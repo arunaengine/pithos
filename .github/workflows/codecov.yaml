@@ -4,25 +4,46 @@ on:
   pull_request:
 name: coverage
 jobs:
-  test:
+  report:
+    name: Report
+    environment: coverage
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort"
+      RUSTDOCFLAGS: "-Cpanic=abort"
+
     steps:
-      - uses: arduino/setup-protoc@v1
-      - uses: actions-rs/toolchain@v1
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - id: setup
+        name: Setup Toolchain
+        uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
-          override: true
-      - uses: actions/checkout@v2
+          components: llvm-tools-preview
+
+      - id: cache
+        name: Enable Workflow Cache
+        uses: Swatinem/rust-cache@v2
+
+      - id: tools
+        name: Install Tools
+        uses: taiki-e/install-action@v2
         with:
-          submodules: recursive
-      - uses: actions-rs/cargo@v1
+          tool: cargo-llvm-cov
+      - id: coverage
+        name: Generate Coverage Report
+        run: |
+          mkdir .coverage
+          cargo llvm-cov --lcov --output-path=./.coverage/lcov.info
+
+      - id: upload
+        name: Upload Coverage Report
+        uses: codecov/codecov-action@v4
         with:
-          command: test
-          args: --all-features --no-fail-fast -- --include-ignored
-        env:
-          CARGO_INCREMENTAL: '0'
-          RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
-          RUSTDOCFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
-      - uses: actions-rs/grcov@v0.1.5
-      - name: Upload to codecov.io
-        uses: codecov/codecov-action@v3
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./.coverage/lcov.info
+          verbose: true
+          fail_ci_if_error: true
