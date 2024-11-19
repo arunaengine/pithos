@@ -2,6 +2,7 @@ use crate::helpers::structs::FileContext;
 use crate::transformer::TransformerType;
 use async_channel::Sender;
 use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 
 #[derive(Clone, Debug)]
@@ -22,7 +23,7 @@ pub struct CompressionInfo {
 }
 
 #[derive(
-    Clone, Copy, Debug, Eq, PartialEq, Hash, BorshDeserialize, BorshSerialize, PartialOrd, Ord,
+    Clone, Copy, Debug, Eq, PartialEq, Hash, BorshDeserialize, BorshSerialize, Serialize, Deserialize, PartialOrd, Ord,
 )]
 pub enum DirOrFileIdx {
     Dir(usize),

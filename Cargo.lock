@@ -1440,6 +1440,7 @@ dependencies = [
  "pithos",
  "rand_core",
  "scrypt",
+ "serde",
  "sha1",
  "sha2",
  "tar",

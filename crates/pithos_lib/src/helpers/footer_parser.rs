@@ -5,6 +5,7 @@ use crate::pithos::structs::{
 use crate::pithos::structs::{EncryptionMetadata, EOF_META_LEN};
 use anyhow::anyhow;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 pub enum FooterParserState {
     Empty,
@@ -46,7 +47,7 @@ impl<'a> TryFrom<FooterParser<'a>> for Footer {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Footer {
     pub eof_metadata: EndOfFileMetadata,
     pub encryption_keys: Option<DecryptedKeys>,
