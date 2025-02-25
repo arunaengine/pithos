@@ -1,102 +1,535 @@
 # The Pithos file format
 
-This document contains the formal description for the pithos (`.pto` equivalent to `.zst.c4gh`) file format. A file format that enables compression and encryption while still maintaining a resonable performant indexing solution for large multi-gigabyte files. Optimized for usage with object storage solutions, like S3.
-
-## Specification
-
-The core of the pithos file format is the combination of GA4GH's [crypt4gh](http://samtools.github.io/hts-specs/crypt4gh.pdf) encryption format with the zstandard compression algorithm ([RFC8878](https://datatracker.ietf.org/doc/rfc8878/)). This is extended by an optional custom footer block containing positional information for decrypting and decompressing blocks within larger files.
-
-### **Structure**
-
-Pithos files consist of three distinct parts. A Header section followed by blocks of compressed and encrypted data and an optional footer section containing indirect index information and block sizes.
+This document contains the formal description for the pithos (`.pto`) file format. A file format that enables compression and encryption while still maintaining a resonable performant indexing solution for large multi-gigabyte files. Optimized for usage with object storage solutions, like S3.
 
 
-#### **Data structure**
+## Goals
 
-For Compression the data SHOULD first be split into raw data chunks with exactly 5 Mib size (except the last one). These chunks MUST be compressed using the zstandard algorithm with a compression level of choice and MAY optionally end with a MAC. Each compressed frame MUST be followed by a `skippable frame` as defined in [RFC8878](https://datatracker.ietf.org/doc/rfc8878/) if the resulting compressed size is not a multiple of 65536 Bytes (64 Kib) and the raw file size was more than 5 Mib. The skippable frame SHOULD use `0x184D2A50` as Magic_Number and SHOULD avoid `0x184D2A51` and `0x184D2A52` to avoid confusion with the custom footer section. A skippable frame MUST be used to align the total compressed size to a multiple of the encryption block size of 65536 Bytes (except for the last block) if more than one chunk exists. Because skippable frames have a minimum size of 8 Bytes they extend the data at worst by `65536 + 7 = 65543 Bytes`. Raw files that are smaller than 5 Mib SHOULD NOT contain any skippable frames and omit any indexing for performance reasons.
- 
-The resulting blocks consisting of compressed data MUST be encrypted in ChaCha20-Poly1305_ietf encrypted blocks as specified in [RFC7539](https://www.rfc-editor.org/rfc/rfc7539) with 65536 Bytes size, using a securely generated random encryption secret. All blocks SHOULD be preceeded by a per block random generated 12 byte Nonce and end with a 16 byte message authentication code (MAC). This results in a total blocksize of 65562 Bytes. The last encrypted block of the file CAN have a smaller size than this if the file has an uncompressed size of less than 5 Mib.
+* **Built-in encryption** - Secures data at rest without requiring additional application layers, providing native protection for sensitive information
+* **Portable format** - Ensures consistent operation across different operating systems, hardware architectures, and programming environments
+* **Included multi-specification metadata** - Supports comprehensive metadata structures adhering to multiple industry standards for improved interoperability
+* **Built-in compression** - Natively integrates data compression within the format, reducing storage requirements and transmission times without external tools, uses "smart" compression that automatically decides if compression is necessary
+* **Configurable Random IO** - Supports efficient retrieval of specific data segments without reading entire files, enabling targeted access operations
+* **Optimized for Object storage** - Designed specifically for modern object storage systems, with considerations for cloud environments, distributed storage paradigms, and scalable data management
 
-If the file is larger than 5 Mib the number of blocks that build 5 Mib of raw data SHOULD be summed up resulting in a 1 Byte unsigned integer between 1 and 81 (with last chunk +2 = 83). 81 is the maximum because 5 Mebibytes are exactly 80 x 65536 Bytes chunks and in the worst case with no compression the skippable frame could extend this by a maximum of one block. This index number is stored in the last one or two encrypted blocks of skippable frames in the file as index for fast access of data in order.
+## Non-goals
 
-#### **Header**
+* **Universal backward compatibility** - The format prioritizes modern functionality over compatibility with legacy systems and older file format versions
+* **Minimal file size for small data** - Not optimized for extremely small files where the metadata overhead may be proportionally significant
+* **Real-time streaming** - Not designed for continuous data streaming applications requiring minimal latency
 
-The primary header is identical to the header specified by the crypt4gh standard and contains the block and encryption information for a specific recipient. This header is generated ad-hoc and NOT stored with the data itself to avoid re-encrypting the first section multiple times.
+## Pithos File Format Specification
 
-#### **Footer** 
+## 1. Introduction
 
-The footer consists of one or two encrypted 65536 Byte sized blocks of skippable frames that contain 1 byte unsigned integers with index information about each block of 5 Mib raw uncompressed data in order. These blocks have the following structure in **little-endian** format.
+Pithos is a modern file format designed for secure, efficient data storage with a focus on object storage systems and cloud environments. It prioritizes security, portability, flexible metadata, and intelligent data handling while maintaining efficient random access capabilities.
 
-- `Header` with `Magic_Number` `0x184D2A51` for one block `0x184D2A52` if two blocks are attached. (4 Bytes)
-- `Frame_Size` = 65536 as unsigned 32 bit integer
-- `Block_Total` = 32 bit unsigned integer with the total number of 64Kib + 28 Byte blocks.
-- `Block_List` = The size of each 5 Mib segment in multiples of 64Kib + 28 Byte blocks as unsigned 8 Bit integer in order
-- `Padding` = 0x00 Bytes to fill the 64 Kib block.
+## 2. Format Overview
 
-If the footer contains two blocks (indicated by the Magic_Number `0x184D2A52`) both blocks should repeat the `Header` / `Frame_Size` / `Block_number` sections with the same information.
+Pithos uses a container-based approach where files, directories, and metadata are stored as objects within a unified structure. The format supports dynamic block sizing, built-in encryption and compression, and optimized random I/O operations.
 
+## 3. File Structure
 
-## Practical guidance
+### 3.1 General Layout
 
-This section contains practical recommendations for building encryption logic that comply with this format. 
+A Pithos file consists of the following components:
 
-### **Compression and Encryption**
+```
++-----------------------------------+
+| Magic Number (8 bytes)            |
++-----------------------------------+
+| Format Version (2 bytes)          |
++-----------------------------------+
+| Block Data                        |
+|   +-------------------------------+
+|   | Block 1 (Data/Metadata)       |
+|   +-------------------------------+
+|   | Block 2 (Data/Metadata)       |
+|   +-------------------------------+
+|   | ...                           |
+|   +-------------------------------+
+|   | Block N (Data/Metadata)       |
++-----------------------------------+
+| Central Directory                 |
++-----------------------------------+
+```
 
-- Split the file in 5 Mib chunks
-- If this results in only one chunk:
-    - compress the whole chunk
-    - Split the compressed data in 64Kib sections
-    - encrypt the 64 Kib sections with a random nonce
-    - concatenate `Nonce` + `Encrypted data` + `MAC` to one block
-    - concatenate all blocks in order
-- If this results in multiple chunks:
-    - compress each chunk
-    - calculate the "missing" bytes to fill a 64 Kib section for each chunk with the formular: `Compressed size % 65536` if the `result` is < 8 the skippable chunk will be `result + 64 Kib` otherwise the skippable frame should be of size `result`
-    - Create a skippable frame of size `result` with a magic header of `0x184D2A50` to align the result to 64Kib
-    - split the resulting compressed section in 64 Kib sections and remember the number of sections
-    - encrypt the 64 Kib sections with a random nonce
-    - concatenate `Nonce` + `Encrypted data` + `MAC` to one block
-    - (if shared) Start with a crypt4gh header containing encryption information
-    - concatenate all blocks and all chunks in order 
-    - create a skippable frame as described in the [Footer](#footer) section with all remembered number of sections for each compressed chunk
-    - append the one or two footers to the file
+### 3.2 Magic Number and Version
 
-### **Decryption and Decompression**
+The file begins with an 8-byte magic number: `0x5049 5448 4F53 0A0D` (ASCII "PITHOS\n\r").
 
-This procedure has two options a simple single threaded one and a more parallelizable multi-threaded one. Multi-threading only gives a significant advantage for files that are larger than 10-20 Mib.
+The version field is a 2-byte unsigned integer representing the major and minor version (e.g., 0x0100 for version 1.0).
 
- #### **Option A (single-threaded)**:
+## 4. Block Structure
 
-  - This procedure should work with regular tools for crypt4gh and zstandard.
-  - Read the file from the start, obtain encryption information via the header section
-  - Decrypt each 64 Kib in order using the encryption key from the header and the prepended 12 Byte Nonce in each Block.
-  - The resulting data can be piped directly in the zstd decompressor.
-  - All padding information and the footer section should be skipped as skippable frame.
- 
- #### **Option B (multi-threaded)**:
- 
-  - Obtain the content-length of the compressed and encrypted file
-  - If the file is significantly smaller than 5 Mib -> Proceed with Option A
-  - Read and decrypt the last two encrypted blocks 2x (64 Kib + 28 Bytes) and store them in separate variables.
-  - Check the last block for its `Magic_Number`, if it is `0x184D2A51` discard the penultimate block, if the number is `0x184D2A52` begin with the penultimate.
-  - Decide how many parallel decryption and decompression threads should be spawned.
-  - Read and split the `Block_Total` described in the [Footer](#footer) section roughly in your number of parallel threads. This results in a number of 64 Kib blocks that should be handled by each thread.
-  - Start iterating through the `Block_List` section of the Footer and sum up the number of blocks for each entry in the blocklist, remember the **initial block** beginning with 0. If the sum surpasses the determined block count from the previous step spawn a separate thread handling the section from your **initial block** up to the end of the current block. Set the initial block to the beginning of the next block and repeat the process.
-    - Each thread gets a "initial" and an "up-to" block index to process
-    - These number relate to byte offsets in the file via the formular: `blocknumber * (65536 + 28)`
-    - **Example 1**: Handle all blocks from 0 to 222 -> Range: 0 - 14554764 Byte
-    - **Example 2**: Handle all blocks from 222 to 444 -> Range: 14554765 (14554764 + 1) - 29109528 Byte
-    - Because the data is aligned it can be handled equivalent to **Option A**
-- Afterwards concatenate all decrypted / decompressed parts from each thread in the correct order to get the full file.
+### 4.1 Block Structure
 
-#### **Option C (specific Range)**:
+Each block has a simple structure:
 
-If you want to get only a specific range from the file the procedure is as follows:
+```
++-----------------------------------+
+| Block Start Marker (4 bytes)      |
+| "BLCK"                            |
++-----------------------------------+
+| Block Index (varint)              |
++-----------------------------------+
+| Block Type (1 byte)               |
++-----------------------------------+
+| Block Length (varint)             |
++-----------------------------------+
+| Encryption Nonce (12 bytes)       |
+| (if encrypted)                    |
++-----------------------------------+
+| Block Data                        |
++-----------------------------------+
+```
 
-- Get the Footer as described in [Option B](#option-b-multi-threaded), if the file is smaller than 5 Mib decrypt / decompress the whole file and extract the requested range from the resulting raw data.
-- Determine the needed sections based on your Range request. The data is compressed in chunks of 5 Mib, so the range must first be converted to an index of 5 Mib Blocks. This can be done by integer dividing the index with 5Mib (5242880)
-- Example: Range: Begin: 5242111 - End: 20971320 -> Begin // 5 Mib = 0, End // 5 Mib = 3 -> The 5 Mib blocks with the indizes from 0 up to 3 are needed.
-- Iterate the Blocklist from the beginning, sum up all counts up to Begin index in Variable A and sum up the counts from Begin to end index separately in Variable B.
-- The resulting variables A and B indicate the the Range of compressed and decrypted bytes that needs to be decrypted and compressed to get all data of the requested Range. The formular to calculate the Ranges is: From: `Variable A * (65536 + 28)` to `Variable A * (65536 + 28) + Variable B * (65536 + 28)` This Range should contain only full encrypted / compressed blocks of 5 Mib size that are needed for the request.
-- The blocks can be decrypted and decompressed as in [Option A](#option-a-single-threaded) or [Option B](#option-b-multi-threaded).
-- To get the "true" requested range afterwards the first `Begin Range % 5 Mib` Bytes and the last `5 Mib - End Range % 5 Mib` Bytes or must be discarded. This can also be done by first discarding the beginning and afterwards only returning the "size" of the requested range (`Begin Range - End Range`)
+- **Block Start Marker**: The ASCII string "BLCK" (0x424C434B) for easy identification of block boundaries
+- **Block Index**: A variable-length integer providing a sequential identifier for the block, simplifying initial write operations
+- **Block Type**: Identifies the type of data contained in the block
+- **Block Length**: A variable-length integer specifying the total length of the block data
+- **Encryption Nonce**: Only present when the block is encrypted, contains the 12-byte nonce used for ChaCha20-Poly1305 encryption
+
+The content hash is not stored with the block itself but is calculated during writing and stored in the central directory.
+
+### 4.2 Block Types
+
+- 0x00: Data block
+- 0x01: Metadata block
+- 0x02: Directory entry
+- 0x03: Symlink
+- 0x04: Extended attribute
+- 0x05-0xFF: Reserved for future use
+
+### 4.3 Content Hashing
+
+Pithos uses the Blake3 cryptographic hash function for content integrity and deduplication:
+
+1. **Algorithm**: Blake3 is selected for its combination of speed, security, and simplicity
+2. **Hash Size**: 16 bytes (128 bits) is used as the standard hash size, providing a good balance between collision resistance and space efficiency
+3. **Hashing Scope**: The hash covers only the block data, not the header
+4. **Storage Location**: Content hashes are stored exclusively in the central directory, not with the blocks themselves
+
+Blake3 offers several advantages for the Pithos format:
+- Extremely high performance (faster than MD5 and SHA-1)
+- Strong security properties
+- Resistance to length extension attacks
+- Parallelizable computation for large blocks
+- Incremental updates for streaming operations
+
+### 4.4 Block Sizing Models
+
+Pithos supports three block sizing models:
+
+- **Constant**: Fixed block size (specified in bytes)
+- **Full**: No blocking, each file is a single block
+- **Dynamic**: Variable block sizes optimized for the content
+
+The block sizing model is selected per file and stored in the file's metadata.
+
+## 5. Encryption
+
+### 5.1 Encryption Scheme
+
+Pithos implements the crypt4gh encryption scheme with modifications to support unlimited blocks and controlled memory usage:
+
+1. X25519 for key exchange
+2. ChaCha20-Poly1305 for authenticated encryption
+3. Support for multiple recipients (multiple public keys)
+
+### 5.2 Encryption Process
+
+1. Generate a random 12-byte nonce for each block
+2. Store the nonce at the beginning of the block header
+3. Generate a random segment key for each encrypted block
+4. Encrypt the block data using ChaCha20-Poly1305 with the segment key and the stored nonce
+5. Encrypt the segment key with each recipient's public key
+6. Store the encrypted segment keys in the central directory's encryption section
+
+This approach provides:
+- Per-block encryption with unique nonces
+- Zero-knowledge encryption where only authorized recipients can decrypt
+- Efficient random access to encrypted blocks
+- Centralized key management in the central directory
+
+### 5.3 Block Size Limitations
+
+To prevent excessive memory usage, encrypted blocks are limited to 64MB by default. Larger files are automatically split into multiple blocks.
+
+### 5.4 Block Recovery
+
+The Block Start Marker ("BLCK") combined with the consistent nonce placement enables recovery of encrypted blocks even if the central directory is corrupted. During recovery operations, the file can be scanned for the "BLCK" marker to identify potential block boundaries and verify integrity using the Blake3 Content Hash.
+
+## 6. Compression
+
+### 6.1 Compression Algorithm
+
+Pithos exclusively uses Zstandard (zstd) for compression:
+
+- **Algorithm**: Zstandard (zstd) is the only supported compression algorithm
+- **Compression Levels**: Supports compression levels 1-19, with higher levels providing better compression at the cost of speed
+- **Default Level**: Level 3 is recommended as the default, offering a good balance between speed and compression ratio
+
+Zstandard was selected for the Pithos format because it provides:
+- Excellent compression ratios
+- High-speed decompression
+- Configurable compression speed/ratio trade-off
+- Dictionary support for improved compression of small files
+- Wide platform support and active maintenance
+
+### 6.2 Smart Compression
+
+The format implements "smart" compression that:
+1. Samples data to determine compressibility
+2. Skips compression for already compressed data (images, videos, etc.)
+3. Adjusts zstd compression level based on data characteristics and desired performance profile
+4. Tracks compression ratio and adjusts strategy for subsequent blocks
+
+## 7. Metadata
+
+### 7.1 Core Metadata
+
+Each file contains core metadata including:
+- Creation timestamp
+- Modification timestamp
+- Owner information
+- Permissions
+- File size
+- Content type
+- Block sizing model
+- Encryption details
+- Compression details
+
+### 7.2 Extended Metadata
+
+Pithos supports multiple metadata specifications through a flexible structure:
+- Schema.org (default metadata schema)
+- Dublin Core
+- XMP
+- EXIF
+- Custom schema with namespace definition
+
+The Schema.org vocabulary is the default metadata schema in Pithos, providing a comprehensive set of structured data schemas that are widely used across the internet. This enables rich semantic descriptions of file content with standardized properties for various types of data and documents.
+
+### 7.3 Metadata Storage
+
+Metadata is stored as regular blocks (type 0x01) interspersed with data blocks throughout the file. This allows:
+- Metadata to be treated as a first-class citizen
+- Efficient updates to metadata without file reorganization
+- Appropriate encryption and compression of metadata
+- Logical grouping of related metadata with its data
+
+Metadata blocks follow the same block structure as data blocks and can be referenced through the central directory just like any other block.
+
+## 8. Directory Structure
+
+### 8.1 Directory Entries
+
+Directories are represented as special blocks containing:
+- Directory name
+- Creation timestamp
+- Modification timestamp
+- Owner information
+- Permissions
+- List of contained files/directories (IDs and names)
+
+### 8.2 Symlinks
+
+Symlinks are implemented as special blocks containing:
+- Link name
+- Target path
+- Creation timestamp
+- Owner information
+
+## 9. Central Directory and Encryption Information
+
+### 9.1 File Structure End
+
+The end of a Pithos file contains two distinct components:
+
+```
++-----------------------------------+
+| Central Directory                 |
++-----------------------------------+
+| Encryption Section                |
++-----------------------------------+
+```
+
+This separation allows for extending the encryption section by appending new recipient information without modifying the central directory.
+
+### 9.2 Central Directory Structure
+
+The central directory contains all essential file and block mapping information:
+
+```
++-----------------------------------+
+| Central Directory Identifier      |
+| (8 bytes: "PITHOSCD")             |
++-----------------------------------+
+| Directory Size (8 bytes)          |
++-----------------------------------+
+| Number of Files (4 bytes)         |
++-----------------------------------+
+| Number of Blocks (8 bytes)        |
++-----------------------------------+
+| File Entries                      |
+|   +-------------------------------+
+|   | File Entry 1                  |
+|   +-------------------------------+
+|   | File Entry 2                  |
+|   +-------------------------------+
+|   | ...                           |
++-----------------------------------+
+| Block Index                       |
++-----------------------------------+
+| Encryption Section Offset (8 bytes)|
++-----------------------------------+
+| CRC32 Checksum (4 bytes)          |
++-----------------------------------+
+```
+
+The "Encryption Section Offset" field points to the beginning of the separate encryption section that follows the central directory.
+
+### 9.3 File Entries
+
+Each file entry contains:
+
+```
++-----------------------------------+
+| File ID (8 bytes)                 |
++-----------------------------------+
+| Filename Length (2 bytes)         |
++-----------------------------------+
+| Filename                          |
++-----------------------------------+
+| Feature Flags (4 bytes)           |
++-----------------------------------+
+| Block Count (4 bytes)             |
++-----------------------------------+
+| Block Index List                  |
++-----------------------------------+
+| File Metadata Offset (8 bytes)    |
++-----------------------------------+
+```
+
+### 9.4 Feature Flags (Per File)
+
+A 4-byte bitfield indicating which features are used for each specific file:
+- Bit 0: Encryption enabled
+- Bit 1: Compression enabled
+- Bit 2: Random I/O optimization
+- Bit 3: Extended metadata
+- Bit 4: Dynamic block sizing
+- Bit 5: Symlinks supported
+- Bit 6-31: Reserved for future use
+
+### 9.5 Block Index
+
+The block index contains comprehensive information for each block:
+
+```
++-----------------------------------+
+| Block Index (varint)              |
++-----------------------------------+
+| Blake3 Content Hash (16 bytes)    |
++-----------------------------------+
+| Block Offset (varint)             |
++-----------------------------------+
+| Raw Size (varint)                 |
++-----------------------------------+
+| Uncompressed Size (varint)        |
++-----------------------------------+
+| Compression Flag (1 byte)         |
++-----------------------------------+
+| Encryption Type (1 byte)          |
++-----------------------------------+
+```
+
+- **Compression Flag**: 0x00 for no compression, 0x01 for zstd compression
+
+Delta compression is applied to sequential block offsets and sizes to minimize space. Variable-length integers (varints) are used to efficiently encode values of different magnitudes.
+
+During file creation, blocks are initially referenced by their Block Index, which is later mapped to the Blake3 Content Hash after the block is completely written.
+
+### 9.6 Encryption Section
+
+The encryption section follows the central directory and uses a fully appendable structure for recipient management:
+
+```
++-----------------------------------+
+| Encryption Section Identifier     |
+| (8 bytes: "PITHOSEN")             |
++-----------------------------------+
+| Encryption Section Size (8 bytes) |
++-----------------------------------+
+| Version (2 bytes)                 |
++-----------------------------------+
+| Recipient Entries                 |
+|   +-------------------------------+
+|   | Recipient Entry 1             |
+|   +-------------------------------+
+|   | Recipient Entry 2             |
+|   +-------------------------------+
+|   | ...                           |
++-----------------------------------+
+```
+
+Each recipient entry is self-contained and follows this format:
+
+```
++-----------------------------------+
+| Entry Start Marker                |
+| (4 bytes: "RCPT")                 |
++-----------------------------------+
+| Entry Size (4 bytes)              |
++-----------------------------------+
+| Recipient ID (16 bytes)           |
++-----------------------------------+
+| Recipient Public Key (32 bytes)   |
++-----------------------------------+
+| Block Key Entries Count (4 bytes) |
++-----------------------------------+
+| Block Key Entries                 |
+|   +-------------------------------+
+|   | Block Index (varint)          |
+|   +-------------------------------+
+|   | Encrypted Key (32 bytes)      |
+|   +-------------------------------+
+|   | ...                           |
++-----------------------------------+
+```
+
+This structure eliminates any upfront recipient count, allowing for true append-only recipient addition.
+
+### 9.7 Encryption Section Extensibility
+
+The encryption section is designed for pure append-only recipient addition:
+
+1. **No Recipient Count**: The design deliberately omits any upfront count of recipients, eliminating the need to update any header when adding recipients
+   
+2. **Self-Contained Entries**: Each recipient entry contains all necessary information for that recipient to decrypt all blocks they have access to
+   
+3. **Append Process**:
+   - To add a new recipient, simply append a new recipient entry to the end of the encryption section
+   - No existing data needs to be modified or rewritten
+   - The new entry contains the recipient's public key and all block keys encrypted for that recipient
+   
+4. **Reading Process**:
+   - Readers scan through all recipient entries until they find one matching their recipient ID
+   - Once found, they can extract all block keys they have access to
+   - No need to process other recipient entries
+   
+This approach allows for unlimited recipients to be added over time without any file rewrites.
+
+## 10. Random I/O Optimization
+
+### 10.1 Enhanced Block Index
+
+For efficient random I/O, Pithos uses a delta-compressed block index in the central directory that maps logical file offsets to physical block locations. The delta compression works as follows:
+
+1. Store the first block offset as an absolute value
+2. For subsequent blocks, store only the difference from the previous block
+3. Use variable-length encoding (varint) to efficiently represent both small and large deltas
+
+This approach provides:
+1. Direct access to any block without scanning the entire file
+2. Minimal index size through efficient compression
+3. Parallel reads of non-contiguous blocks
+4. Efficient range queries
+
+### 10.2 Block Size Tracking
+
+The block index tracks both raw (compressed) and uncompressed sizes for each block:
+
+1. Raw size: Actual size of the block as stored on disk (after compression if applicable)
+2. Uncompressed size: Original size of the block data before compression
+
+Both sizes are stored using delta-compressed varints to minimize space usage while supporting efficient random access calculations.
+
+### 10.3 Access Modes
+
+Three access modes are supported:
+- **Sequential**: Optimized for reading/writing the entire file sequentially
+- **Random**: Optimized for accessing arbitrary portions of the file
+- **Hybrid**: Balanced approach for mixed access patterns
+
+## 11. Extensibility
+
+### 11.1 Append Operations
+
+New content can be added to a Pithos file by appending blocks to the end of the file and updating the central directory. This allows for:
+1. Adding new files without rewriting the entire archive
+2. Updating metadata without changing file data
+3. Progressive creation of large archives
+
+### 11.2 Versioning
+
+The format supports versioning through:
+1. Block-level versioning (multiple blocks with the same logical ID but different versions)
+2. Metadata versioning
+3. Format versioning for future specification updates
+
+## 12. Implementation Considerations
+
+### 12.1 Memory Management
+
+- Block size caps to prevent excessive memory usage
+- Streaming operations where possible
+- Memory-mapped I/O support for efficient access
+
+### 12.2 Multithreading
+
+- Thread-safe design for concurrent operations
+- Parallel compression/decompression
+- Parallel encryption/decryption
+
+## 13. Implementation Considerations
+
+### 13.1 Writing Process
+
+The Pithos format is designed for efficient sequential writing, following these steps:
+
+1. Write the file header (magic number and version)
+2. For each block:
+   a. Generate a sequential Block Index
+   b. Write the block header with the Block Index, type, and length
+   c. If encrypted, generate and write the encryption nonce
+   d. Write the block data
+   e. Calculate the Blake3 Content Hash of the data (to be stored in the central directory)
+3. Build the block index mapping Block Indices to Content Hashes
+4. Write the central directory with all metadata and block information
+5. Write the encryption section with recipient keys and encrypted segment keys
+   
+This approach allows writers to process blocks sequentially without needing to seek backward in the file to update headers with content hashes.
+
+### 13.2 Adding Recipients
+
+To add new recipients to an existing encrypted Pithos file:
+
+1. Obtain the block encryption keys using an existing recipient's credentials
+2. Create a new recipient entry:
+   - Generate a unique recipient ID
+   - Include the new recipient's public key
+   - Encrypt each block key with the new recipient's public key
+   - Package these keys with their corresponding block indices
+3. Append this new recipient entry to the end of the encryption section
+
+No other modifications to the file are needed. This is a true append-only operation that doesn't require rewriting any existing content or updating any counts or offsets.
+
+### 13.3 Processing Encryption During Reading
+
+When reading an encrypted Pithos file:
+
+1. Locate the encryption section using the offset in the central directory
+2. Scan through recipient entries looking for one matching the reader's recipient ID
+3. If found, extract the encrypted block keys
+4. As blocks are read, use the appropriate decrypted key and the nonce stored in the block header to decrypt the content
+
+This process is efficient as readers only need to process their own recipient entry, not the entire encryption section.
+
+## 14. Future Considerations
+
+- Support for distributed storage backends
+- Integration with content-addressable storage systems
+- Advanced deduplication strategies
+- Transparent cloud tiering support
