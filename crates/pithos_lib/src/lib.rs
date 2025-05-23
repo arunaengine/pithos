@@ -19,6 +19,7 @@ mod tests {
     use crate::streamreadwrite::GenericStreamReadWriter;
     use crate::transformer::ReadWriter;
     use crate::transformers::decrypt::ChaCha20Dec;
+    use crate::transformers::decrypt_resilient::ChaChaResilient;
     use crate::transformers::decrypt_with_parts::ChaCha20DecParts;
     use crate::transformers::encrypt::ChaCha20Enc;
     use crate::transformers::filter::Filter;
@@ -1295,6 +1296,36 @@ mod tests {
                 .unwrap(),
             )
             .add_transformer(ChaCha20DecParts::new_with_lengths(
+                b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea"
+                    .to_vec()
+                    .try_into()
+                    .unwrap(),
+                repeated,
+            ))
+            .process()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn e2e_test_resilient_parts_decryptor() {
+        let file = File::open("test.txt").await.unwrap();
+        let file2 = vec![];
+
+        let repeated: Vec<u64> = vec![50860];
+
+        // Create a new GenericReadWriter
+        GenericReadWriter::new_with_writer(file, file2)
+            .add_transformer(
+                ChaCha20Enc::new_with_fixed(
+                    b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea"
+                        .to_vec()
+                        .try_into()
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .add_transformer(ChaChaResilient::new_with_lengths(
                 b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea"
                     .to_vec()
                     .try_into()

@@ -10,6 +10,7 @@ pub mod size_probe;
 pub mod tar;
 pub mod writer_sink;
 //pub mod zip;
+pub mod decrypt_resilient;
 pub mod decrypt_with_parts;
 pub mod footer_extractor;
 pub mod footer_updater;
