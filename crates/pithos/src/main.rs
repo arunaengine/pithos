@@ -16,8 +16,8 @@ use pithos_lib::pithos::pithoswriter::PithosWriter;
 use pithos_lib::pithos::structs::{
     DirContextVariants, EndOfFileMetadata, FileContextVariants, EOF_META_LEN,
 };
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use rand::distr::Alphanumeric;
+use rand::Rng;
 use std::fmt::Write;
 use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
@@ -453,7 +453,7 @@ async fn main() -> Result<()> {
             reader_public_keys,
         } => {
             // Generate random symmetric "key" for encryption
-            let key: [u8; 32] = thread_rng()
+            let key: [u8; 32] = rand::rng()
                 .sample_iter(&Alphanumeric)
                 .take(32)
                 .map(char::from)

@@ -1,11 +1,11 @@
 [package]
 name = "pithos_pyo3"
 description = "Client for the Pithos object storage file format"
-version = "0.6.0"
+version = "0.6.2"
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
 
 [dependencies]
-pithos_lib = { path = "../pithos_lib", version="0.6.0"}
+pithos_lib = { path = "../pithos_lib", version = "0.6.2" }
