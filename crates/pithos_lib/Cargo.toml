@@ -45,7 +45,3 @@ integer-encoding = "4.0.2"
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports", "async_tokio"] }
 pithos = { path = "../pithos" }
-
-[[bench]]
-name = "performance"
-harness = false
