@@ -6,9 +6,9 @@
 // - Strings: UTF-8 with varint length prefix
 // - Error handling via DeserializationError
 
+use crate::helpers::structs::*;
 use integer_encoding::VarIntReader;
 use std::io::{Error as IoError, Read};
-use crate::helpers::structs::*;
 
 #[derive(Debug)]
 pub enum DeserializationError {

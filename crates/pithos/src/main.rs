@@ -193,12 +193,7 @@ async fn main() -> Result<()> {
     // Evaluate subcommand
     match cli.command {
         PithosCommands::Read { read_command } => match read_command {
-            ReadCommands::Info { file } => {
-                // Open file
-                let mut _input_file = File::open(file).await?;
-                
-                //TODO
-            }
+            ReadCommands::Info { file } => {}
             ReadCommands::All { .. } => {}
             ReadCommands::Data { file } => {}
             ReadCommands::Directory { file } => {}
