@@ -29,5 +29,5 @@ tokio-stream = "0.1.16"
 tokio-util = "0.7.12"
 tracing = "0.1.40"
 tracing-subscriber = {version = "0.3.18", features = ["env-filter", "time"]}
-x25519-dalek = "2.0.1"
+x25519-dalek = {workspace = true}
 indicatif = "0.17.9"

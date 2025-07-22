@@ -41,6 +41,7 @@ borsh = {version = "1.5.3", features = ["std", "derive"]}
 itertools = "0.13.0"
 serde = {version = "1.0.215", features = ["derive"]}
 integer-encoding = "4.0.2"
+x25519-dalek = {workspace = true}
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports", "async_tokio"] }

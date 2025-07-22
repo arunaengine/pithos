@@ -10,3 +10,6 @@ authors = ["Sebastian Beyvers <sb@pus.de>"]
 edition = "2021"
 repository = "https://github.com/ArunaStorage/aruna-file"
 license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
