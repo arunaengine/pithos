@@ -1,8 +1,8 @@
 # PITHOS File Format Specification
 
-**Version:** 1.0  
-**Status:** Draft  
-**Date:** July 2025  
+**Version:** 1.0
+**Status:** Draft
+**Date:** July 2025
 **Purpose:** Next-generation file format for scientific data management, optimized for object storage with built-in deduplication, encryption, and metadata support
 
 ## 1. Introduction
@@ -92,10 +92,10 @@ bitflags::bitflags! {
         const COMPRESSION_LEVEL_6 = 0b0000_0110;
         const COMPRESSION_LEVEL_7 = 0b0000_0111;
         const COMPRESSION_MASK    = 0b0000_0111;
-        
+
         // Bit 3: Encryption enabled
         const ENCRYPTION_ENABLED = 0b0000_1000;
-        
+
         // Bits 4-7: Reserved for future use (MUST be zero)
     }
 }
@@ -243,7 +243,7 @@ pub enum FormatError {
     VarintOverflow,
     VarintIncomplete,
     StringTruncated,
-    
+
     // Validation errors
     InvalidBlockIndex(u64),
     FileNotFound,
@@ -254,7 +254,7 @@ pub enum FormatError {
     InvalidBlocksForFileType,
     MissingBlocks,
     InvalidOperation,
-    
+
     // Path errors
     EmptyPath,
     PathTraversal,
@@ -265,7 +265,7 @@ pub enum FormatError {
         parent: String,
         index: usize,
     },
-    
+
     // IO errors
     IoError(std::io::Error),
 }
@@ -283,7 +283,7 @@ All strings MUST be encoded as UTF-8 with a varint length prefix.
 
 ### 5.3 Byte Order
 
-All multi-byte values not using varint encoding MUST use little-endian byte order.
+All multi-byte values not using varint encoding MUST use big-endian byte order.
 
 ### 5.4 Directory Entry Ordering Requirements
 
@@ -319,7 +319,7 @@ data/                    (too late - subdirectory already referenced this)
 
 Implementations SHOULD use content-defined chunking with recommended parameters:
 - **min_size**: 64 KB
-- **avg_size**: 128 KB  
+- **avg_size**: 128 KB
 - **max_size**: 512 KB
 - **window_size**: 48 bytes
 
@@ -414,7 +414,7 @@ Implementations MAY support:
 
 The format reserves space for future extensions:
 - FileType values 4-255
-- ProcessingFlags bits 4-7  
+- ProcessingFlags bits 4-7
 - Custom relationship types starting at 1000
 
 Extensions MUST maintain backwards compatibility for reading.
