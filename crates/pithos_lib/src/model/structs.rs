@@ -2,7 +2,7 @@
 // Extracted from serialization.rs for modularity.
 //
 // Import deserialization implementations from helpers/deserialization.rs
-pub use crate::helpers::deserialization::*;
+pub use crate::model::deserialization::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
@@ -10,9 +10,23 @@ pub struct FileHeader {
     pub version: u16,   // Format version (e.g., 0x0100 for 1.0)
 }
 
+impl Default for FileHeader {
+    fn default() -> Self {
+        FileHeader {
+            magic: *b"PITH",
+            version: 0x0100,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHeader {
     pub marker: [u8; 4], // MUST be b"BLCK"
+}
+impl Default for BlockHeader {
+    fn default() -> Self {
+        BlockHeader { marker: *b"BLCK" }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,7 +35,7 @@ pub struct ProcessingFlags(pub u8);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockLocation {
     Local,                    // Block data at specified offset in this file
-    External { url: String }, // URL to external storage
+    External { url: String }, // URL to external storage //TODO: Auth?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +73,7 @@ pub enum FileType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockDataState {
-    Encrypted(Vec<u8>),              // Chacha + nonce
+    Encrypted(Vec<u8>),              // Chacha + nonce (Random key)
     Decrypted(Vec<(u64, [u8; 32])>), // Index / Shake256 hash
 }
 
@@ -91,8 +105,8 @@ pub struct EncryptionSection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecipientData {
-    Encrypted(Vec<u8>),              // Chacha + nonce
-    Decrypted(Vec<(u64, [u8; 32])>), // Fileindex / Shake256 hash
+    Encrypted(Vec<u8>), // Chacha + nonce (Shared key PrivKey Writer <--> PubKey Reader)
+    Decrypted(Vec<(u64, [u8; 32])>), // Fileindex / Random key to decrypt BlockDataState
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

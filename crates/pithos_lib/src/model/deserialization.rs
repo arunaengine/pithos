@@ -6,16 +6,32 @@
 // - Strings: UTF-8 with varint length prefix
 // - Error handling via DeserializationError
 
-use crate::helpers::structs::*;
-use integer_encoding::VarIntReader;
-use std::io::{Error as IoError, Read};
+use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
+use crate::model::structs::*;
+use integer_encoding::{VarIntReader, VarIntWriter};
+use std::io::{Error as IoError, Read, Write};
+use byteorder::ReadBytesExt;
+use thiserror::Error;
+use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
+use zstd::zstd_safe::WriteBuf;
 
-#[derive(Debug)]
+/// Custom error type for deserialization operations
+#[derive(Error, Debug)]
 pub enum DeserializationError {
+    /// I/O error during deserialization
+    #[error("I/O error: {0}")]
     Io(IoError),
+    /// UTF-8 decoding error
+    #[error("UTF-8 decoding error: {0}")]
     Utf8(std::string::FromUtf8Error),
+    /// Invalid enum value encountered
+    #[error("Invalid enum value: {0}")]
     InvalidEnumValue(u8),
+    /// Invalid option encountered
+    #[error("Invalid option")]
     InvalidOption,
+    /// Invalid length encountered
+    #[error("Invalid length")]
     InvalidLength,
 }
 
@@ -290,6 +306,7 @@ impl RecipientData {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag)?;
+
         match tag[0] {
             0 => {
                 let len = reader.read_varint::<u64>()?;
@@ -299,9 +316,13 @@ impl RecipientData {
             }
             1 => {
                 let list_len = reader.read_varint::<u64>()?;
+                dbg!(&list_len);
                 let mut list = Vec::with_capacity(list_len as usize);
                 for _ in 0..list_len {
-                    let idx = reader.read_varint::<u64>()?;
+                    let mut idx_buf = [0u8; 8];
+                    reader.read_exact(&mut idx_buf)?;
+                    let idx = u64::from_be_bytes(idx_buf); //reader.read_varint::<u64>()?;
+                    dbg!(&idx);
                     let mut hash = [0u8; 32];
                     reader.read_exact(&mut hash)?;
                     list.push((idx, hash));
@@ -310,6 +331,24 @@ impl RecipientData {
             }
             v => Err(DeserializationError::InvalidEnumValue(v)),
         }
+    }
+
+    pub fn decrypt(&mut self, shared_key: &SharedSecret) -> anyhow::Result<()> {
+        match &self {
+            RecipientData::Decrypted(_) => {
+                // Do nothing, already decrypted
+            }
+            RecipientData::Encrypted(enc_data) => {
+                let dec_data = decrypt_chunk(enc_data, shared_key.as_bytes())?;
+                dbg!(dec_data.len());
+                let recipient_data = RecipientData::deserialize(&mut dec_data.as_slice())?;
+                dbg!(&recipient_data);
+
+                *self = recipient_data
+            }
+        };
+
+        Ok(())
     }
 }
 

@@ -6,13 +6,17 @@
 // - CRC32: not implemented here (use a separate utility)
 // - Only serialization to bytes is implemented (no deserialization)
 
-use crate::helpers::structs::*;
+use crate::helpers::chacha_poly1305::encrypt_chunk;
+use crate::model::structs::*;
 use integer_encoding::VarIntWriter;
 use std::io::Write;
+use thiserror::Error;
+use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 // Helper: error type for serialization
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum SerializationError {
+    #[error("IoError error: {0}")]
     IoError(std::io::Error),
 }
 
@@ -48,6 +52,12 @@ impl FileHeader {
         writer.write_all(&self.magic)?;
         writer.write_all(&encode_u16_be(self.version))?;
         Ok(())
+    }
+
+    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, SerializationError> {
+        let mut buf = Vec::new();
+        self.serialize(&mut buf)?;
+        Ok(buf)
     }
 }
 
@@ -121,7 +131,8 @@ impl Directory {
         for enc in &self.encryption {
             enc.serialize(writer)?;
         }
-        writer.write_varint(self.dir_len)?;
+
+        writer.write_all(&encode_u64_be(self.dir_len))?;
         writer.write_all(&encode_u32_be(self.crc32))?;
         Ok(())
     }
@@ -153,6 +164,33 @@ impl BlockDataState {
         }
         Ok(())
     }
+
+    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, SerializationError> {
+        let mut buf = Vec::new();
+        self.serialize(&mut buf)?;
+        Ok(buf)
+    }
+
+    pub fn encrypt(&mut self, key: [u8; 32]) -> anyhow::Result<()> {
+        match &self {
+            BlockDataState::Encrypted(_) => {
+                return Err(anyhow::anyhow!("Already encrypted".to_string()))
+            }
+            BlockDataState::Decrypted(entries) => {
+                let mut data_bytes = Vec::new();
+                data_bytes.write_varint(entries.len() as u64)?;
+                for (idx, hash) in entries {
+                    data_bytes.write_varint(*idx)?;
+                    data_bytes.write_all(hash)?;
+                }
+                let encrypted_data = encrypt_chunk(data_bytes.as_slice(), b"", &key)?;
+
+                *self = BlockDataState::Encrypted(encrypted_data.to_vec())
+            }
+        };
+
+        Ok(())
+    }
 }
 
 impl FileEntry {
@@ -176,6 +214,20 @@ impl FileEntry {
             }
             None => writer.write_all(&[0u8])?,
         }
+        Ok(())
+    }
+
+    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, SerializationError> {
+        let mut buf = Vec::new();
+        self.serialize(&mut buf)?;
+        Ok(buf)
+    }
+
+    pub fn encrypt_block_data(&mut self, key: [u8; 32]) -> anyhow::Result<()> {
+        self.block_data.encrypt(key)
+    }
+
+    pub fn decrypt_block_data(&mut self, _key: [u8; 32]) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -218,12 +270,57 @@ impl RecipientData {
         }
         Ok(())
     }
+
+    pub fn encrypt(&mut self, shared_key: SharedSecret) -> anyhow::Result<()> {
+        match &self {
+            RecipientData::Encrypted(_) => {
+                return Err(anyhow::anyhow!("Already encrypted".to_string()))
+            }
+            RecipientData::Decrypted(entries) => {
+                let mut data_bytes = Vec::new();
+                data_bytes.write_varint(entries.len() as u64)?;
+                for (idx, hash) in entries {
+                    data_bytes.write_varint(*idx)?;
+                    data_bytes.write_all(hash)?;
+                }
+                let encrypted_data =
+                    encrypt_chunk(data_bytes.as_slice(), b"", shared_key.as_bytes())?;
+
+                *self = RecipientData::Encrypted(encrypted_data.to_vec())
+            }
+        };
+
+        Ok(())
+    }
 }
 
 impl RecipientSection {
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_all(&self.recipient_public_key)?;
         self.recipient_data.serialize(writer)?;
+        Ok(())
+    }
+
+    pub fn encrypt(&mut self, sender_key: &StaticSecret) -> anyhow::Result<()> {
+        let shared_key = sender_key.diffie_hellman(&PublicKey::from(self.recipient_public_key));
+        match &self.recipient_data {
+            RecipientData::Encrypted(_) => {
+                return Err(anyhow::anyhow!("Already encrypted".to_string()))
+            }
+            RecipientData::Decrypted(entries) => {
+                let mut data_bytes = Vec::new();
+                data_bytes.write_varint(entries.len() as u64)?;
+                for (idx, hash) in entries {
+                    data_bytes.write_all(&encode_u64_be(*idx))?;
+                    data_bytes.write_all(hash)?;
+                }
+                let encrypted_data =
+                    encrypt_chunk(data_bytes.as_slice(), b"", shared_key.as_bytes())?;
+
+                self.recipient_data = RecipientData::Encrypted(encrypted_data.to_vec())
+            }
+        };
+
         Ok(())
     }
 }
