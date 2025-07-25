@@ -1,6 +1,4 @@
-pub mod deserialization;
-pub mod serialization;
-pub mod structs;
+pub mod chacha_poly1305;
 pub mod directory;
 pub mod hash;
 pub mod x25519_keys;
