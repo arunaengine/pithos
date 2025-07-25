@@ -79,7 +79,6 @@ pub enum CryptError {
 /// # Examples
 ///
 /// ```rust
-///
 /// use pithos_lib::helpers::x25519_keys::generate_private_key;
 /// let private_key = generate_private_key().unwrap();
 /// let public_key = x25519_dalek::PublicKey::from(&private_key);
@@ -87,6 +86,37 @@ pub enum CryptError {
 pub fn generate_private_key() -> Result<StaticSecret, CryptError> {
     let secret = StaticSecret::random_from_rng(OsRng);
     Ok(secret)
+}
+
+/// Derive a shared secret using X25519 key agreement
+///
+/// # Arguments
+///
+/// * `private_key` - The local party's X25519 private key (`StaticSecret`)
+/// * `public_key` - The remote party's X25519 public key (`PublicKey`)
+///
+/// # Returns
+///
+/// Returns a 32-byte shared secret as a `[u8;32]`.
+///
+/// # Examples
+///
+/// ```rust
+/// use pithos_lib::helpers::x25519_keys::{generate_private_key, derive_shared_key};
+/// use x25519_dalek::PublicKey;
+///
+/// let private_a = generate_private_key().unwrap();
+/// let public_a = PublicKey::from(&private_a);
+/// let private_b = generate_private_key().unwrap();
+/// let public_b = PublicKey::from(&private_b);
+///
+/// let shared_ab = derive_shared_key(&private_a, &public_b);
+/// let shared_ba = derive_shared_key(&private_b, &public_a);
+/// assert_eq!(shared_ab, shared_ba);
+/// ```
+pub fn derive_shared_key(private_key: &StaticSecret, public_key: &PublicKey) -> [u8; 32] {
+    let shared = private_key.diffie_hellman(public_key);
+    shared.to_bytes()
 }
 
 /// Convert an X25519 private key to PEM-encoded PKCS#8 bytes
@@ -153,14 +183,11 @@ pub fn private_key_to_pem_bytes(key: &StaticSecret) -> Result<Vec<u8>, CryptErro
 pub fn private_key_from_pem_bytes(pem_data: &[u8]) -> Result<StaticSecret, CryptError> {
     let pem_str = std::str::from_utf8(pem_data)
         .map_err(|e| CryptError::InvalidPemFormat(format!("Invalid UTF-8: {}", e)))?;
-    dbg!(&pem_str);
 
     let (label, doc) = SecretDocument::from_pem(pem_str)
         .map_err(|e| CryptError::InvalidPemFormat(e.to_string()))?;
     PrivateKeyInfo::validate_pem_label(label)
         .map_err(|e| CryptError::InvalidPemFormat(e.to_string()))?;
-
-    dbg!(doc.as_bytes().len());
 
     let key_bytes = match doc.as_bytes() {
         bytes if bytes.len() == 48 && bytes[..16] == X25519_PKCS8_DER_HEADER => {
@@ -267,6 +294,23 @@ mod tests {
         let key = generate_private_key().expect("Failed to generate private key");
         // Verify we can derive a public key
         let _public_key = PublicKey::from(&key);
+    }
+
+    #[test]
+    fn test_derive_shared_key() {
+        let private_a = generate_private_key().unwrap();
+        let public_a = PublicKey::from(&private_a);
+        let private_b = generate_private_key().unwrap();
+        let public_b = PublicKey::from(&private_b);
+
+        let shared_ab = derive_shared_key(&private_a, &public_b);
+        let shared_ba = derive_shared_key(&private_b, &public_a);
+
+        // The shared secrets should be equal
+        assert_eq!(shared_ab, shared_ba);
+
+        // The shared secret should be 32 bytes
+        assert_eq!(shared_ab.len(), 32);
     }
 
     #[test]
