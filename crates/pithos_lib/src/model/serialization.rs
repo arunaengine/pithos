@@ -8,6 +8,7 @@
 
 use crate::helpers::chacha_poly1305::encrypt_chunk;
 use crate::model::structs::*;
+use byteorder::{BigEndian, WriteBytesExt};
 use integer_encoding::VarIntWriter;
 use std::io::Write;
 use thiserror::Error;
@@ -28,20 +29,9 @@ impl From<std::io::Error> for SerializationError {
 
 // Helper: encode string (UTF-8 with varint length prefix)
 pub fn encode_string<W: Write>(writer: &mut W, s: &str) -> Result<(), SerializationError> {
-    writer.write_varint(s.len() as u64)?;
+    writer.write_varint(s.len())?;
     writer.write_all(s.as_bytes())?;
     Ok(())
-}
-
-// Helper: encode u16/u32/u64 as big-endian
-pub fn encode_u16_be(v: u16) -> [u8; 2] {
-    v.to_be_bytes()
-}
-pub fn encode_u32_be(v: u32) -> [u8; 4] {
-    v.to_be_bytes()
-}
-pub fn encode_u64_be(v: u64) -> [u8; 8] {
-    v.to_be_bytes()
 }
 
 // --- Serialization methods for PITHOS Spec Structs ---
@@ -50,7 +40,7 @@ pub fn encode_u64_be(v: u64) -> [u8; 8] {
 impl FileHeader {
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_all(&self.magic)?;
-        writer.write_all(&encode_u16_be(self.version))?;
+        writer.write_varint(self.version)?;
         Ok(())
     }
 
@@ -105,7 +95,10 @@ impl BlockIndexEntry {
 
 impl Directory {
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
+        // Write static identifier
         writer.write_all(&self.identifier)?;
+
+        // Write parent directory offset, if present
         match &self.parent_directory_offset {
             Some((start, len)) => {
                 writer.write_all(&[1u8])?;
@@ -114,26 +107,28 @@ impl Directory {
             }
             None => writer.write_all(&[0u8])?,
         }
-        writer.write_varint(self.files.len() as u64)?;
+
+        // Write fiel
+        writer.write_varint(self.files.len())?;
         for file in &self.files {
             file.serialize(writer)?;
         }
-        writer.write_varint(self.blocks.len() as u64)?;
+        writer.write_varint(self.blocks.len())?;
         for block in &self.blocks {
             block.serialize(writer)?;
         }
-        writer.write_varint(self.relations.len() as u64)?;
+        writer.write_varint(self.relations.len())?;
         for (idx, name) in &self.relations {
             writer.write_varint(*idx)?;
             encode_string(writer, name)?;
         }
-        writer.write_varint(self.encryption.len() as u64)?;
+        writer.write_varint(self.encryption.len())?;
         for enc in &self.encryption {
             enc.serialize(writer)?;
         }
 
-        writer.write_all(&encode_u64_be(self.dir_len))?;
-        writer.write_all(&encode_u32_be(self.crc32))?;
+        writer.write_u64::<BigEndian>(self.dir_len)?; // Actually writes the 8 bytes
+        writer.write_u32::<BigEndian>(self.crc32)?; // Actually writes the 4 bytes
         Ok(())
     }
 }
@@ -150,12 +145,12 @@ impl BlockDataState {
         match self {
             BlockDataState::Encrypted(data) => {
                 writer.write_all(&[0u8])?;
-                writer.write_varint(data.len() as u64)?;
+                writer.write_varint(data.len())?;
                 writer.write_all(data)?;
             }
             BlockDataState::Decrypted(list) => {
                 writer.write_all(&[1u8])?;
-                writer.write_varint(list.len() as u64)?;
+                writer.write_varint(list.len())?;
                 for (idx, hash) in list {
                     writer.write_varint(*idx)?;
                     writer.write_all(hash)?;
@@ -178,7 +173,7 @@ impl BlockDataState {
             }
             BlockDataState::Decrypted(entries) => {
                 let mut data_bytes = Vec::new();
-                data_bytes.write_varint(entries.len() as u64)?;
+                data_bytes.write_varint(entries.len())?;
                 for (idx, hash) in entries {
                     data_bytes.write_varint(*idx)?;
                     data_bytes.write_all(hash)?;
@@ -199,11 +194,11 @@ impl FileEntry {
         encode_string(writer, &self.path)?;
         self.file_type.serialize(writer)?;
         self.block_data.serialize(writer)?;
-        writer.write_all(&encode_u64_be(self.created))?;
-        writer.write_all(&encode_u64_be(self.modified))?;
+        writer.write_varint(self.created)?;
+        writer.write_varint(self.modified)?;
         writer.write_varint(self.file_size)?;
-        writer.write_all(&encode_u32_be(self.permissions))?;
-        writer.write_varint(self.references.len() as u64)?;
+        writer.write_varint(self.permissions)?;
+        writer.write_varint(self.references.len())?;
         for r in &self.references {
             r.serialize(writer)?;
         }
@@ -243,7 +238,7 @@ impl Reference {
 impl EncryptionSection {
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_all(&self.sender_public_key)?;
-        writer.write_varint(self.recipients.len() as u64)?;
+        writer.write_varint(self.recipients.len())?;
         for r in &self.recipients {
             r.serialize(writer)?;
         }
@@ -256,12 +251,12 @@ impl RecipientData {
         match self {
             RecipientData::Encrypted(data) => {
                 writer.write_all(&[0u8])?;
-                writer.write_varint(data.len() as u64)?;
+                writer.write_varint(data.len())?;
                 writer.write_all(data)?;
             }
             RecipientData::Decrypted(list) => {
                 writer.write_all(&[1u8])?;
-                writer.write_varint(list.len() as u64)?;
+                writer.write_varint(list.len())?;
                 for (idx, hash) in list {
                     writer.write_varint(*idx)?;
                     writer.write_all(hash)?;
@@ -271,18 +266,19 @@ impl RecipientData {
         Ok(())
     }
 
-    pub fn encrypt(&mut self, shared_key: SharedSecret) -> anyhow::Result<()> {
+    pub fn encrypt(&mut self, shared_key: &SharedSecret) -> anyhow::Result<()> {
         match &self {
             RecipientData::Encrypted(_) => {
                 return Err(anyhow::anyhow!("Already encrypted".to_string()))
             }
             RecipientData::Decrypted(entries) => {
                 let mut data_bytes = Vec::new();
-                data_bytes.write_varint(entries.len() as u64)?;
-                for (idx, hash) in entries {
+                data_bytes.write_varint(entries.len())?;
+                for (idx, key) in entries {
                     data_bytes.write_varint(*idx)?;
-                    data_bytes.write_all(hash)?;
+                    data_bytes.write_all(key)?;
                 }
+                
                 let encrypted_data =
                     encrypt_chunk(data_bytes.as_slice(), b"", shared_key.as_bytes())?;
 
@@ -309,11 +305,12 @@ impl RecipientSection {
             }
             RecipientData::Decrypted(entries) => {
                 let mut data_bytes = Vec::new();
-                data_bytes.write_varint(entries.len() as u64)?;
-                for (idx, hash) in entries {
-                    data_bytes.write_all(&encode_u64_be(*idx))?;
-                    data_bytes.write_all(hash)?;
+                data_bytes.write_varint(entries.len())?;
+                for (idx, key) in entries {
+                    data_bytes.write_varint(*idx)?;
+                    data_bytes.write_all(key)?;
                 }
+
                 let encrypted_data =
                     encrypt_chunk(data_bytes.as_slice(), b"", shared_key.as_bytes())?;
 
@@ -324,9 +321,6 @@ impl RecipientSection {
         Ok(())
     }
 }
-
-// --- Error Types (FormatError) ---
-// Not serialized as part of archive, so not implemented here.
 
 // --- Tests ---
 #[cfg(test)]

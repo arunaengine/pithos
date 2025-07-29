@@ -6,14 +6,13 @@
 // - Strings: UTF-8 with varint length prefix
 // - Error handling via DeserializationError
 
-use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
+use crate::helpers::chacha_poly1305::decrypt_chunk;
 use crate::model::structs::*;
-use integer_encoding::{VarIntReader, VarIntWriter};
-use std::io::{Error as IoError, Read, Write};
-use byteorder::ReadBytesExt;
+use byteorder::{BigEndian, ReadBytesExt};
+use integer_encoding::VarIntReader;
+use std::io::{Error as IoError, Read};
 use thiserror::Error;
-use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
-use zstd::zstd_safe::WriteBuf;
+use x25519_dalek::SharedSecret;
 
 /// Custom error type for deserialization operations
 #[derive(Error, Debug)]
@@ -46,27 +45,10 @@ impl From<std::string::FromUtf8Error> for DeserializationError {
     }
 }
 
-// Helper: decode big-endian u16/u32/u64
-pub fn decode_u16_be<R: Read>(reader: &mut R) -> Result<u16, DeserializationError> {
-    let mut buf = [0u8; 2];
-    reader.read_exact(&mut buf)?;
-    Ok(u16::from_be_bytes(buf))
-}
-pub fn decode_u32_be<R: Read>(reader: &mut R) -> Result<u32, DeserializationError> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(u32::from_be_bytes(buf))
-}
-pub fn decode_u64_be<R: Read>(reader: &mut R) -> Result<u64, DeserializationError> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(u64::from_be_bytes(buf))
-}
-
 // Helper: decode string (UTF-8 with varint length prefix)
 pub fn decode_string<R: Read>(reader: &mut R) -> Result<String, DeserializationError> {
-    let len = reader.read_varint::<u64>()?;
-    let mut buf = vec![0u8; len as usize];
+    let len = reader.read_varint()?;
+    let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
     Ok(String::from_utf8(buf)?)
 }
@@ -76,7 +58,7 @@ impl FileHeader {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
-        let version = decode_u16_be(reader)?;
+        let version: u16 = reader.read_varint()?;
         Ok(FileHeader { magic, version })
     }
 }
@@ -118,12 +100,12 @@ impl BlockLocation {
 // BlockIndexEntry
 impl BlockIndexEntry {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let index = reader.read_varint::<u64>()?;
+        let index: u64 = reader.read_varint()?;
         let mut hash = [0u8; 32];
         reader.read_exact(&mut hash)?;
-        let offset = reader.read_varint::<u64>()?;
-        let stored_size = reader.read_varint::<u64>()?;
-        let original_size = reader.read_varint::<u64>()?;
+        let offset: u64 = reader.read_varint()?;
+        let stored_size: u64 = reader.read_varint()?;
+        let original_size: u64 = reader.read_varint()?;
         let flags = ProcessingFlags::deserialize(reader)?;
         let location = BlockLocation::deserialize(reader)?;
         Ok(BlockIndexEntry {
@@ -141,8 +123,11 @@ impl BlockIndexEntry {
 // Directory
 impl Directory {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
+        // Read static directory identifier
         let mut identifier = [0u8; 8];
         reader.read_exact(&mut identifier)?;
+
+        // Read parent directory offset
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag)?;
         let parent_directory_offset = match tag[0] {
@@ -154,30 +139,37 @@ impl Directory {
             }
             _ => return Err(DeserializationError::InvalidOption),
         };
-        let files_len = reader.read_varint::<u64>()?;
-        let mut files = Vec::with_capacity(files_len as usize);
+
+        // Read file entries
+        let files_len = reader.read_varint()?;
+        let mut files = Vec::with_capacity(files_len);
         for _ in 0..files_len {
             files.push(FileEntry::deserialize(reader)?);
         }
-        let blocks_len = reader.read_varint::<u64>()?;
-        let mut blocks = Vec::with_capacity(blocks_len as usize);
+
+        let blocks_len = reader.read_varint()?;
+        let mut blocks = Vec::with_capacity(blocks_len);
         for _ in 0..blocks_len {
             blocks.push(BlockIndexEntry::deserialize(reader)?);
         }
-        let relations_len = reader.read_varint::<u64>()?;
-        let mut relations = Vec::with_capacity(relations_len as usize);
+
+        let relations_len = reader.read_varint()?;
+        let mut relations = Vec::with_capacity(relations_len);
         for _ in 0..relations_len {
             let idx = reader.read_varint::<u64>()?;
             let name = decode_string(reader)?;
             relations.push((idx, name));
         }
-        let encryption_len = reader.read_varint::<u64>()?;
-        let mut encryption = Vec::with_capacity(encryption_len as usize);
+
+        let encryption_len = reader.read_varint()?;
+        let mut encryption = Vec::with_capacity(encryption_len);
         for _ in 0..encryption_len {
             encryption.push(EncryptionSection::deserialize(reader)?);
         }
-        let dir_len = reader.read_varint::<u64>()?;
-        let crc32 = decode_u32_be(reader)?;
+
+        let dir_len = reader.read_u64::<BigEndian>()?;
+        let crc32 = reader.read_u32::<BigEndian>()?;
+
         Ok(Directory {
             identifier,
             parent_directory_offset,
@@ -213,16 +205,16 @@ impl BlockDataState {
         reader.read_exact(&mut tag)?;
         match tag[0] {
             0 => {
-                let len = reader.read_varint::<u64>()?;
-                let mut buf = vec![0u8; len as usize];
+                let len = reader.read_varint()?;
+                let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf)?;
                 Ok(BlockDataState::Encrypted(buf))
             }
             1 => {
-                let list_len = reader.read_varint::<u64>()?;
-                let mut list = Vec::with_capacity(list_len as usize);
+                let list_len = reader.read_varint()?;
+                let mut list = Vec::with_capacity(list_len);
                 for _ in 0..list_len {
-                    let idx = reader.read_varint::<u64>()?;
+                    let idx: u64 = reader.read_varint()?;
                     let mut hash = [0u8; 32];
                     reader.read_exact(&mut hash)?;
                     list.push((idx, hash));
@@ -232,21 +224,54 @@ impl BlockDataState {
             v => Err(DeserializationError::InvalidEnumValue(v)),
         }
     }
+
+    pub fn deserialize_block_index<R: Read>(
+        &self,
+        reader: &mut R,
+    ) -> Result<Vec<(u64, [u8; 32])>, DeserializationError> {
+        let list_len = reader.read_varint()?;
+        let mut list = Vec::with_capacity(list_len);
+        for _ in 0..list_len {
+            let idx: u64 = reader.read_varint()?;
+            let mut key = [0u8; 32];
+            reader.read_exact(&mut key)?;
+            list.push((idx, key));
+        }
+
+        Ok(list)
+    }
+
+    pub fn decrypt(&mut self, key: &[u8; 32]) -> anyhow::Result<()> {
+        match &self {
+            BlockDataState::Encrypted(data) => {
+                let decrypted_bytes = decrypt_chunk(&data, &key)?;
+                let block_data_entries =
+                    self.deserialize_block_index(&mut decrypted_bytes.as_slice())?;
+
+                *self = BlockDataState::Decrypted(block_data_entries);
+            }
+            BlockDataState::Decrypted(_) => {
+                // Nothing to do
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // FileEntry
 impl FileEntry {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let file_id = reader.read_varint::<u64>()?;
+        let file_id: u64 = reader.read_varint()?;
         let path = decode_string(reader)?;
         let file_type = FileType::deserialize(reader)?;
         let block_data = BlockDataState::deserialize(reader)?;
-        let created = decode_u64_be(reader)?;
-        let modified = decode_u64_be(reader)?;
-        let file_size = reader.read_varint::<u64>()?;
-        let permissions = decode_u32_be(reader)?;
-        let refs_len = reader.read_varint::<u64>()?;
-        let mut references = Vec::with_capacity(refs_len as usize);
+        let created: u64 = reader.read_varint()?;
+        let modified: u64 = reader.read_varint()?;
+        let file_size: u64 = reader.read_varint()?;
+        let permissions: u32 = reader.read_varint()?;
+        let refs_len = reader.read_varint()?;
+        let mut references = Vec::with_capacity(refs_len);
         for _ in 0..refs_len {
             references.push(Reference::deserialize(reader)?);
         }
@@ -275,8 +300,8 @@ impl FileEntry {
 // Reference
 impl Reference {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let target_file_id = reader.read_varint::<u64>()?;
-        let relationship = reader.read_varint::<u64>()?;
+        let target_file_id: u64 = reader.read_varint()?;
+        let relationship: u64 = reader.read_varint()?;
         Ok(Reference {
             target_file_id,
             relationship,
@@ -289,8 +314,9 @@ impl EncryptionSection {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut sender_public_key = [0u8; 32];
         reader.read_exact(&mut sender_public_key)?;
-        let recipients_len = reader.read_varint::<u64>()?;
-        let mut recipients = Vec::with_capacity(recipients_len as usize);
+
+        let recipients_len = reader.read_varint()?;
+        let mut recipients = Vec::with_capacity(recipients_len);
         for _ in 0..recipients_len {
             recipients.push(RecipientSection::deserialize(reader)?);
         }
@@ -309,28 +335,40 @@ impl RecipientData {
 
         match tag[0] {
             0 => {
-                let len = reader.read_varint::<u64>()?;
-                let mut buf = vec![0u8; len as usize];
+                let len = reader.read_varint()?;
+                let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf)?;
                 Ok(RecipientData::Encrypted(buf))
             }
             1 => {
-                let list_len = reader.read_varint::<u64>()?;
-                dbg!(&list_len);
-                let mut list = Vec::with_capacity(list_len as usize);
+                let list_len = reader.read_varint()?;
+                let mut list = Vec::with_capacity(list_len);
                 for _ in 0..list_len {
-                    let mut idx_buf = [0u8; 8];
-                    reader.read_exact(&mut idx_buf)?;
-                    let idx = u64::from_be_bytes(idx_buf); //reader.read_varint::<u64>()?;
-                    dbg!(&idx);
-                    let mut hash = [0u8; 32];
-                    reader.read_exact(&mut hash)?;
-                    list.push((idx, hash));
+                    let idx: u64 = reader.read_varint()?;
+                    let mut key = [0u8; 32];
+                    reader.read_exact(&mut key)?;
+                    list.push((idx, key));
                 }
                 Ok(RecipientData::Decrypted(list))
             }
             v => Err(DeserializationError::InvalidEnumValue(v)),
         }
+    }
+
+    pub fn deserialize_decrypted_list<R: Read>(
+        &self,
+        reader: &mut R,
+    ) -> Result<Vec<(u64, [u8; 32])>, DeserializationError> {
+        let list_len = reader.read_varint()?;
+        let mut list = Vec::with_capacity(list_len);
+        for _ in 0..list_len {
+            let idx: u64 = reader.read_varint()?;
+            let mut key = [0u8; 32];
+            reader.read_exact(&mut key)?;
+            list.push((idx, key));
+        }
+
+        Ok(list)
     }
 
     pub fn decrypt(&mut self, shared_key: &SharedSecret) -> anyhow::Result<()> {
@@ -340,11 +378,9 @@ impl RecipientData {
             }
             RecipientData::Encrypted(enc_data) => {
                 let dec_data = decrypt_chunk(enc_data, shared_key.as_bytes())?;
-                dbg!(dec_data.len());
-                let recipient_data = RecipientData::deserialize(&mut dec_data.as_slice())?;
-                dbg!(&recipient_data);
+                let entries = self.deserialize_decrypted_list(&mut dec_data.as_slice())?;
 
-                *self = recipient_data
+                *self = RecipientData::Decrypted(entries);
             }
         };
 
