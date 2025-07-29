@@ -1,10 +1,10 @@
 use crate::io::pithosreader::PithosReaderError;
+use crate::model::serialization::encode_string;
 use crate::model::structs::RecipientData;
 use crate::model::{
     serialization::SerializationError,
     structs::{BlockIndexEntry, Directory, EncryptionSection, FileEntry},
 };
-use borsh::BorshSerialize;
 use crc32fast::Hasher;
 use integer_encoding::VarIntWriter;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -76,8 +76,10 @@ impl DirectoryBuilder {
         for block in &self.blocks {
             block.serialize(&mut buf)?
         }
-        for relation in &self.relations {
-            relation.serialize(&mut buf)?
+        buf.write_varint(self.relations.len() as u64)?;
+        for (idx, name) in &self.relations {
+            buf.write_varint(*idx)?;
+            encode_string(&mut buf, name)?;
         }
         for enc in &self.encryption {
             enc.serialize(&mut buf)?
@@ -110,7 +112,6 @@ impl Directory {
     pub fn update_len(&mut self) -> Result<(), SerializationError> {
         let mut buf = Vec::new();
         self.serialize(&mut buf)?;
-        dbg!(&buf.len());
         self.dir_len = buf.len() as u64;
         Ok(())
     }
@@ -128,8 +129,10 @@ impl Directory {
         for block in &self.blocks {
             block.serialize(&mut buf)?
         }
-        for relation in &self.relations {
-            relation.serialize(&mut buf)?
+        buf.write_varint(self.relations.len() as u64)?;
+        for (idx, name) in &self.relations {
+            buf.write_varint(*idx)?;
+            encode_string(&mut buf, name)?;
         }
         for enc in &self.encryption {
             enc.serialize(&mut buf)?
