@@ -96,7 +96,6 @@ impl PithosWriter {
                 references: vec![],
                 symlink_target: None,
             };
-            file_index = file_index.saturating_add(1);
 
             let mut fastcdc_stream = StreamCDC::with_level(
                 file_handle,
@@ -199,6 +198,9 @@ impl PithosWriter {
                     }
                 }
             }
+
+            // Increment file index
+            file_index = file_index.saturating_add(1);
         }
 
         // Encrypt recipient data and integrate into directory
