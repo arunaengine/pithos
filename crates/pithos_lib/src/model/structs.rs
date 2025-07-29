@@ -32,6 +32,38 @@ impl Default for BlockHeader {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessingFlags(pub u8);
 
+impl ProcessingFlags {
+    // Compression level can be set from 0-7 with the first three bits
+    // 0 = Uncompressed
+    // 7 = Highest compression
+    const COMPRESSION_MASK: u8    = 0b0000_0111;
+
+    // Encryption is toggled with the 4th bit
+    const ENCRYPTION_MASK: u8     = 0b0000_1000;
+    
+    pub fn set_encryption(&mut self, encrypted: bool) {
+        if encrypted {
+            self.0 |= Self::ENCRYPTION_MASK; // Set bit for encryption
+        } else {
+            self.0 &= !Self::ENCRYPTION_MASK; // Clear bit for encryption
+        }
+    }
+
+    // New function to check if encryption is enabled
+    pub fn is_encrypted(&self) -> bool {
+        (self.0 & Self::ENCRYPTION_MASK) != 0
+    }
+
+    pub fn set_compression_level(&mut self, compression_level: u8) {
+        // Only use the lowest 3 bits (0-7)
+        self.0 = (self.0 & !Self::COMPRESSION_MASK) | (compression_level & Self::COMPRESSION_MASK);
+    }
+
+    pub fn get_compression_level(&self) -> u8 {
+        self.0 & Self::COMPRESSION_MASK
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockLocation {
     Local,                    // Block data at specified offset in this file
