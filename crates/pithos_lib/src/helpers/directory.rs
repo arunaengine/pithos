@@ -155,24 +155,32 @@ impl Directory {
         todo!()
     }
 
-    pub fn decrypt_recipient_section(&mut self, reader_key: &StaticSecret) -> anyhow::Result<()> {
+    pub fn decrypt_recipient_section(
+        &mut self,
+        reader_key: &StaticSecret,
+    ) -> anyhow::Result<Vec<(u64, [u8; 32])>> {
+        // Store for decrypted sections
+        let mut available_file_indices = Vec::<(u64, [u8; 32])>::new();
+
+        //
         for e_section in self.encryption.iter_mut() {
             let sender_pubkey = PublicKey::from(e_section.sender_public_key);
             let shared_key = reader_key.diffie_hellman(&sender_pubkey);
 
             for r_section in e_section.recipients.iter_mut() {
                 if let RecipientData::Encrypted(_) = r_section.recipient_data {
-                    r_section
-                        .recipient_data
-                        .decrypt(&shared_key)
-                        .map_err(|e| {
-                            dbg!(&e);
-                            PithosReaderError::Other(e.to_string())
-                        })?;
+                    r_section.recipient_data.decrypt(&shared_key).map_err(|e| {
+                        dbg!(&e);
+                        PithosReaderError::Other(e.to_string())
+                    })?;
+
+                    if let RecipientData::Decrypted(entries) = &r_section.recipient_data {
+                        available_file_indices.extend(entries);
+                    }
                 }
             }
         }
 
-        Ok(())
+        Ok(available_file_indices)
     }
 }
