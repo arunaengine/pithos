@@ -25,6 +25,8 @@ pub struct FileWithMetadata {
     pub file_path: String,
     pub file_name: String,
     pub file_metadata: String,
+    pub encrypted: bool,
+    pub compression_level: Option<u8>,
 }
 
 pub struct PithosWriter {

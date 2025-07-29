@@ -14,6 +14,8 @@ mod tests {
             file_path: "/tmp/t8.shakespeare.txt".to_string(),
             file_name: "t8.shakespeare.txt".to_string(),
             file_metadata: "{'foo': 'bar'}".to_string(),
+            encrypted: true,
+            compression_level: None,
         };
 
         let sender_pem_content = std::fs::read_to_string("tests/data/sender_private.pem").unwrap();
