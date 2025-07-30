@@ -36,11 +36,41 @@ impl ProcessingFlags {
     // Compression level can be set from 0-7 with the first three bits
     // 0 = Uncompressed
     // 7 = Highest compression
-    const COMPRESSION_MASK: u8    = 0b0000_0111;
+    const COMPRESSION_MASK: u8 = 0b0000_0111;
 
-    // Encryption is toggled with the 4th bit
-    const ENCRYPTION_MASK: u8     = 0b0000_1000;
-    
+    // Encryption is indicated with the 4th bit
+    const ENCRYPTION_MASK: u8 = 0b0000_1000;
+
+    pub fn new(encrypted: bool, compression_level: Option<u8>) -> Self {
+        // Init
+        let mut flags = ProcessingFlags(0b0);
+
+        // Set compression level
+        if let Some(level) = compression_level {
+            if level > Self::COMPRESSION_MASK {
+                flags.set_compression_level(Self::COMPRESSION_MASK) // Cap at maximum
+            } else {
+                flags.set_compression_level(3) // Default is compression level 3
+            }
+        }
+
+        // Set encryption
+        flags.set_encryption(encrypted);
+        flags
+    }
+
+    pub fn from_byte(byte: u8) -> Self {
+        // Init with byte
+        let mut flags = ProcessingFlags(byte);
+        // Clear unused bits
+        flags.0 = flags.0 & !(Self::COMPRESSION_MASK | Self::ENCRYPTION_MASK);
+        flags
+    }
+
+    pub fn default() -> Self {
+        ProcessingFlags::new(true, None)
+    }
+
     pub fn set_encryption(&mut self, encrypted: bool) {
         if encrypted {
             self.0 |= Self::ENCRYPTION_MASK; // Set bit for encryption
