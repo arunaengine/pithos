@@ -26,6 +26,8 @@ pub enum DeserializationError {
     /// Invalid enum value encountered
     #[error("Invalid enum value: {0}")]
     InvalidEnumValue(u8),
+    #[error("Invalid marker: {0}")]
+    InvalidMarker(String),
     /// Invalid option encountered
     #[error("Invalid option")]
     InvalidOption,
@@ -55,19 +57,37 @@ pub fn decode_string<R: Read>(reader: &mut R) -> Result<String, DeserializationE
 
 // FileHeader
 impl FileHeader {
+    const FILE_HEADER_MARKER: [u8; 4] = *b"PITH";
+
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let mut magic = [0u8; 4];
-        reader.read_exact(&mut magic)?;
+        let mut marker = [0u8; 4];
+        reader.read_exact(&mut marker)?;
+
+        // Validate correct file header marker
+        if marker != Self::FILE_HEADER_MARKER {
+            return Err(DeserializationError::InvalidMarker(format!(
+                "Read invalid block marker {marker:?}"
+            )));
+        }
+
         let version: u16 = reader.read_varint()?;
-        Ok(FileHeader { magic, version })
+        Ok(FileHeader { magic: marker, version })
     }
 }
 
 // BlockHeader
 impl BlockHeader {
+    const BLOCK_HEADER_MARKER: [u8; 4] = *b"BLCK";
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut marker = [0u8; 4];
         reader.read_exact(&mut marker)?;
+
+        if marker != Self::BLOCK_HEADER_MARKER {
+            return Err(DeserializationError::InvalidMarker(format!(
+                "Read invalid block marker {marker:?}"
+            )));
+        }
+
         Ok(BlockHeader { marker })
     }
 }
@@ -371,20 +391,19 @@ impl RecipientData {
         Ok(list)
     }
 
-    pub fn decrypt(&mut self, shared_key: &SharedSecret) -> anyhow::Result<()> {
-        match &self {
-            RecipientData::Decrypted(_) => {
-                // Do nothing, already decrypted
-            }
+    pub fn decrypt(&mut self, shared_key: &SharedSecret) -> anyhow::Result<Vec<(u64, [u8; 32])>> {
+        let entries = match &self {
+            RecipientData::Decrypted(entries) => entries.clone(),
             RecipientData::Encrypted(enc_data) => {
                 let dec_data = decrypt_chunk(enc_data, shared_key.as_bytes())?;
                 let entries = self.deserialize_decrypted_list(&mut dec_data.as_slice())?;
 
-                *self = RecipientData::Decrypted(entries);
+                *self = RecipientData::Decrypted(entries.clone());
+                entries
             }
         };
 
-        Ok(())
+        Ok(entries)
     }
 }
 
