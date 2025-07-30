@@ -123,6 +123,45 @@ pub struct FileEntry {
     pub symlink_target: Option<String>, // Target path for symlinks
 }
 
+impl FileEntry {
+    pub fn new(file_id: u64, path: &str, metadata: Metadata) -> Result<Self, SystemTimeError> {
+        Ok(FileEntry {
+            file_id,
+            path: path.to_string(),
+            file_type: FileType::Data, //TODO: Directory ingestion
+            block_data: BlockDataState::Decrypted(vec![]),
+            created: metadata
+                .created()
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+            modified: metadata
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+            file_size: metadata.len(),
+            permissions: metadata.permissions().mode(),
+            references: vec![],
+            symlink_target: None,
+        })
+    }
+
+    pub fn add_block_data(&mut self, entry: (u64, [u8; 32])) -> Result<(), PithosWriterError> {
+        match self.block_data {
+            BlockDataState::Encrypted(_) => {
+                return Err(PithosWriterError::InvalidBlockDataState(
+                    "Block data already/still encrypted".to_string(),
+                ));
+            }
+            BlockDataState::Decrypted(ref mut entries) => {
+                entries.push(entry);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
     pub target_file_id: u64, // varint
