@@ -166,10 +166,12 @@ impl BlockDataState {
         Ok(buf)
     }
 
-    pub fn encrypt(&mut self, key: [u8; 32]) -> anyhow::Result<()> {
+    pub fn encrypt(&mut self, key: [u8; 32]) -> Result<(), PithosWriterError> {
         match &self {
             BlockDataState::Encrypted(_) => {
-                return Err(anyhow::anyhow!("Already encrypted".to_string()))
+                return Err(PithosWriterError::InvalidBlockDataState(
+                    "Block encrypted.".to_string(),
+                ));
             }
             BlockDataState::Decrypted(entries) => {
                 let mut data_bytes = Vec::new();
@@ -218,7 +220,7 @@ impl FileEntry {
         Ok(buf)
     }
 
-    pub fn encrypt_block_data(&mut self, key: [u8; 32]) -> anyhow::Result<()> {
+    pub fn encrypt_block_data(&mut self, key: [u8; 32]) -> Result<(), PithosWriterError> {
         self.block_data.encrypt(key)
     }
 
@@ -266,10 +268,12 @@ impl RecipientData {
         Ok(())
     }
 
-    pub fn encrypt(&mut self, shared_key: &SharedSecret) -> anyhow::Result<()> {
+    pub fn encrypt(&mut self, shared_key: &SharedSecret) -> Result<(), PithosWriterError> {
         match &self {
             RecipientData::Encrypted(_) => {
-                return Err(anyhow::anyhow!("Already encrypted".to_string()))
+                return Err(PithosWriterError::InvalidRecipientDataState(
+                    "Recipient data encrypted".to_string(),
+                ));
             }
             RecipientData::Decrypted(entries) => {
                 let mut data_bytes = Vec::new();
@@ -278,7 +282,7 @@ impl RecipientData {
                     data_bytes.write_varint(*idx)?;
                     data_bytes.write_all(key)?;
                 }
-                
+
                 let encrypted_data =
                     encrypt_chunk(data_bytes.as_slice(), b"", shared_key.as_bytes())?;
 
@@ -297,11 +301,13 @@ impl RecipientSection {
         Ok(())
     }
 
-    pub fn encrypt(&mut self, sender_key: &StaticSecret) -> anyhow::Result<()> {
+    pub fn encrypt(&mut self, sender_key: &StaticSecret) -> Result<(), PithosWriterError> {
         let shared_key = sender_key.diffie_hellman(&PublicKey::from(self.recipient_public_key));
         match &self.recipient_data {
             RecipientData::Encrypted(_) => {
-                return Err(anyhow::anyhow!("Already encrypted".to_string()))
+                return Err(PithosWriterError::InvalidRecipientDataState(
+                    "Recipient data encrypted".to_string(),
+                ));
             }
             RecipientData::Decrypted(entries) => {
                 let mut data_bytes = Vec::new();

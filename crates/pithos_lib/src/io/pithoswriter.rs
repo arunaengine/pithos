@@ -20,6 +20,37 @@ use crate::{
     },
     model::structs::FileHeader,
 };
+use fastcdc::v2020::StreamCDC;
+use rand_core::OsRng;
+use std::fs::File;
+use std::io;
+use std::io::Write;
+use x25519_dalek::{PublicKey, StaticSecret};
+
+/// Error type for PithosReader operations
+#[derive(Debug, thiserror::Error)]
+pub enum PithosWriterError {
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+    #[error("FastCDC error: {0}")]
+    FastCDC(#[from] fastcdc::v2020::Error),
+    #[error("Serialization error: {0:?}")]
+    Serialization(#[from] SerializationError),
+    #[error("Crypt error: {0}")]
+    Crypt(#[from] CryptError),
+    #[error("Encryption error: {0}")]
+    Encryption(#[from] ChaChaPoly1305Error),
+    #[error("Compression error: {0}")]
+    Compression(#[from] ZstdError),
+    #[error("File not found: {0}")]
+    FileNotFound(String),
+    #[error("Invalid block data state: {0}")]
+    InvalidBlockDataState(String),
+    #[error("Invalid recipient data state: {0}")]
+    InvalidRecipientDataState(String),
+    #[error("Other error: {0}")]
+    Other(String),
+}
 
 pub struct FileWithMetadata {
     pub file_path: String,

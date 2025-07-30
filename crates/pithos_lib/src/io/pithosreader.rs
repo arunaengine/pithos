@@ -30,7 +30,9 @@ pub enum PithosReaderError {
     #[error("Block not found for file block index {0}")]
     BlockNotFound(u64),
     #[error("Invalid block data state for file block index {0}")]
-    InvalidBlockDataState(u64),
+    InvalidBlockDataState(String),
+    #[error("File not found: {0}")]
+    FileNotFound(String),
     #[error("Other error: {0}")]
     Other(String),
 }
