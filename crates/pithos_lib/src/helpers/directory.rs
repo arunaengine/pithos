@@ -20,6 +20,12 @@ pub struct DirectoryBuilder {
     dir_len: u64,
 }
 
+impl Default for DirectoryBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DirectoryBuilder {
     pub fn new() -> Self {
         DirectoryBuilder {

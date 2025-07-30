@@ -11,14 +11,15 @@ mod tests {
             file_name: "sample.file".to_string(),
             file_metadata: "{'foo': 'bar'}".to_string(),
             encrypted: true,
-            compression_level: None,
+            compression_level: Some(3),
         };
 
         // Read sender private key
         let sender_pem_content = std::fs::read_to_string("tests/data/sender_private.pem").unwrap();
-        let writer_key =
-            pithos_lib::helpers::x25519_keys::private_key_from_pem_bytes(sender_pem_content.as_bytes())
-                .unwrap();
+        let writer_key = pithos_lib::helpers::x25519_keys::private_key_from_pem_bytes(
+            sender_pem_content.as_bytes(),
+        )
+        .unwrap();
 
         // Read recipient public key
         let recipient_pem_content =
@@ -26,7 +27,9 @@ mod tests {
         let reader_key = pithos_lib::helpers::x25519_keys::public_key_from_pem_bytes(
             recipient_pem_content.as_bytes(),
         )
-            .unwrap();
+        .unwrap();
+
+        // Prepare input for writer
         let reader_keys = vec![reader_key];
         let outfile = File::create("/tmp/test.pith").unwrap();
 

@@ -71,7 +71,10 @@ impl FileHeader {
         }
 
         let version: u16 = reader.read_varint()?;
-        Ok(FileHeader { magic: marker, version })
+        Ok(FileHeader {
+            magic: marker,
+            version,
+        })
     }
 }
 
@@ -264,7 +267,7 @@ impl BlockDataState {
     pub fn decrypt(&mut self, key: &[u8; 32]) -> anyhow::Result<()> {
         match &self {
             BlockDataState::Encrypted(data) => {
-                let decrypted_bytes = decrypt_chunk(&data, &key)?;
+                let decrypted_bytes = decrypt_chunk(data, key)?;
                 let block_data_entries =
                     self.deserialize_block_index(&mut decrypted_bytes.as_slice())?;
 

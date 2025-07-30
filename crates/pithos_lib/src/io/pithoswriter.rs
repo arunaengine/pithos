@@ -230,7 +230,7 @@ impl PithosWriter {
             &block
         };
 
-        if probe_compression_ratio(&chunk_sample, Some(compression_level as i32))? < 0.85 {
+        if probe_compression_ratio(chunk_sample, Some(compression_level as i32))? < 0.85 {
             block = compress_data(&block, Some(compression_level as i32))?;
         }
         Ok(block)

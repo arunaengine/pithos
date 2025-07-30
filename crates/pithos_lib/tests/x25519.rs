@@ -33,10 +33,6 @@ mod tests {
 
         // Convert to PEM
         let pem_bytes = private_key_to_pem_bytes(&original_key).expect("Failed to convert to PEM");
-        println!(
-            "{}",
-            String::from_utf8(pem_bytes.clone()).expect("Failed to convert to string")
-        );
 
         // Parse back from PEM
         let parsed_key = private_key_from_pem_bytes(&pem_bytes).expect("Failed to parse from PEM");
@@ -117,11 +113,11 @@ mod tests {
     #[test]
     fn test_error_display() {
         let error = CryptError::InvalidPemFormat("test message".to_string());
-        assert_eq!(format!("{}", error), "Invalid PEM format: test message");
+        assert_eq!(format!("{error}"), "Invalid PEM format: test message");
 
         let error = CryptError::KeyGenerationError("generation failed".to_string());
         assert_eq!(
-            format!("{}", error),
+            format!("{error}"),
             "Key generation error: generation failed"
         );
     }

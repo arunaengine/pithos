@@ -133,7 +133,7 @@ impl PithosReaderSimple {
             .files
             .iter()
             .find(|file| file.path == path)
-            .ok_or_else(|| PithosReaderError::FileNotFound(path))?;
+            .ok_or(PithosReaderError::FileNotFound(path))?;
 
         match &file_entry.block_data {
             BlockDataState::Encrypted(_) => {
@@ -147,7 +147,7 @@ impl PithosReaderSimple {
                         .blocks
                         .iter()
                         .find(|block| block.index == *idx)
-                        .ok_or_else(|| PithosReaderError::BlockKeyNotFound(*idx))?;
+                        .ok_or(PithosReaderError::BlockKeyNotFound(*idx))?;
 
                     self.file.seek(SeekFrom::Start(block_meta.offset))?;
 

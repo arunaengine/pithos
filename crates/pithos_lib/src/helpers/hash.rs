@@ -11,6 +11,12 @@ pub struct Hashes {
     pub shake256: [u8; 32],
 }
 
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Hasher {
     pub fn new() -> Self {
         Hasher {

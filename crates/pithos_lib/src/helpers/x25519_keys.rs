@@ -21,12 +21,12 @@
 //! let parsed_public = public_key_from_pem_bytes(&public_pem).unwrap();
 //! ```
 
-use pkcs8::der::pem::PemLabel;
 use pkcs8::der::EncodePem;
+use pkcs8::der::pem::PemLabel;
 use pkcs8::spki::AlgorithmIdentifier;
 use pkcs8::{
-    der, Document, LineEnding, ObjectIdentifier, PrivateKeyInfo, SecretDocument,
-    SubjectPublicKeyInfoRef,
+    Document, LineEnding, ObjectIdentifier, PrivateKeyInfo, SecretDocument,
+    SubjectPublicKeyInfoRef, der,
 };
 use rand::rngs::OsRng;
 use std::str::FromStr;
@@ -182,7 +182,7 @@ pub fn private_key_to_pem_bytes(key: &StaticSecret) -> Result<Vec<u8>, CryptErro
 /// ```
 pub fn private_key_from_pem_bytes(pem_data: &[u8]) -> Result<StaticSecret, CryptError> {
     let pem_str = std::str::from_utf8(pem_data)
-        .map_err(|e| CryptError::InvalidPemFormat(format!("Invalid UTF-8: {}", e)))?;
+        .map_err(|e| CryptError::InvalidPemFormat(format!("Invalid UTF-8: {e}")))?;
 
     let (label, doc) = SecretDocument::from_pem(pem_str)
         .map_err(|e| CryptError::InvalidPemFormat(e.to_string()))?;
@@ -264,7 +264,7 @@ pub fn public_key_to_pem_bytes(key: &PublicKey) -> Result<Vec<u8>, CryptError> {
 /// ```
 pub fn public_key_from_pem_bytes(pem_data: &[u8]) -> Result<PublicKey, CryptError> {
     let pem_str = std::str::from_utf8(pem_data)
-        .map_err(|e| CryptError::InvalidPemFormat(format!("Invalid UTF-8: {}", e)))?;
+        .map_err(|e| CryptError::InvalidPemFormat(format!("Invalid UTF-8: {e}")))?;
 
     let (label, doc) =
         Document::from_pem(pem_str).map_err(|e| CryptError::InvalidPemFormat(e.to_string()))?;

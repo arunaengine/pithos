@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod marshalling_tests {
-    use pithos_lib::model::structs::*;
     use pithos_lib::helpers::x25519_keys::generate_private_key;
+    use pithos_lib::model::serialization::encode_string;
+    use pithos_lib::model::structs::*;
     use std::io::Cursor;
     use x25519_dalek::PublicKey;
-    use pithos_lib::model::serialization::encode_string;
 
     #[test]
     fn test_varint_encoding() {

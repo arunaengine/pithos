@@ -27,7 +27,7 @@ mod tests {
     #[test]
     fn test_decrypt_chunk_invalid_nonce() {
         let key = [42u8; 32];
-        let chunk = vec![1u8; 20];
+        let chunk = [1u8; 20];
         // Make nonce slice not 12 bytes
         let result = decrypt_chunk(&chunk[..5], &key);
         assert!(

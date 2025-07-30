@@ -1,3 +1,8 @@
+use crate::io::pithoswriter::PithosWriterError;
+use std::fs::Metadata;
+use std::os::unix::fs::PermissionsExt;
+use std::time::{SystemTime, SystemTimeError};
+
 // Struct and enum definitions for PITHOS serialization.
 // Extracted from serialization.rs for modularity.
 //
@@ -63,12 +68,8 @@ impl ProcessingFlags {
         // Init with byte
         let mut flags = ProcessingFlags(byte);
         // Clear unused bits
-        flags.0 = flags.0 & !(Self::COMPRESSION_MASK | Self::ENCRYPTION_MASK);
+        flags.0 &= !(Self::COMPRESSION_MASK | Self::ENCRYPTION_MASK);
         flags
-    }
-
-    pub fn default() -> Self {
-        ProcessingFlags::new(true, None)
     }
 
     pub fn set_encryption(&mut self, encrypted: bool) {
@@ -91,6 +92,12 @@ impl ProcessingFlags {
 
     pub fn get_compression_level(&self) -> u8 {
         self.0 & Self::COMPRESSION_MASK
+    }
+}
+
+impl Default for ProcessingFlags {
+    fn default() -> Self {
+        ProcessingFlags::new(true, None)
     }
 }
 

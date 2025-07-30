@@ -7,6 +7,7 @@
 // - Only serialization to bytes is implemented (no deserialization)
 
 use crate::helpers::chacha_poly1305::encrypt_chunk;
+use crate::io::pithoswriter::PithosWriterError;
 use crate::model::structs::*;
 use byteorder::{BigEndian, WriteBytesExt};
 use integer_encoding::VarIntWriter;

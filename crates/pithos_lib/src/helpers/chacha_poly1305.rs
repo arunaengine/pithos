@@ -64,6 +64,5 @@ pub fn decrypt_chunk(
 
     cipher
         .decrypt(nonce_slice.into(), payload)
-        .map(|plaintext| plaintext.into())
         .map_err(|e| ChaChaPoly1305Error::DecryptionError(e.to_string()))
 }
