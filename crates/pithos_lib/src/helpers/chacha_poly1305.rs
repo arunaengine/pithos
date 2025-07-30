@@ -1,7 +1,6 @@
-use bytes::{BufMut, Bytes, BytesMut};
 use chacha20poly1305::{
-    aead::{Aead, Payload},
     AeadCore, ChaCha20Poly1305,
+    aead::{Aead, Payload},
 };
 use digest::KeyInit;
 use rand_core::OsRng;
@@ -23,29 +22,22 @@ pub enum ChaChaPoly1305Error {
     ChunkTooSmall(usize),
 }
 
-pub fn encrypt_chunk(msg: &[u8], aad: &[u8], enc: &[u8]) -> Result<Bytes, ChaChaPoly1305Error> {
-    let mut nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let mut bytes = BytesMut::new();
-    let pload = Payload { msg, aad };
+pub fn encrypt_chunk(msg: &[u8], aad: &[u8], enc: &[u8]) -> Result<Vec<u8>, ChaChaPoly1305Error> {
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let payload = Payload { msg, aad };
+
     let cipher = ChaCha20Poly1305::new_from_slice(enc)
         .map_err(|e| ChaChaPoly1305Error::CipherInitError(e.to_string()))?;
-    let mut result = cipher
-        .encrypt(&nonce, pload)
+    let result = cipher
+        .encrypt(&nonce, payload)
         .map_err(|e| ChaChaPoly1305Error::EncryptionError(e.to_string()))?;
 
-    while result.ends_with(&[0u8]) {
-        let pload = Payload { msg, aad };
-        nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        result = cipher
-            .encrypt(&nonce, pload)
-            .map_err(|e| ChaChaPoly1305Error::EncryptionError(e.to_string()))?;
-    }
+    let mut bytes = Vec::new();
+    bytes.extend(nonce.as_slice());
+    bytes.extend(result.as_slice());
+    bytes.extend(aad);
 
-    bytes.put(nonce.as_ref());
-    bytes.put(result.as_ref());
-    bytes.put(aad);
-
-    Ok(bytes.freeze())
+    Ok(bytes)
 }
 
 pub fn decrypt_chunk(
