@@ -1,3 +1,4 @@
+use crate::model::structs::ProcessingFlags;
 use thiserror::Error;
 use zstd::bulk;
 
@@ -15,8 +16,22 @@ pub enum ZstdError {
     DecompressionError(String),
 }
 
+const ZSTD_MAGIC_NUMBER: u32 = 0xFD2FB528; // 4 Bytes, little-endian format
+
+pub fn map_to_zstd_level(flags: ProcessingFlags) -> i32 {
+    match flags.get_compression_level() {
+        1 => 1,
+        2 => 4,
+        3 => 8,
+        4 => 11,
+        5 => 15,
+        6 => 18,
+        7 => 22,
+        _ => 22, // Everything above is just max compression
+    }
+}
+
 /// Compresses a chunk of data with zstd and returns the compression ratio.
-/// Returns (compressed_data, compression_ratio).
 pub fn probe_compression_ratio(input: &[u8], level: Option<i32>) -> Result<f64, ZstdError> {
     let compressed = bulk::compress(input, level.unwrap_or_default())
         .map_err(|e| ZstdError::CompressionError(e.to_string()))?;
