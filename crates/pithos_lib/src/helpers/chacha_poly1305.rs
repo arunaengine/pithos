@@ -25,13 +25,15 @@ pub enum ChaChaPoly1305Error {
 pub fn encrypt_chunk(msg: &[u8], aad: &[u8], enc: &[u8]) -> Result<Vec<u8>, ChaChaPoly1305Error> {
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let payload = Payload { msg, aad };
-
     let cipher = ChaCha20Poly1305::new_from_slice(enc)
         .map_err(|e| ChaChaPoly1305Error::CipherInitError(e.to_string()))?;
+
+    // Encrypt chunk
     let result = cipher
         .encrypt(&nonce, payload)
         .map_err(|e| ChaChaPoly1305Error::EncryptionError(e.to_string()))?;
 
+    // Gather nonce, encrypted chunk and aad together
     let mut bytes = Vec::new();
     bytes.extend(nonce.as_slice());
     bytes.extend(result.as_slice());

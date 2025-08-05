@@ -109,7 +109,7 @@ impl Directory {
             None => writer.write_all(&[0u8])?,
         }
 
-        // Write fiel
+        // Write file
         writer.write_varint(self.files.len())?;
         for file in &self.files {
             file.serialize(writer)?;
