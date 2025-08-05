@@ -227,4 +227,85 @@ impl PithosReaderSimple {
 
         Ok(())
     }
+
+    pub fn read_data_range_to_sink(
+        &mut self,
+        byte_range: Range<u64>,
+        file_entry: &FileEntry,
+        block_index: &Vec<BlockIndexEntry>,
+        mut sink: Box<dyn Write>,
+    ) -> Result<(), PithosReaderError> {
+        let mut block_byte_sum = 0;
+
+        match &file_entry.block_data {
+            BlockDataState::Encrypted(_) => {
+                return Err(PithosReaderError::InvalidBlockDataState(
+                    "Block data is still encrypted".to_string(),
+                ));
+            }
+            BlockDataState::Decrypted(blocks) => {
+                for (idx, key) in blocks {
+                    let block_meta = block_index
+                        .iter()
+                        .find(|block| block.index == *idx)
+                        .ok_or(PithosReaderError::BlockKeyNotFound(*idx))?;
+
+                    let block_start = block_byte_sum;
+                    let block_end = block_byte_sum + block_meta.original_size;
+                    block_byte_sum = block_end;
+
+                    // If block ends before start of range; Discard block
+                    if block_end <= byte_range.start {
+                        continue;
+                    }
+
+                    // If block starts after end of range; Stop loop
+                    if block_start >= byte_range.end {
+                        break;
+                    }
+
+                    // Read block header for block start validation
+                    self.file.seek(SeekFrom::Start(block_meta.offset))?;
+                    let mut block_header = [0u8; 4];
+                    self.file.read_exact(&mut block_header)?;
+                    BlockHeader::deserialize(&mut block_header.as_slice())?;
+
+                    // Read block data
+                    let mut block_buf = vec![0u8; block_meta.stored_size as usize];
+                    self.file.read_exact(&mut block_buf)?;
+
+                    // Decrypt and decompress according to ProcessingFlags
+                    if block_meta.flags.is_encrypted() {
+                        block_buf = decrypt_chunk(&block_buf, key)?;
+                    }
+
+                    if block_meta.flags.get_compression_level() > 0 {
+                        block_buf = decompress_data(&block_buf, block_meta.original_size)?;
+                    }
+
+                    // Calculate the range within this block to write
+                    let write_start = if byte_range.start > block_start {
+                        (byte_range.start - block_start) as usize
+                    } else {
+                        0
+                    };
+                    let write_end = if byte_range.end < block_end {
+                        (byte_range.end - block_start) as usize
+                    } else {
+                        block_buf.len()
+                    };
+
+                    // Write only the relevant slice of the block
+                    sink.write_all(&block_buf[write_start..write_end])?;
+
+                    // If we've written enough bytes, stop
+                    if block_end >= byte_range.end {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
