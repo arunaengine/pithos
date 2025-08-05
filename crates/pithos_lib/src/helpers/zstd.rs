@@ -18,7 +18,7 @@ pub enum ZstdError {
 
 const ZSTD_MAGIC_NUMBER: u32 = 0xFD2FB528; // 4 Bytes, little-endian format
 
-pub fn map_to_zstd_level(flags: ProcessingFlags) -> i32 {
+pub fn map_to_zstd_level(flags: &ProcessingFlags) -> i32 {
     match flags.get_compression_level() {
         1 => 1,
         2 => 4,

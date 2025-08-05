@@ -120,17 +120,27 @@ impl Directory {
         self.blocks.push(block_index_entry)
     }
 
-    pub fn block_exists(&self, hash: blake3::Hash) -> Option<u64> {
+    pub fn block_exists(&self, hash: blake3::Hash) -> Option<BlockIndexEntry> {
         for block in &self.blocks {
             if &block.hash == hash.as_bytes() {
-                return Some(block.index);
+                return Some(block.clone());
             }
         }
         None
     }
 
-    pub fn add_file_to_index(&mut self, file_entry: FileEntry) {
-        self.files.push(file_entry);
+    pub fn add_file_to_index(&mut self, file_entry: &FileEntry) -> Result<(), PithosWriterError> {
+        if self
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<&str>>()
+            .contains(&file_entry.path.as_str())
+        {
+            return Err(PithosWriterError::PathOccupied(file_entry.path.clone()));
+        }
+
+        Ok(self.files.push(file_entry.clone()))
     }
 
     pub fn add_file_to_recipient(

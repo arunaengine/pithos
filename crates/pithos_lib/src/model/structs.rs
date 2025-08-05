@@ -1,13 +1,13 @@
 use crate::io::pithoswriter::PithosWriterError;
-use std::fs::Metadata;
-use std::os::unix::fs::PermissionsExt;
-use std::time::{SystemTime, SystemTimeError};
-
+use crate::io::util::{current_timestamp, get_symlink_target};
 // Struct and enum definitions for PITHOS serialization.
 // Extracted from serialization.rs for modularity.
 //
 // Import deserialization implementations from helpers/deserialization.rs
 pub use crate::model::deserialization::*;
+use std::fs::Metadata;
+use std::os::unix::fs::PermissionsExt;
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
@@ -131,13 +131,32 @@ pub struct Directory {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FileType {
-    Data = 0,
-    Metadata = 1,
-    Directory = 2,
+    Directory = 0,
+    Data = 1,
+    Metadata = 2,
     Symlink = 3,
     // 4-255 reserved
+}
+
+impl TryFrom<&Metadata> for FileType {
+    type Error = PithosWriterError;
+
+    fn try_from(value: &Metadata) -> Result<Self, Self::Error> {
+        Ok(if value.is_file() {
+            FileType::Data
+        } else if value.is_dir() {
+            FileType::Directory
+        } else if value.is_symlink() {
+            FileType::Symlink
+        } else {
+            return Err(PithosWriterError::Other(format!(
+                "Invalid file type: {:?}",
+                value.file_type()
+            )));
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,11 +180,17 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
-    pub fn new(file_id: u64, path: &str, metadata: Metadata) -> Result<Self, SystemTimeError> {
+    pub fn new(
+        file_id: u64,
+        file_type: FileType,
+        abs_path: &str,
+        rel_path: &str,
+        metadata: &Metadata,
+    ) -> Result<Self, PithosWriterError> {
         Ok(FileEntry {
             file_id,
-            path: path.to_string(),
-            file_type: FileType::Data, //TODO: Directory ingestion
+            path: rel_path.to_string(),
+            file_type,
             block_data: BlockDataState::Decrypted(vec![]),
             created: metadata
                 .created()
@@ -180,6 +205,62 @@ impl FileEntry {
             file_size: metadata.len(),
             permissions: metadata.permissions().mode(),
             references: vec![],
+            symlink_target: if file_type == FileType::Symlink {
+                Some(std::fs::read_link(abs_path)?.to_string_lossy().to_string())
+            } else {
+                None
+            },
+        })
+    }
+
+    pub fn new_from_file(
+        file_id: u64,
+        path: String,
+        file: &std::fs::File,
+        metadata: Metadata,
+    ) -> Result<Self, PithosWriterError> {
+        // Evaluate file type and create file entry
+        let file_type = FileType::try_from(&metadata)?;
+        Ok(FileEntry {
+            file_id,
+            path: path.clone(),
+            file_type,
+            block_data: BlockDataState::Decrypted(Vec::new()),
+            created: metadata
+                .created()
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+            modified: metadata
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+            file_size: metadata.len(),
+            permissions: metadata.permissions().mode(),
+            references: vec![],
+            symlink_target: if file_type == FileType::Symlink {
+                Some(get_symlink_target(file)?)
+            } else {
+                None
+            },
+        })
+    }
+
+    pub fn meta_from(other_file: &FileEntry, meta_length: u64) -> Result<Self, PithosWriterError> {
+        Ok(FileEntry {
+            file_id: other_file.file_id - 1,
+            path: format!("{}.meta", other_file.path),
+            file_type: FileType::Metadata,
+            block_data: BlockDataState::Decrypted(Vec::new()),
+            created: current_timestamp()?, // Just inherit from other file?
+            modified: current_timestamp()?, // Just inherit from other file?
+            file_size: meta_length,
+            permissions: other_file.permissions,
+            references: vec![Reference {
+                target_file_id: other_file.file_id,
+                relationship: 0,
+            }],
             symlink_target: None,
         })
     }

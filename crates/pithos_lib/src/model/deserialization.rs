@@ -212,9 +212,9 @@ impl FileType {
         let mut buf = [0u8; 1];
         reader.read_exact(&mut buf)?;
         match buf[0] {
-            0 => Ok(FileType::Data),
-            1 => Ok(FileType::Metadata),
-            2 => Ok(FileType::Directory),
+            0 => Ok(FileType::Directory),
+            1 => Ok(FileType::Data),
+            2 => Ok(FileType::Metadata),
             3 => Ok(FileType::Symlink),
             v => Err(DeserializationError::InvalidEnumValue(v)),
         }
