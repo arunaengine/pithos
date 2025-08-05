@@ -140,7 +140,8 @@ impl Directory {
             return Err(PithosWriterError::PathOccupied(file_entry.path.clone()));
         }
 
-        Ok(self.files.push(file_entry.clone()))
+        self.files.push(file_entry.clone());
+        Ok(())
     }
 
     pub fn add_file_to_recipient(

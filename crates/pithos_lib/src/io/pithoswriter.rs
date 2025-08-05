@@ -370,7 +370,7 @@ impl PithosWriter {
         // Process files
         let prefix = directory.as_ref().to_str().expect("non-utf8 path");
         for entry in entries {
-            self.process_input(entry, Some(&prefix))?;
+            self.process_input(entry, Some(prefix))?;
         }
 
         Ok(())
