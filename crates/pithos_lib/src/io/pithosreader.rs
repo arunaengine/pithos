@@ -1,14 +1,17 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
-
 use crate::helpers::chacha_poly1305::{ChaChaPoly1305Error, decrypt_chunk};
 use crate::helpers::x25519_keys::{CryptError, private_key_from_pem_bytes};
 use crate::helpers::zstd::{ZstdError, decompress_data};
 use crate::model::deserialization::DeserializationError;
-use crate::model::structs::{BlockDataState, BlockHeader, Directory, FileEntry};
+use crate::model::structs::{
+    BlockDataState, BlockHeader, BlockIndexEntry, Directory, FileEntry, FileType,
+};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 
+use crate::io::util::{create_dir, create_symlink};
 use x25519_dalek::StaticSecret;
 
 /// Error type for PithosReader operations
@@ -86,23 +89,24 @@ impl PithosReaderSimple {
         let mut dir_buf = vec![0u8; dir_len as usize];
         self.file.read_exact(&mut dir_buf)?;
 
+        // Deserialize full directory
         let mut directory = Directory::deserialize(&mut dir_buf.as_slice())?;
 
         // Decrypt file indices in recipient sections
-        let mut available_file_indices = HashMap::new();
+        let mut available_file_keys = HashMap::new();
         let decrypted_file_indices =
             directory
                 .decrypt_recipient(&self.private_key)
                 .map_err(|_| {
                     PithosReaderError::Other("Failed to decrypt recipient data".to_string())
                 })?;
-        available_file_indices.extend(decrypted_file_indices);
+        available_file_keys.extend(decrypted_file_indices);
 
         // Remove all files from directory which cannot be decrypted
         directory.files.retain_mut(|file| match file.block_data {
             BlockDataState::Decrypted(_) => true,
             BlockDataState::Encrypted(_) => {
-                if let Some(block_key) = available_file_indices.get(&file.file_id) {
+                if let Some(block_key) = available_file_keys.get(&file.file_id) {
                     file.block_data.decrypt(block_key).is_ok()
                 } else {
                     false
@@ -110,31 +114,79 @@ impl PithosReaderSimple {
             }
         });
 
-        //TODO: Refactor in cli
-        let outfile = File::create("/tmp/test.out")?;
-        let inner_file = directory.files.first().expect("No file available");
-
-        self.read_file(inner_file.path.clone(), &directory, Box::new(outfile))?;
-
         Ok(directory)
     }
 
-    pub fn read_file_list(&self) -> Result<Vec<FileEntry>, PithosReaderError> {
-        todo!()
+    pub fn read_file_paths(
+        &self,
+        directory: &Directory,
+    ) -> Result<Vec<(FileType, String)>, PithosReaderError> {
+        Ok(directory
+            .files
+            .iter()
+            .map(|f| (f.file_type, f.path.clone()))
+            .collect())
     }
 
     pub fn read_file(
         &mut self,
-        path: String,
+        inner_path: &str,
         directory: &Directory,
-        mut sink: Box<dyn Write>,
+        output_path: Option<&PathBuf>,
+        range: Option<Range<u64>>,
     ) -> Result<(), PithosReaderError> {
         let file_entry = directory
             .files
             .iter()
-            .find(|file| file.path == path)
-            .ok_or(PithosReaderError::FileNotFound(path))?;
+            .find(|file| file.path == inner_path)
+            .ok_or(PithosReaderError::FileNotFound(inner_path.to_string()))?;
 
+        match &file_entry.file_type {
+            FileType::Data | FileType::Metadata => {
+                // Create output file and write file blocks
+                let output_file = File::create(if let Some(base_dir) = output_path {
+                    base_dir.join(inner_path)
+                } else {
+                    std::env::current_dir()?.join(inner_path)
+                })?;
+
+                if let Some(range) = range {
+                    self.read_data_range_to_sink(
+                        range,
+                        file_entry,
+                        &directory.blocks,
+                        Box::new(output_file),
+                    )?;
+                } else {
+                    self.read_data_to_sink(file_entry, &directory.blocks, Box::new(output_file))?;
+                }
+            }
+            FileType::Directory => {
+                // Create directory (parent?)
+                create_dir(&file_entry.path, output_path)?;
+            }
+            FileType::Symlink => {
+                // Create symlink (UNIX only)
+                create_symlink(
+                    &file_entry.path,
+                    file_entry
+                        .symlink_target
+                        .as_ref()
+                        .expect("Symlink has no target"),
+                    output_path,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_data_to_sink(
+        &mut self,
+        file_entry: &FileEntry,
+        block_index: &Vec<BlockIndexEntry>,
+        mut sink: Box<dyn Write>,
+    ) -> Result<(), PithosReaderError> {
         match &file_entry.block_data {
             BlockDataState::Encrypted(_) => {
                 return Err(PithosReaderError::InvalidBlockDataState(
@@ -143,8 +195,7 @@ impl PithosReaderSimple {
             }
             BlockDataState::Decrypted(blocks) => {
                 for (idx, key) in blocks {
-                    let block_meta = directory
-                        .blocks
+                    let block_meta = block_index
                         .iter()
                         .find(|block| block.index == *idx)
                         .ok_or(PithosReaderError::BlockKeyNotFound(*idx))?;

@@ -190,6 +190,10 @@ impl Directory {
         }
     }
 
+    pub fn get_file_entry(&self, path: &str) -> Option<&FileEntry> {
+        self.files.iter().find(|file| file.path == path)
+    }
+
     pub fn encrypt_recipients(
         &mut self,
         writer_key: &StaticSecret,
