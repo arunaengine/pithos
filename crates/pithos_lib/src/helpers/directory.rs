@@ -195,6 +195,27 @@ impl Directory {
         self.files.iter().find(|file| file.path == path)
     }
 
+    pub fn get_file_by_id(&self, file_id: u64) -> Option<&FileEntry> {
+        self.files.iter().find(|file| file.file_id == file_id)
+    }
+
+    // Checks only decrypted recipient sections
+    pub fn get_file_encryption_key(&self, file_id: u64) -> Option<[u8; 32]> {
+        for e_section in &self.encryption {
+            for r_section in &e_section.recipients {
+                match &r_section.recipient_data {
+                    RecipientData::Encrypted(_) => {}
+                    RecipientData::Decrypted(entries) => {
+                        if let Some((_, key)) = entries.iter().find(|(k, _)| *k == file_id) {
+                            return Some(key.clone());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn encrypt_recipients(
         &mut self,
         writer_key: &StaticSecret,
