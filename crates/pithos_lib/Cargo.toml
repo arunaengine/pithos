@@ -28,3 +28,6 @@ thiserror = "2.0.3"
 walkdir = "2.5.0"
 x25519-dalek = { workspace = true }
 zstd = "0.13.3"
+
+[dev-dependencies]
+tempfile = "3.20"
