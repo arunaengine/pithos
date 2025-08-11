@@ -159,6 +159,23 @@ impl TryFrom<&Metadata> for FileType {
     }
 }
 
+impl TryFrom<&DataEntity> for FileType {
+    type Error = PithosWriterError;
+
+    fn try_from(value: &DataEntity) -> Result<Self, Self::Error> {
+        if value.entity_type().contains(&"File".to_string()) {
+            Ok(FileType::Data)
+        } else if value.entity_type().contains(&"Dataset".to_string()) {
+            Ok(FileType::Directory)
+        } else {
+            Err(PithosWriterError::InvalidFileType(format!(
+                "Data entity must have type File or Dataset: {:?}",
+                value.entity_type()
+            )))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockDataState {
     Encrypted(Vec<u8>),              // Chacha + nonce (Random key)
