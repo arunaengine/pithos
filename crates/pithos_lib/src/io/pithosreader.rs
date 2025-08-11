@@ -77,13 +77,13 @@ impl PithosReaderSimple {
 
     /// Init a simple Pithos reader
     pub fn new_with_keys<P: AsRef<Path>>(
-        pithos_path: P,
-        private_key: Vec<StaticSecret>,
+        _pithos_path: P,
+        _private_key: Vec<StaticSecret>,
     ) -> Result<Self, PithosReaderError> {
-        // Open the Pithos file
-        let file = File::open(&pithos_path)?;
-
         unimplemented!("Multiple reader keys");
+
+        // Open the Pithos file
+        //let file = File::open(&_pithos_path)?;
         //Ok(Self { file, private_key })
     }
 
@@ -207,7 +207,7 @@ impl PithosReaderSimple {
     fn read_data_to_sink(
         &mut self,
         file_entry: &FileEntry,
-        block_index: &Vec<BlockIndexEntry>,
+        block_index: &[BlockIndexEntry],
         mut sink: Box<dyn Write>,
     ) -> Result<(), PithosReaderError> {
         match &file_entry.block_data {
@@ -255,7 +255,7 @@ impl PithosReaderSimple {
         &mut self,
         byte_range: Range<u64>,
         file_entry: &FileEntry,
-        block_index: &Vec<BlockIndexEntry>,
+        block_index: &[BlockIndexEntry],
         mut sink: Box<dyn Write>,
     ) -> Result<(), PithosReaderError> {
         let mut block_byte_sum = 0;

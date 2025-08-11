@@ -217,11 +217,11 @@ impl PithosWriter {
         content: Box<dyn Read>,
     ) -> Result<Reference, PithosWriterError> {
         // Directory or Symlink FileEntry are just added to Pithos directory
-        if vec![FileType::Directory, FileType::Symlink].contains(&file_entry.file_type) {
-            self.directory.add_file_to_index(&file_entry)?;
+        if [FileType::Directory, FileType::Symlink].contains(&file_entry.file_type) {
+            self.directory.add_file_to_index(file_entry)?;
             self.file_idx = self.file_idx.saturating_add(1);
 
-            return Ok(Reference::try_from(file_entry)?);
+            return Reference::try_from(file_entry);
         }
 
         // Split content in chunks
@@ -262,7 +262,7 @@ impl PithosWriter {
         self.file_idx = self.file_idx.saturating_add(1);
 
         // Return reference according to FileType
-        Ok(Reference::try_from(file_entry)?)
+        Reference::try_from(file_entry)
     }
 
     pub fn process_input(&mut self, input: InputFile) -> Result<Reference, PithosWriterError> {

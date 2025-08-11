@@ -207,7 +207,7 @@ impl Directory {
                     RecipientData::Encrypted(_) => {}
                     RecipientData::Decrypted(entries) => {
                         if let Some((_, key)) = entries.iter().find(|(k, _)| *k == file_id) {
-                            return Some(key.clone());
+                            return Some(*key);
                         }
                     }
                 }

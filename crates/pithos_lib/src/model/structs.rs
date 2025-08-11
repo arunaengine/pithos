@@ -5,9 +5,9 @@ use crate::io::util::{current_timestamp, get_symlink_target};
 //
 // Import deserialization implementations from helpers/deserialization.rs
 pub use crate::model::deserialization::*;
-use rocrate::entity::EntityTrait;
 use rocrate::DataEntity;
-use std::fs::{symlink_metadata, Metadata};
+use rocrate::entity::EntityTrait;
+use std::fs::{Metadata, symlink_metadata};
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
 
