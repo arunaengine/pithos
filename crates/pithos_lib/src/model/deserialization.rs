@@ -7,6 +7,7 @@
 // - Error handling via DeserializationError
 
 use crate::helpers::chacha_poly1305::decrypt_chunk;
+use crate::io::pithosreader::PithosReaderError;
 use crate::model::structs::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use integer_encoding::VarIntReader;
@@ -264,7 +265,7 @@ impl BlockDataState {
         Ok(list)
     }
 
-    pub fn decrypt(&mut self, key: &[u8; 32]) -> anyhow::Result<()> {
+    pub fn decrypt(&mut self, key: &[u8; 32]) -> Result<(), PithosReaderError> {
         match &self {
             BlockDataState::Encrypted(data) => {
                 let decrypted_bytes = decrypt_chunk(data, key)?;

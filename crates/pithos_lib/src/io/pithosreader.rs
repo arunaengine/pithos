@@ -64,6 +64,29 @@ impl PithosReaderSimple {
         Ok(Self { file, private_key })
     }
 
+    /// Init a simple Pithos reader
+    pub fn new_with_key<P: AsRef<Path>>(
+        pithos_path: P,
+        private_key: StaticSecret,
+    ) -> Result<Self, PithosReaderError> {
+        // Open the Pithos file
+        let file = File::open(&pithos_path)?;
+
+        Ok(Self { file, private_key })
+    }
+
+    /// Init a simple Pithos reader
+    pub fn new_with_keys<P: AsRef<Path>>(
+        pithos_path: P,
+        private_key: Vec<StaticSecret>,
+    ) -> Result<Self, PithosReaderError> {
+        // Open the Pithos file
+        let file = File::open(&pithos_path)?;
+
+        unimplemented!("Multiple reader keys");
+        //Ok(Self { file, private_key })
+    }
+
     pub fn read_directory(&mut self) -> Result<Directory, PithosReaderError> {
         // Read last 12 bytes for crc32 and directory length
         let file_len = self.file.metadata()?.len();
