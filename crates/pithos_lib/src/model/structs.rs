@@ -376,6 +376,22 @@ pub struct Reference {
     pub relationship: u64,   // varint
 }
 
+impl TryFrom<&mut FileEntry> for Reference {
+    type Error = PithosWriterError;
+
+    fn try_from(value: &mut FileEntry) -> Result<Self, Self::Error> {
+        Ok(Reference {
+            target_file_id: value.file_id,
+            relationship: match value.file_type {
+                FileType::Directory => 6, // PART_OF
+                FileType::Data => 7,      // DERIVED_FROM
+                FileType::Metadata => 0,  // DESCRIBES
+                FileType::Symlink => 3,   // SOURCE
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptionSection {
     pub sender_public_key: [u8; 32],       // X25519 public key
