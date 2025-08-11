@@ -18,6 +18,8 @@ use crate::{
 };
 use fastcdc::v2020::{ChunkData, StreamCDC};
 use rand_core::OsRng;
+use rocrate::ROCrate;
+use std::cmp::Ordering;
 use std::fs::{File, symlink_metadata};
 use std::io;
 use std::io::{Cursor, Read, Write};
@@ -353,6 +355,7 @@ impl PithosWriter {
     pub fn process_directory<P: AsRef<Path>>(
         &mut self,
         directory: P,
+        ro_crate: Option<&ROCrate>,
     ) -> Result<(), PithosWriterError> {
         // Walk directory and create file entries
         let mut entries = Vec::new();
@@ -372,9 +375,10 @@ impl PithosWriter {
 
             // Store necessary info
             let input_file = InputFile {
-                file_path: entry.path().to_string_lossy().to_string(),
                 file_type: FileType::try_from(&symlink_metadata(entry.path())?)?,
-                file_meta: None,
+                file_path: relative_path,
+                data: Content::File(entry.path().to_string_lossy().to_string()),
+                metadata: None,
                 encrypt: true,
                 compression_level: Some(3),
             };
@@ -383,16 +387,52 @@ impl PithosWriter {
 
         // Sort directories to front and then by path
         entries.sort_by(|a, b| {
+            // In case of RO-Crate always sort ro-crate-metadata.json to top
+            if ro_crate.is_some() {
+                if a.file_path.contains("ro-crate-metadata.json") {
+                    return Ordering::Less;
+                } else if b.file_path.contains("ro-crate-metadata.json") {
+                    return Ordering::Greater;
+                }
+            }
+
             if a.file_type == b.file_type {
                 return a.file_path.to_lowercase().cmp(&b.file_path.to_lowercase());
             }
             a.file_type.cmp(&b.file_type)
         });
 
-        // Process files
-        let prefix = directory.as_ref().to_str().expect("non-utf8 path");
-        for entry in entries {
-            self.process_input(entry, Some(prefix))?;
+        if let Some(ro_crate) = ro_crate {
+            // Process ro-crate-metadata.json first and reference all other files which are mentioned as data entity
+            let mut entry = entries.remove(0);
+            entry.file_type = FileType::Metadata;
+            dbg!(&entry);
+            let ro_crate_meta_ref = self.process_input(entry)?;
+            dbg!(&ro_crate_meta_ref);
+
+            // Process the rest all files
+            for mut entry in entries {
+                if entry.file_type == FileType::Data {
+                    if ro_crate
+                        .data_entities()
+                        .keys()
+                        .collect::<Vec<_>>()
+                        .contains(&&entry.file_path)
+                    {
+                        println!(
+                            "Found {} in ro-crate-metadata.json data entities ids",
+                            entry.file_path
+                        );
+                    }
+                    entry.metadata = Some(Content::Reference(ro_crate_meta_ref.clone()))
+                }
+                self.process_input(entry)?;
+            }
+        } else {
+            // Just process all files
+            for entry in entries {
+                self.process_input(entry)?;
+            }
         }
 
         Ok(())
@@ -403,7 +443,7 @@ impl PithosWriter {
         directories: Vec<P>,
     ) -> Result<(), PithosWriterError> {
         for directory in directories {
-            self.process_directory(directory)?
+            self.process_directory(directory, None)?
         }
 
         Ok(())
@@ -462,6 +502,15 @@ impl PithosWriter {
         // Write directory
         self.directory.serialize(&mut self.sink)?;
 
+        Ok(())
+    }
+
+    pub fn process_ro_crate(&mut self, crate_data: &ROCrate) -> Result<(), PithosWriterError> {
+        if let Some(base_path) = &crate_data.base_path {
+            self.process_directory(base_path, Some(crate_data))?
+        } else {
+            self.process_directory("", Some(crate_data))?
+        }
         Ok(())
     }
 }
