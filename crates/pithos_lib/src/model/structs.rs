@@ -1,11 +1,13 @@
-use crate::io::pithoswriter::PithosWriterError;
+use crate::io::pithoswriter::{Content, PithosWriterError};
 use crate::io::util::{current_timestamp, get_symlink_target};
 // Struct and enum definitions for PITHOS serialization.
 // Extracted from serialization.rs for modularity.
 //
 // Import deserialization implementations from helpers/deserialization.rs
 pub use crate::model::deserialization::*;
-use std::fs::Metadata;
+use rocrate::entity::EntityTrait;
+use rocrate::DataEntity;
+use std::fs::{symlink_metadata, Metadata};
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
 
@@ -184,29 +186,29 @@ pub enum BlockDataState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
-    pub file_id: u64,        // varint
-    pub path: String,        // UTF-8 + varint
-    pub file_type: FileType, // u8
+    pub file_id: u64,
+    pub path: String,
+    pub file_type: FileType,
     pub block_data: BlockDataState,
-    pub created: u64,                   // u64 (BE)
-    pub modified: u64,                  // u64 (BE)
-    pub file_size: u64,                 // varint
-    pub permissions: u32,               // u32 (BE)
-    pub references: Vec<Reference>,     // Data->Metadata references only
+    pub created: u64,
+    pub modified: u64,
+    pub file_size: u64,
+    pub permissions: u32,
+    pub references: Vec<Reference>,
     pub symlink_target: Option<String>, // Target path for symlinks
 }
 
 impl FileEntry {
     pub fn new(
-        file_id: u64,
+        file_id: Option<u64>,
         file_type: FileType,
-        abs_path: &str,
-        rel_path: &str,
+        disk_path: &str,
+        pithos_path: &str,
         metadata: &Metadata,
     ) -> Result<Self, PithosWriterError> {
         Ok(FileEntry {
-            file_id,
-            path: rel_path.to_string(),
+            file_id: file_id.unwrap_or(0),
+            path: pithos_path.to_string(),
             file_type,
             block_data: BlockDataState::Decrypted(vec![]),
             created: metadata
@@ -223,10 +225,77 @@ impl FileEntry {
             permissions: metadata.permissions().mode(),
             references: vec![],
             symlink_target: if file_type == FileType::Symlink {
-                Some(std::fs::read_link(abs_path)?.to_string_lossy().to_string())
+                Some(std::fs::read_link(disk_path)?.to_string_lossy().to_string())
             } else {
                 None
             },
+        })
+    }
+
+    pub fn new_ext(
+        file_id: Option<u64>,
+        file_type: FileType,
+        disk_path: &str,
+        pithos_path: &str,
+        created: Option<SystemTime>,
+        modified: Option<SystemTime>,
+        permissions: Option<u32>,
+        references: Vec<Reference>,
+        file_size: Option<u64>,
+    ) -> Result<Self, PithosWriterError> {
+        Ok(FileEntry {
+            file_id: file_id.unwrap_or(0),
+            path: pithos_path.to_string(),
+            file_type,
+            block_data: BlockDataState::Decrypted(vec![]),
+            created: created
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+            modified: modified
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+            file_size: file_size.unwrap_or(0),
+            permissions: permissions.unwrap_or(0o644),
+            references,
+            symlink_target: if file_type == FileType::Symlink {
+                Some(std::fs::read_link(disk_path)?.to_string_lossy().to_string())
+            } else {
+                None
+            },
+        })
+    }
+
+    pub fn new_from_content(
+        file_id: Option<u64>,
+        file_type: FileType,
+        pithos_path: &str,
+        content: &Content,
+    ) -> Result<Self, PithosWriterError> {
+        Ok(match content {
+            Content::File(disk_path) => {
+                let file_metadata = symlink_metadata(disk_path)?;
+                FileEntry::new(file_id, file_type, disk_path, pithos_path, &file_metadata)?
+            }
+            Content::Raw(raw_content) => {
+                let current_timestamp = current_timestamp()?;
+                FileEntry {
+                    file_id: file_id.unwrap_or(0),
+                    path: pithos_path.to_string(),
+                    file_type,
+                    block_data: BlockDataState::Decrypted(vec![]),
+                    created: current_timestamp,
+                    modified: current_timestamp,
+                    file_size: raw_content.len() as u64,
+                    permissions: 0o644,
+                    references: vec![],
+                    symlink_target: None,
+                }
+            }
+            Content::Reference(_) => {
+                unimplemented!("Currently FileEntry cannot be created from Content::Reference")
+            }
         })
     }
 
@@ -280,6 +349,10 @@ impl FileEntry {
             }],
             symlink_target: None,
         })
+    }
+
+    pub fn set_file_id(&mut self, file_id: u64) {
+        self.file_id = file_id;
     }
 
     pub fn add_block_data(&mut self, entry: (u64, [u8; 32])) -> Result<(), PithosWriterError> {
