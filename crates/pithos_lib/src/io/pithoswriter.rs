@@ -20,7 +20,7 @@ use fastcdc::v2020::{ChunkData, StreamCDC};
 use rand_core::OsRng;
 use std::fs::{File, symlink_metadata};
 use std::io;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::time::SystemTimeError;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -60,15 +60,19 @@ pub enum PithosWriterError {
     Other(String),
 }
 
-pub enum FileMeta {
-    File(String),    // Path to file with metadata content
-    Content(String), // File metadata as string content
+#[derive(Debug)]
+pub enum Content {
+    File(String),         // Path to file with content
+    Raw(String),          // Raw string content
+    Reference(Reference), // Reference to already existing file entry (Data -> copies BlockIndex; Metadata -> )
 }
 
+#[derive(Debug)]
 pub struct InputFile {
-    pub file_path: String,
     pub file_type: FileType,
-    pub file_meta: Option<FileMeta>,
+    pub file_path: String, // Internal path
+    pub data: Content,
+    pub metadata: Option<Content>,
     pub encrypt: bool,
     pub compression_level: Option<u8>,
 }
@@ -210,8 +214,16 @@ impl PithosWriter {
         processing_flags: &ProcessingFlags,
         content: Box<dyn Read>,
     ) -> Result<Reference, PithosWriterError> {
-        // Split file content in chunks
-        //TODO: Configurable
+        // Directory or Symlink FileEntry are just added to Pithos directory
+        if vec![FileType::Directory, FileType::Symlink].contains(&file_entry.file_type) {
+            self.directory.add_file_to_index(&file_entry)?;
+            self.file_idx = self.file_idx.saturating_add(1);
+
+            return Ok(Reference::try_from(file_entry)?);
+        }
+
+        // Split content in chunks
+        //TODO: Configurable CDC values
         let fastcdc_stream = StreamCDC::with_level(
             content,
             fastcdc::v2020::MINIMUM_MAX, //65536,   //1024,
@@ -247,82 +259,92 @@ impl PithosWriter {
         // Increment file index
         self.file_idx = self.file_idx.saturating_add(1);
 
-        Ok(Reference {
-            target_file_id: file_entry.file_id,
-            relationship: match &file_entry.file_type {
-                FileType::Data => 7,      // CONTAINS
-                FileType::Metadata => 0,  // DESCRIBES
-                FileType::Directory => 6, // PART_OF
-                FileType::Symlink => 3,   // SOURCE_OF
-            },
-        })
+        // Return reference according to FileType
+        Ok(Reference::try_from(file_entry)?)
     }
 
-    pub fn process_input(
-        &mut self,
-        file: InputFile,
-        strip_prefix: Option<&str>,
-    ) -> Result<(), PithosWriterError> {
-        // File input prelude
-        let file_metadata = symlink_metadata(&file.file_path)?;
-        let processing_flags = ProcessingFlags::new(file.encrypt, file.compression_level);
-        let relative_path = if let Some(prefix) = strip_prefix {
-            if let Some(stripped) = file.file_path.strip_prefix(prefix) {
-                stripped
-            } else {
-                file.file_path.as_ref()
+    pub fn process_input(&mut self, input: InputFile) -> Result<Reference, PithosWriterError> {
+        // Create FileEntry from data file input
+        let mut data_fe =
+            FileEntry::new_from_content(None, input.file_type, &input.file_path, &input.data)?;
+        let processing_flags = ProcessingFlags::new(input.encrypt, input.compression_level);
+
+        if let Some(metadata) = input.metadata {
+            let reference = match &metadata {
+                Content::File(disk_path) => {
+                    let mut meta_fe = FileEntry::new_from_content(
+                        Some(self.file_idx),
+                        FileType::Metadata,
+                        &format!("{}.meta", input.file_path),
+                        &metadata,
+                    )?;
+
+                    let handle = Box::new(File::open(disk_path)?);
+                    self.process_file_entry(&mut meta_fe, &processing_flags, handle)?
+                }
+                Content::Raw(raw_content) => {
+                    let mut meta_fe = FileEntry::new_from_content(
+                        Some(self.file_idx),
+                        FileType::Metadata,
+                        &format!("{}.meta", input.file_path),
+                        &metadata,
+                    )?;
+
+                    let handle = Box::new(Cursor::new(raw_content.clone().into_bytes()));
+                    self.process_file_entry(&mut meta_fe, &processing_flags, handle)?
+                }
+                Content::Reference(reference) => reference.clone(),
+            };
+
+            data_fe.references.push(reference);
+        }
+
+        // Process data FileEntry
+        data_fe.file_id = self.file_idx;
+        let data_reference = match input.data {
+            Content::File(disk_path) => {
+                let handle = Box::new(File::open(disk_path)?);
+                self.process_file_entry(&mut data_fe, &processing_flags, handle)?
             }
-        } else {
-            file.file_path.as_ref()
+            Content::Raw(raw_content) => {
+                let handle = Box::new(Cursor::new(raw_content.into_bytes()));
+                self.process_file_entry(&mut data_fe, &processing_flags, handle)?
+            }
+            Content::Reference(reference) => {
+                // Clone content (block_data) into new FileEntry
+                let ref_fe = self
+                    .directory
+                    .get_file_by_id(reference.target_file_id)
+                    .expect("FileEntry does not exist.");
+                data_fe.block_data = ref_fe.block_data.clone();
+
+                // Fetch encryption key of referenced file
+                // Add file entry to directory and make it available for all recipients
+                if let Some(enc_key) = self
+                    .directory
+                    .get_file_encryption_key(reference.target_file_id)
+                {
+                    self.directory.add_file_to_index(&data_fe)?;
+                    self.directory
+                        .add_file_to_all_recipients((self.file_idx, enc_key));
+                    // Increment file index
+                    self.file_idx = self.file_idx.saturating_add(1);
+                    Reference::try_from(&mut data_fe)?
+                } else {
+                    return Err(PithosWriterError::FileNotFound(
+                        "Could not find encryption key for file".to_string(),
+                    ));
+                }
+            }
         };
 
-        let mut file_entry = FileEntry::new(
-            self.file_idx,
-            file.file_type,
-            &file.file_path,
-            relative_path,
-            &file_metadata,
-        )
-        .map_err(|e| PithosWriterError::Other(e.to_string()))?;
-
-        // Process metadata as individual file
-        if let Some(metadata) = file.file_meta {
-            let handle: Box<dyn Read> = match metadata {
-                FileMeta::File(path) => Box::new(File::open(&path)?),
-                FileMeta::Content(content) => Box::new(io::Cursor::new(content.into_bytes())),
-            };
-            let mut meta_file_entry = FileEntry::meta_from(&file_entry, file_metadata.len())?;
-            let meta_processing_flags = ProcessingFlags::new(file.encrypt, file.compression_level);
-
-            // Process and add reference to data file entry
-            let reference =
-                self.process_file_entry(&mut meta_file_entry, &meta_processing_flags, handle)?;
-            file_entry.references.push(reference);
-        }
-
-        // Individual processing depending on file type
-        match file.file_type {
-            FileType::Directory | FileType::Symlink => {
-                self.directory.add_file_to_index(&mut file_entry)?;
-                self.file_idx = self.file_idx.saturating_add(1);
-            }
-            FileType::Data | FileType::Metadata => {
-                self.process_file_entry(
-                    &mut file_entry,
-                    &processing_flags,
-                    Box::new(File::open(&file.file_path)?),
-                )?;
-            }
-        }
-
-        // Supi
-        Ok(())
+        Ok(data_reference)
     }
 
     #[allow(dead_code)]
     pub fn process_input_files(&mut self, files: Vec<InputFile>) -> Result<(), PithosWriterError> {
         for file in files {
-            self.process_input(file, None)?;
+            self.process_input(file)?;
         }
         Ok(())
     }
