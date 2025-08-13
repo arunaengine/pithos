@@ -33,8 +33,13 @@ pub fn map_to_zstd_level(flags: &ProcessingFlags) -> i32 {
 
 /// Compresses a chunk of data with zstd and returns the compression ratio.
 pub fn probe_compression_ratio(input: &[u8], level: Option<i32>) -> Result<f64, ZstdError> {
-    let compressed = bulk::compress(input, level.unwrap_or_default())
-        .map_err(|e| ZstdError::CompressionError(e.to_string()))?;
+    let compressed = if input.len() > 4096 {
+        bulk::compress(&input[..4096], level.unwrap_or_default())
+            .map_err(|e| ZstdError::CompressionError(e.to_string()))?
+    } else {
+        bulk::compress(input, level.unwrap_or_default())
+            .map_err(|e| ZstdError::CompressionError(e.to_string()))?
+    };
     let orig_len = input.len();
     let comp_len = compressed.len();
 
