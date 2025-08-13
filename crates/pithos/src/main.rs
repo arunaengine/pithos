@@ -1,13 +1,18 @@
 mod io;
 pub mod utils;
 
-use crate::io::utils::load_key_from_pem;
-use anyhow::Result;
+use crate::io::utils::{load_private_key_from_pem, load_public_key_from_pem};
 use clap::{Parser, Subcommand, ValueEnum};
+use pithos_lib::helpers::x25519_keys::{
+    generate_private_key, private_key_to_pem_bytes, public_key_to_pem_bytes,
+};
 use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use utils::conversion::evaluate_log_level;
+use thiserror::Error;
+use tracing::dispatcher::SetGlobalDefaultError;
+use x25519_dalek::PublicKey;
 
 #[derive(Clone, ValueEnum)]
 enum KeyFormat {
@@ -32,13 +37,13 @@ struct Cli {
     /// Optionally set the log file
     log_file: Option<PathBuf>,
 
+    /// Output destination; Default is stdout
+    #[arg(short, long, global = true)]
+    output: Option<PathBuf>,
+
     /// Private key for encryption/decryption
     #[arg(long)]
     private_key: Option<PathBuf>, // File path; if None -> Default file: ~/.pithos/sec_key.pem
-
-    /// Output destination; Default is stdout
-    #[arg(short, long)]
-    output: Option<PathBuf>,
 
     /// Subcommands
     #[command(subcommand)]
@@ -159,9 +164,20 @@ enum ModifyCommands {
     },
 }
 
+#[derive(Error, Debug)]
+pub enum PithosCliError {
+    #[error("Writer Error: {0}")]
+    TracingError(#[from] SetGlobalDefaultError),
+    #[error("Reader Error: {0}")]
+    ReaderError(#[from] PithosReaderError),
+    #[error("Writer Error: {0}")]
+    WriterError(#[from] PithosWriterError),
+    #[error("Invalid argument: {0}")]
+    InvalidArgumentError(String),
+}
+
 #[tracing::instrument(level = "trace", skip())]
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<(), PithosCliError> {
     // Parse CLI parameter input
     let cli = Cli::parse();
 
@@ -238,17 +254,24 @@ async fn main() -> Result<()> {
                     )
                 }
             };
+        PithosCommands::CreateKeypair { .. } => {
+            let private_key = generate_private_key().map_err(PithosWriterError::Crypt)?;
+            let public_key = PublicKey::from(&private_key);
 
             // Write output
-            if let Some(dest) = cli.output {
-                let mut output_target = File::create(dest).await?;
-                output_target.write_all(&seckey_bytes).await?;
-                output_target.write_all(&pubkey_bytes).await?;
+            let mut output_target: Box<dyn Write> = if let Some(dest) = cli.output {
+                Box::new(std::fs::File::create(dest).map_err(PithosWriterError::Io)?)
             } else {
-                let mut output_target = tokio::io::stdout();
-                output_target.write_all(&seckey_bytes).await?;
-                output_target.write_all(&pubkey_bytes).await?;
-            }
+                Box::new(std::io::stdout())
+            };
+            output_target
+                .write_all(
+                    &private_key_to_pem_bytes(&private_key).map_err(PithosWriterError::Crypt)?,
+                )
+                .map_err(PithosWriterError::Io)?;
+            output_target
+                .write_all(&public_key_to_pem_bytes(&public_key).map_err(PithosWriterError::Crypt)?)
+                .map_err(PithosWriterError::Io)?;
         }
         PithosCommands::Modify { .. } => {}
         PithosCommands::Export { .. } => {}
