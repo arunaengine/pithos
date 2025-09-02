@@ -20,6 +20,8 @@ use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 pub enum SerializationError {
     #[error("IoError error: {0}")]
     IoError(std::io::Error),
+    #[error("Serialization error: {0}")]
+    Other(String),
 }
 
 impl From<std::io::Error> for SerializationError {
