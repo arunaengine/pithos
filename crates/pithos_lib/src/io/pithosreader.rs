@@ -1,4 +1,4 @@
-use crate::helpers::chacha_poly1305::{ChaChaPoly1305Error, decrypt_chunk};
+use crate::helpers::chacha_poly1305::{ChaChaPoly1305Error, decrypt_chunk, encrypt_chunk};
 use crate::helpers::x25519_keys::{CryptError, private_key_from_pem_bytes};
 use crate::helpers::zstd::{ZstdError, decompress_data};
 use crate::model::deserialization::DeserializationError;
@@ -11,8 +11,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use crate::helpers::crypt4gh::{CRYPT4GH_BLOCK_SIZE, Crypt4GHError, Crypt4GHHeader, HeaderPacket};
 use crate::io::util::{create_dir, create_symlink};
-use x25519_dalek::StaticSecret;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Error type for PithosReader operations
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +24,8 @@ pub enum PithosReaderError {
     Deserialization(#[from] DeserializationError),
     #[error("Crypt error: {0}")]
     Crypt(#[from] CryptError),
+    #[error("Crypt4GH error: {0}")]
+    Crypt4GH(#[from] Crypt4GHError),
     #[error("Decryption error: {0}")]
     Decryption(#[from] ChaChaPoly1305Error),
     #[error("Compression error: {0}")]
@@ -198,6 +201,138 @@ impl PithosReaderSimple {
                         .expect("Symlink has no target"),
                     output_path,
                 )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn read_file_to_crypt4gh(
+        &mut self,
+        inner_path: &str,
+        directory: &Directory,
+        reader_keys: Vec<&PublicKey>,
+        output: Option<Box<dyn Write>>,
+    ) -> Result<(), PithosReaderError> {
+        // Fetch file entry from directory
+        let file_entry = directory
+            .get_file_by_path(inner_path)
+            .ok_or(PithosReaderError::FileNotFound(inner_path.to_string()))?;
+
+        // Validate file type
+        if FileType::Data != file_entry.file_type {
+            return Err(PithosReaderError::Other(
+                "File needs to be data".to_string(),
+            ));
+        }
+
+        // Generate Crypt4GH header packets from keys
+        let data_key = directory
+            .get_file_encryption_key(file_entry.file_id)
+            .ok_or(PithosReaderError::FileNotFound(
+                "File does not exist in Pithos".to_string(),
+            ))?;
+        //println!("Data key: {:?}", data_key);
+        let packets = HeaderPacket::from_pithos(&self.private_key, reader_keys, &data_key)
+            .map_err(|e| {
+                PithosReaderError::Other(format!("Conversion to header packet failed: {e})"))
+            })?;
+
+        // Init output sink
+        let mut sink = if let Some(sink) = output {
+            sink
+        } else {
+            Box::new(std::io::stdout())
+        };
+
+        // Write Crypt4GH header
+        let header = Crypt4GHHeader::new(packets);
+        let header_bytes: Vec<u8> = header.try_into()?;
+        sink.write_all(&header_bytes)?;
+
+        // Load blocks and write data in 64kb blocks
+        match &file_entry.block_data {
+            BlockDataState::Encrypted(_) => {
+                return Err(PithosReaderError::InvalidBlockDataState(
+                    "Cannot read encrypted block data".to_string(),
+                ));
+            }
+            BlockDataState::Decrypted(blocks) => {
+                let mut buffer = Vec::with_capacity(65536); // 64kb buffer
+                for (block_idx, key) in blocks {
+                    // Fetch block meta from directory
+                    let block_meta = directory
+                        .blocks
+                        .iter()
+                        .find(|block| block.index == *block_idx)
+                        .ok_or(PithosReaderError::BlockKeyNotFound(*block_idx))?;
+
+                    // Jump to begin of block in file
+                    self.file.seek(SeekFrom::Start(block_meta.offset))?;
+
+                    // Read block header for block start validation
+                    let mut block_header = [0u8; 4];
+                    self.file.read_exact(&mut block_header)?;
+                    BlockHeader::deserialize(&mut block_header.as_slice())?;
+
+                    // Read block data
+                    let mut block_buf = vec![0u8; block_meta.stored_size as usize];
+                    self.file.read_exact(&mut block_buf)?;
+
+                    // Decrypt and decompress according to ProcessingFlags
+                    if block_meta.flags.is_encrypted() {
+                        block_buf = decrypt_chunk(&block_buf, key)?;
+                    }
+                    if block_meta.flags.get_compression_level() > 0 {
+                        block_buf = decompress_data(&block_buf, block_meta.original_size)?;
+                    }
+
+                    // Write chunk data in 64KiB ChaCha20Poly1305 encrypted blocks
+                    let mut chunk_offset = 0;
+                    while chunk_offset < block_buf.len() {
+                        let remaining_chunk = &block_buf[chunk_offset..];
+                        let remaining_buffer = CRYPT4GH_BLOCK_SIZE - buffer.len();
+
+                        if remaining_chunk.len() <= remaining_buffer {
+                            // Chunk fits in remaining buffer space
+                            buffer.extend_from_slice(remaining_chunk);
+                            chunk_offset = block_buf.len(); // Consumed the entire chunk
+
+                            // Check if buffer is full
+                            if buffer.len() == CRYPT4GH_BLOCK_SIZE {
+                                let encrypted = encrypt_chunk(&buffer, b"", &data_key)?;
+                                sink.write_all(&encrypted)?;
+                                //sink.write_all(&encrypt_chunk(&buffer, b"", &data_key)?)?;
+                                buffer.clear();
+                            }
+                        } else if buffer.is_empty() && remaining_chunk.len() > CRYPT4GH_BLOCK_SIZE {
+                            // Large chunk that exceeds buffer capacity -> Process in buffer-sized pieces
+                            let chunk_to_process = &remaining_chunk[..CRYPT4GH_BLOCK_SIZE];
+                            let encrypted = encrypt_chunk(&chunk_to_process, b"", &data_key)?;
+                            sink.write_all(&encrypted)?;
+                            //sink.write_all(&encrypt_chunk(&chunk_to_process, b"", &data_key)?)?;
+                            chunk_offset += CRYPT4GH_BLOCK_SIZE;
+                        } else {
+                            // Fill remaining buffer space with part of the chunk
+                            let bytes_to_take = remaining_buffer;
+                            buffer.extend_from_slice(&remaining_chunk[..bytes_to_take]);
+                            chunk_offset += bytes_to_take;
+
+                            // Buffer is now full
+                            let encrypted = encrypt_chunk(&buffer, b"", &data_key)?;
+                            sink.write_all(&encrypted)?;
+                            buffer.clear();
+                        }
+                    }
+                }
+
+                // Write partial filled buffer if is not empty
+                if !buffer.is_empty() {
+                    let encrypted = encrypt_chunk(&buffer, b"", &data_key)?;
+                    sink.write_all(&encrypted)?;
+                    //sink.write_all(&encrypt_chunk(&buffer, b"", &data_key)?)?;
+                    buffer.clear()
+                }
             }
         }
 

@@ -1,4 +1,5 @@
 pub mod chacha_poly1305;
+pub mod crypt4gh;
 pub mod directory;
 pub mod hash;
 pub mod ro_crate;
