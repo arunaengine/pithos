@@ -44,7 +44,6 @@ pub fn create_symlink(
     } else {
         (current_dir()?.join(path), current_dir()?.join(target))
     };
-    dbg!("create_symlink", &path, &target);
     std::os::unix::fs::symlink(path, target)?;
 
     Ok(())

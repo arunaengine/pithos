@@ -17,6 +17,7 @@ use crate::{
     model::structs::FileHeader,
 };
 use fastcdc::v2020::{ChunkData, StreamCDC};
+use indexmap::IndexMap;
 use rand_core::OsRng;
 use rocrate::ROCrate;
 use std::cmp::Ordering;
@@ -99,16 +100,8 @@ impl PithosWriter {
         sink: Box<dyn Write>,
     ) -> Result<Self, PithosWriterError> {
         // Init encryption section
-        let encryption_sections = vec![EncryptionSection {
-            sender_public_key: PublicKey::from(&writer_key).to_bytes(),
-            recipients: reader_keys
-                .iter()
-                .map(|key| RecipientSection {
-                    recipient_public_key: key.to_bytes(),
-                    recipient_data: RecipientData::Decrypted(Vec::new()),
-                })
-                .collect(),
-        }];
+        let encryption_sections =
+            IndexMap::from_iter([(writer_key.to_bytes(), EncryptionSection::new(&reader_keys))]);
 
         Ok(PithosWriter {
             writer_key,
@@ -406,9 +399,7 @@ impl PithosWriter {
             // Process ro-crate-metadata.json first and reference all other files which are mentioned as data entity
             let mut entry = entries.remove(0);
             entry.file_type = FileType::Metadata;
-            dbg!(&entry);
             let ro_crate_meta_ref = self.process_input(entry)?;
-            dbg!(&ro_crate_meta_ref);
 
             // Process the rest all files
             for mut entry in entries {

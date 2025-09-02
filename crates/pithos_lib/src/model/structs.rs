@@ -5,11 +5,13 @@ use crate::io::util::{current_timestamp, get_symlink_target};
 //
 // Import deserialization implementations from helpers/deserialization.rs
 pub use crate::model::deserialization::*;
+use indexmap::IndexMap;
 use rocrate::DataEntity;
 use rocrate::entity::EntityTrait;
 use std::fs::{Metadata, symlink_metadata};
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
+use x25519_dalek::PublicKey;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
@@ -122,12 +124,12 @@ pub struct BlockIndexEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directory {
-    pub identifier: [u8; 8],                         // MUST be b"PITHOSDR"
-    pub parent_directory_offset: Option<(u64, u64)>, // (start, len) varint
-    pub files: Vec<FileEntry>,                       // Files in this segment
-    pub blocks: Vec<BlockIndexEntry>,                // Blocks in this segment
-    pub relations: Vec<(u64, String)>,               // Relation idx, relationname/id
-    pub encryption: Vec<EncryptionSection>,
+    pub identifier: [u8; 8],                               // MUST be b"PITHOSDR"
+    pub parent_directory_offset: Option<(u64, u64)>,       // (start, len) varint
+    pub blocks: Vec<BlockIndexEntry>,                      // Blocks in this segment
+    pub files: Vec<FileEntry>,                             // Files in this segment
+    pub relations: Vec<(u64, String)>,                     // Relation idx, relationname/id
+    pub encryption: IndexMap<[u8; 32], EncryptionSection>, // (Sender's X25519 public key, section with recipients)
     pub dir_len: u64,
     pub crc32: u32, // CRC32 of all preceding fields
 }
@@ -394,8 +396,47 @@ impl TryFrom<&mut FileEntry> for Reference {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptionSection {
-    pub sender_public_key: [u8; 32],       // X25519 public key
-    pub recipients: Vec<RecipientSection>, // Per-recipient data
+    // Recipient's X25519 public key, Recipient file list
+    pub recipients: IndexMap<[u8; 32], RecipientSection>,
+}
+
+impl EncryptionSection {
+    pub fn new(recipient_pubkeys: &Vec<PublicKey>) -> Self {
+        EncryptionSection {
+            recipients: IndexMap::from_iter(
+                recipient_pubkeys
+                    .iter()
+                    .map(|key| {
+                        (
+                            key.to_bytes(),
+                            RecipientSection {
+                                recipient_data: RecipientData::Decrypted(Vec::new()),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientSection {
+    pub recipient_data: RecipientData, // Encrypted FileKeyEntry list
+}
+
+impl RecipientSection {
+    pub fn add_file_to_recipient(
+        &mut self,
+        entry: (u64, [u8; 32]),
+    ) -> Result<(), PithosWriterError> {
+        match self.recipient_data {
+            RecipientData::Encrypted(_) => Err(PithosWriterError::InvalidRecipientDataState(
+                "Cannot add file entry to encrypted recipient data".to_string(),
+            )),
+            RecipientData::Decrypted(ref mut entries) => Ok(entries.push(entry)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

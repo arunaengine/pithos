@@ -1,13 +1,16 @@
 use crate::io::pithosreader::PithosReaderError;
 use crate::io::pithoswriter::PithosWriterError;
 use crate::model::serialization::encode_string;
-use crate::model::structs::RecipientData;
+use crate::model::structs::{RecipientData, RecipientSection};
 use crate::model::{
     serialization::SerializationError,
     structs::{BlockIndexEntry, Directory, EncryptionSection, FileEntry},
 };
 use crc32fast::Hasher;
+use indexmap::IndexMap;
+use indexmap::map::Entry;
 use integer_encoding::VarIntWriter;
+use std::io::Write;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct DirectoryBuilder {
@@ -16,7 +19,7 @@ pub struct DirectoryBuilder {
     files: Vec<FileEntry>,
     blocks: Vec<BlockIndexEntry>,
     relations: Vec<(u64, String)>,
-    encryption: Vec<EncryptionSection>,
+    encryption: IndexMap<[u8; 32], EncryptionSection>,
     dir_len: u64,
 }
 
@@ -34,7 +37,7 @@ impl DirectoryBuilder {
             files: vec![],
             blocks: vec![],
             relations: vec![],
-            encryption: vec![],
+            encryption: IndexMap::new(),
             dir_len: 8,
         }
     }
@@ -59,7 +62,7 @@ impl DirectoryBuilder {
         self
     }
 
-    pub fn encryption(mut self, encryption: Vec<EncryptionSection>) -> Self {
+    pub fn encryption(mut self, encryption: IndexMap<[u8; 32], EncryptionSection>) -> Self {
         self.encryption = encryption;
         self
     }
@@ -88,7 +91,8 @@ impl DirectoryBuilder {
             buf.write_varint(*idx)?;
             encode_string(&mut buf, name)?;
         }
-        for enc in &self.encryption {
+        for (key, enc) in &self.encryption {
+            buf.write_all(key)?;
             enc.serialize(&mut buf)?
         }
         buf.write_varint(self.dir_len)?;
@@ -148,40 +152,40 @@ impl Directory {
         &mut self,
         writer_key: &StaticSecret,
         reader_key: &PublicKey,
-        entry: (u64, [u8; 32]), // (file index, encryption key)
+        file_entry: (u64, [u8; 32]), // (file index, encryption key)
     ) -> Result<(), PithosWriterError> {
-        let writer_pubkey = PublicKey::from(writer_key);
-        for e_section in self.encryption.iter_mut() {
-            if writer_pubkey.to_bytes() == e_section.sender_public_key {
-                for r_section in e_section.recipients.iter_mut() {
-                    if reader_key.to_bytes() == r_section.recipient_public_key {
-                        return match r_section.recipient_data {
-                            RecipientData::Encrypted(_) => {
-                                Err(PithosWriterError::InvalidBlockDataState(
-                                    "Block data already/still encrypted".to_string(),
-                                ))
-                            }
-                            RecipientData::Decrypted(ref mut entries) => {
-                                entries.push(entry);
-                                Ok(())
-                            }
-                        };
+        Ok(match self.encryption.entry(*writer_key.as_bytes()) {
+            Entry::Occupied(ref mut entry) => {
+                match entry.get_mut().recipients.entry(reader_key.to_bytes()) {
+                    Entry::Occupied(ref mut entry) => {
+                        entry.get_mut().add_file_to_recipient(file_entry)?
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(RecipientSection {
+                            recipient_data: RecipientData::Decrypted(vec![]),
+                        });
                     }
                 }
             }
-        }
-
-        Err(PithosWriterError::Other(
-            "Recipient section not found".to_string(),
-        ))
+            Entry::Vacant(entry) => {
+                entry.insert(EncryptionSection {
+                    recipients: IndexMap::from_iter([(
+                        reader_key.to_bytes(),
+                        RecipientSection {
+                            recipient_data: RecipientData::Decrypted(vec![]),
+                        },
+                    )]),
+                });
+            }
+        })
     }
 
     pub fn add_file_to_all_recipients(&mut self, entry: (u64, [u8; 32])) {
-        for e_section in self.encryption.iter_mut() {
-            for r_section in e_section.recipients.iter_mut() {
+        for (_, e_section) in self.encryption.iter_mut() {
+            for (_, r_section) in e_section.recipients.iter_mut() {
                 match r_section.recipient_data {
                     RecipientData::Encrypted(_) => {
-                        // Won't add to encrypted sections ¯\_(ツ)_/¯
+                        // Won't add files to encrypted sections ¯\_(ツ)_/¯
                     }
                     RecipientData::Decrypted(ref mut entries) => {
                         entries.push(entry);
@@ -201,8 +205,8 @@ impl Directory {
 
     // Checks only decrypted recipient sections
     pub fn get_file_encryption_key(&self, file_id: u64) -> Option<[u8; 32]> {
-        for e_section in &self.encryption {
-            for r_section in &e_section.recipients {
+        for (_, e_section) in &self.encryption {
+            for (_, r_section) in &e_section.recipients {
                 match &r_section.recipient_data {
                     RecipientData::Encrypted(_) => {}
                     RecipientData::Decrypted(entries) => {
@@ -221,10 +225,10 @@ impl Directory {
         writer_key: &StaticSecret,
     ) -> Result<(), PithosWriterError> {
         let writer_pubkey = PublicKey::from(writer_key);
-        for e_section in self.encryption.iter_mut() {
-            if writer_pubkey.as_bytes() == &e_section.sender_public_key {
-                for r_section in e_section.recipients.iter_mut() {
-                    let reader_pubkey = PublicKey::from(r_section.recipient_public_key);
+        for (sender_pubkey, e_section) in self.encryption.iter_mut() {
+            if writer_pubkey.as_bytes() == sender_pubkey {
+                for (recipient_pubkey, r_section) in e_section.recipients.iter_mut() {
+                    let reader_pubkey = PublicKey::from(*recipient_pubkey);
                     let shared_key = writer_key.diffie_hellman(&reader_pubkey);
                     r_section.recipient_data.encrypt(&shared_key)?;
                 }
@@ -237,31 +241,32 @@ impl Directory {
     pub fn decrypt_recipient(
         &mut self,
         reader_key: &StaticSecret,
-    ) -> anyhow::Result<Vec<(u64, [u8; 32])>> {
+    ) -> Result<Vec<(u64, [u8; 32])>, PithosReaderError> {
         // Store for decrypted sections
         let mut available_file_indices = Vec::<(u64, [u8; 32])>::new();
         let reader_pubkey = PublicKey::from(reader_key);
 
         // Iterate available encryption sections
-        for e_section in self.encryption.iter_mut() {
-            let sender_pubkey = PublicKey::from(e_section.sender_public_key);
+        for (sender_pubkey, e_section) in self.encryption.iter_mut() {
+            let sender_pubkey = PublicKey::from(*sender_pubkey);
             let shared_key = reader_key.diffie_hellman(&sender_pubkey);
 
-            // Try decrypt users recipient data
-            for r_section in e_section.recipients.iter_mut() {
-                if reader_pubkey.as_bytes() == &r_section.recipient_public_key {
-                    match &r_section.recipient_data {
-                        RecipientData::Encrypted(_) => {
-                            let entries = r_section
-                                .recipient_data
-                                .decrypt(&shared_key)
-                                .map_err(|e| PithosReaderError::Other(e.to_string()))?;
-                            available_file_indices.extend(entries);
-                        }
-                        RecipientData::Decrypted(entries) => {
-                            available_file_indices.extend(entries);
-                        }
+            match e_section.recipients.entry(*reader_pubkey.as_bytes()) {
+                Entry::Occupied(ref mut entry) => match &entry.get().recipient_data {
+                    RecipientData::Encrypted(_) => {
+                        let entries = entry
+                            .get_mut()
+                            .recipient_data
+                            .decrypt(&shared_key)
+                            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+                        available_file_indices.extend(entries);
                     }
+                    RecipientData::Decrypted(entries) => {
+                        available_file_indices.extend(entries);
+                    }
+                },
+                Entry::Vacant(_) => {
+                    return Err(PithosReaderError::Other("Recipient not found".to_string())); //TODO: Replace with individual error option
                 }
             }
         }
@@ -294,7 +299,8 @@ impl Directory {
             buf.write_varint(*idx)?;
             encode_string(&mut buf, name)?;
         }
-        for enc in &self.encryption {
+        for (key, enc) in &self.encryption {
+            buf.write_all(key)?;
             enc.serialize(&mut buf)?
         }
         buf.write_varint(self.dir_len)?;
@@ -305,5 +311,13 @@ impl Directory {
         self.crc32 = hasher.finalize();
 
         Ok(())
+    }
+}
+
+fn merge_recipient_data(existing: &mut RecipientData, new: RecipientData) {
+    if let (RecipientData::Decrypted(existing_files), RecipientData::Decrypted(new_files)) =
+        (existing, new)
+    {
+        existing_files.extend(new_files);
     }
 }

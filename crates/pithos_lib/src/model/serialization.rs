@@ -13,7 +13,7 @@ use byteorder::{BigEndian, WriteBytesExt};
 use integer_encoding::VarIntWriter;
 use std::io::Write;
 use thiserror::Error;
-use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
+use x25519_dalek::SharedSecret;
 
 // Helper: error type for serialization
 #[derive(Error, Debug)]
@@ -111,7 +111,7 @@ impl Directory {
             None => writer.write_all(&[0u8])?,
         }
 
-        // Write file
+        // Write file entries
         writer.write_varint(self.files.len())?;
         for file in &self.files {
             file.serialize(writer)?;
@@ -125,8 +125,9 @@ impl Directory {
             writer.write_varint(*idx)?;
             encode_string(writer, name)?;
         }
-        writer.write_varint(self.encryption.len())?;
-        for enc in &self.encryption {
+        writer.write_varint(self.encryption.len() as u64)?;
+        for (key, enc) in &self.encryption {
+            writer.write_all(key)?;
             enc.serialize(writer)?;
         }
 
@@ -242,10 +243,10 @@ impl Reference {
 
 impl EncryptionSection {
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
-        writer.write_all(&self.sender_public_key)?;
-        writer.write_varint(self.recipients.len())?;
-        for r in &self.recipients {
-            r.serialize(writer)?;
+        writer.write_varint(self.recipients.len() as u64)?;
+        for (key, recipient) in &self.recipients {
+            writer.write_all(key)?;
+            recipient.serialize(writer)?;
         }
         Ok(())
     }
@@ -299,13 +300,11 @@ impl RecipientData {
 
 impl RecipientSection {
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
-        writer.write_all(&self.recipient_public_key)?;
         self.recipient_data.serialize(writer)?;
         Ok(())
     }
 
-    pub fn encrypt(&mut self, sender_key: &StaticSecret) -> Result<(), PithosWriterError> {
-        let shared_key = sender_key.diffie_hellman(&PublicKey::from(self.recipient_public_key));
+    pub fn encrypt(&mut self, shared_key: SharedSecret) -> Result<(), PithosWriterError> {
         match &self.recipient_data {
             RecipientData::Encrypted(_) => {
                 return Err(PithosWriterError::InvalidRecipientDataState(

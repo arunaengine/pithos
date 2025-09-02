@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use pithos_lib::helpers::x25519_keys::generate_private_key;
 use pithos_lib::model::serialization::encode_string;
 use pithos_lib::model::structs::*;
@@ -103,7 +104,7 @@ fn directory_roundtrip() {
         created: 123,
         modified: 456,
         file_size: 789,
-        permissions: 0xFFFF_FFFF,
+        permissions: 0o644,
         references: vec![Reference {
             target_file_id: 2,
             relationship: 3,
@@ -119,20 +120,24 @@ fn directory_roundtrip() {
         flags: ProcessingFlags(7),
         location: BlockLocation::Local,
     };
-    let enc_section = EncryptionSection {
-        sender_public_key: [4u8; 32],
-        recipients: vec![RecipientSection {
-            recipient_public_key: [5u8; 32],
-            recipient_data: RecipientData::Decrypted(vec![(6, [7u8; 32])]),
-        }],
-    };
+    let enc_section = IndexMap::from_iter([(
+        [4u8; 32],
+        EncryptionSection {
+            recipients: IndexMap::from_iter([(
+                [5u8; 32],
+                RecipientSection {
+                    recipient_data: RecipientData::Decrypted(vec![(6, [7u8; 32])]),
+                },
+            )]),
+        },
+    )]);
     let original = Directory {
         identifier: *b"PITHOSDR",
         parent_directory_offset: Some((10, 20)),
         files: vec![file_entry.clone()],
         blocks: vec![block_index.clone()],
         relations: vec![(1, "rel".to_string())],
-        encryption: vec![enc_section.clone()],
+        encryption: enc_section,
         dir_len: 12345,
         crc32: 67890,
     };
@@ -207,12 +212,10 @@ fn reference_roundtrip() {
 #[test]
 fn encryption_section_roundtrip() {
     let recipient = RecipientSection {
-        recipient_public_key: [1u8; 32],
         recipient_data: RecipientData::Decrypted(vec![(2, [3u8; 32])]),
     };
     let original = EncryptionSection {
-        sender_public_key: [4u8; 32],
-        recipients: vec![recipient],
+        recipients: IndexMap::from_iter([([1u8; 32], recipient)]),
     };
     let mut buf = Vec::new();
     original.serialize(&mut buf).unwrap();
@@ -248,7 +251,6 @@ fn recipient_data_roundtrip() {
 #[test]
 fn recipient_section_roundtrip() {
     let original = RecipientSection {
-        recipient_public_key: [1u8; 32],
         recipient_data: RecipientData::Decrypted(vec![(2, [3u8; 32])]),
     };
     let mut buf = Vec::new();

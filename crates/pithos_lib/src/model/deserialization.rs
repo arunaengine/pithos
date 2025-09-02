@@ -10,6 +10,7 @@ use crate::helpers::chacha_poly1305::decrypt_chunk;
 use crate::io::pithosreader::PithosReaderError;
 use crate::model::structs::*;
 use byteorder::{BigEndian, ReadBytesExt};
+use indexmap::IndexMap;
 use integer_encoding::VarIntReader;
 use std::io::{Error as IoError, Read};
 use thiserror::Error;
@@ -185,10 +186,12 @@ impl Directory {
             relations.push((idx, name));
         }
 
-        let encryption_len = reader.read_varint()?;
-        let mut encryption = Vec::with_capacity(encryption_len);
+        let encryption_len = reader.read_varint::<u64>()?;
+        let mut encryption = IndexMap::new();
         for _ in 0..encryption_len {
-            encryption.push(EncryptionSection::deserialize(reader)?);
+            let mut key = [0u8; 32];
+            reader.read_exact(&mut key)?;
+            encryption.insert(key, EncryptionSection::deserialize(reader)?);
         }
 
         let dir_len = reader.read_u64::<BigEndian>()?;
@@ -336,18 +339,14 @@ impl Reference {
 // EncryptionSection
 impl EncryptionSection {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let mut sender_public_key = [0u8; 32];
-        reader.read_exact(&mut sender_public_key)?;
-
-        let recipients_len = reader.read_varint()?;
-        let mut recipients = Vec::with_capacity(recipients_len);
+        let recipients_len = reader.read_varint::<u64>()?;
+        let mut recipients = IndexMap::new();
         for _ in 0..recipients_len {
-            recipients.push(RecipientSection::deserialize(reader)?);
+            let mut key = [0u8; 32];
+            reader.read_exact(&mut key)?;
+            recipients.insert(key, RecipientSection::deserialize(reader)?);
         }
-        Ok(EncryptionSection {
-            sender_public_key,
-            recipients,
-        })
+        Ok(EncryptionSection { recipients })
     }
 }
 
@@ -414,12 +413,7 @@ impl RecipientData {
 // RecipientSection
 impl RecipientSection {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let mut recipient_public_key = [0u8; 32];
-        reader.read_exact(&mut recipient_public_key)?;
         let recipient_data = RecipientData::deserialize(reader)?;
-        Ok(RecipientSection {
-            recipient_public_key,
-            recipient_data,
-        })
+        Ok(RecipientSection { recipient_data })
     }
 }
