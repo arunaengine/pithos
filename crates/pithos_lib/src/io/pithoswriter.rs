@@ -4,6 +4,7 @@ use crate::helpers::hash::Hasher;
 use crate::helpers::x25519_keys::CryptError;
 use crate::helpers::zstd::{ZstdError, map_to_zstd_level};
 use crate::io::pithosreader::{PithosReaderError, PithosReaderSimple};
+use crate::io::util::extract_filename;
 use crate::model::serialization::SerializationError;
 use crate::model::structs::{
     BlockHeader, BlockIndexEntry, BlockLocation, Directory, EncryptionSection, FileEntry, FileType,
@@ -23,7 +24,7 @@ use rocrate::ROCrate;
 use std::cmp::Ordering;
 use std::fs::{File, symlink_metadata};
 use std::io::{Cursor, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTimeError;
 use std::{fs, io};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -78,6 +79,39 @@ pub struct InputFile {
     pub metadata: Option<Content>,
     pub encrypt: bool,
     pub compression_level: Option<u8>,
+}
+
+impl TryFrom<&PathBuf> for InputFile {
+    type Error = PithosWriterError;
+
+    fn try_from(file_path: &PathBuf) -> Result<Self, Self::Error> {
+        let file = File::open(file_path)?;
+        let metadata = file.metadata()?;
+        let file_type = FileType::try_from(&metadata)?;
+        let file_path_str = file_path
+            .to_str()
+            .ok_or(PithosWriterError::Other(
+                "Invalid UTF-8 in path".to_string(),
+            ))?
+            .to_string();
+        let inner_path = match &file_type {
+            FileType::Directory => file_path_str.as_str(),
+            _ => extract_filename(&file_path_str).expect("Input file is missing file name."),
+        };
+
+        Ok(InputFile {
+            file_type,
+            file_path: inner_path.to_string(),
+            data: if file_type == FileType::Data {
+                Content::File(file_path_str)
+            } else {
+                Content::Raw("".to_string())
+            },
+            metadata: None,
+            encrypt: true,
+            compression_level: Some(3),
+        })
+    }
 }
 
 pub struct PithosWriter {
@@ -174,7 +208,7 @@ impl PithosWriter {
         &mut self,
         chunk: &mut ChunkData,
         processing_flags: &ProcessingFlags,
-    ) -> Result<(BlockIndexEntry, [u8; 32]), PithosWriterError> {
+    ) -> Result<(BlockIndexEntry, [u8; 32], bool), PithosWriterError> {
         // Calculate block hashes
         let mut hasher = Hasher::new();
         hasher.update(&chunk.data);
@@ -184,7 +218,7 @@ impl PithosWriter {
         if let Some(index) = self.directory.block_exists(hashes.blake3) {
             // Add block to FileEntry and continue with next chunk
             //file_entry.add_block_data((index, hashes.shake256))?;
-            return Ok((index, hashes.shake256));
+            return Ok((index, hashes.shake256, true));
         }
 
         // Init BlockIndexEntry
@@ -217,7 +251,7 @@ impl PithosWriter {
         // Update stored size to processed block length
         block_index_entry.stored_size = chunk.data.len() as u64;
 
-        Ok((block_index_entry, hashes.shake256))
+        Ok((block_index_entry, hashes.shake256, false))
     }
 
     /// Processes an entire file and adds it to the directory index.
@@ -265,15 +299,17 @@ impl PithosWriter {
         for result in fastcdc_stream {
             // Process chunk
             let mut chunk = result?;
-            let (block_index_entry, key) = self.process_block(&mut chunk, processing_flags)?;
+            let (block_index_entry, key, deduplicated) =
+                self.process_block(&mut chunk, processing_flags)?;
 
             // Write block; Add block to file entry; Add block to index in directory
             self.write_block(&chunk.data)?;
             file_entry.add_block_data((block_index_entry.index, key))?;
-            self.directory.add_block_to_index(block_index_entry)?;
-
-            // Increment chunk index
-            self.chunk_idx = self.chunk_idx.saturating_add(1);
+            if !deduplicated {
+                self.directory.add_block_to_index(block_index_entry)?;
+                // Increment chunk index
+                self.chunk_idx = self.chunk_idx.saturating_add(1);
+            }
         }
 
         // Create random key and encrypt file block index
@@ -373,7 +409,12 @@ impl PithosWriter {
     #[allow(dead_code)]
     pub fn process_input_files(&mut self, files: Vec<InputFile>) -> Result<(), PithosWriterError> {
         for file in files {
-            self.process_input(file)?;
+            match file.file_type {
+                FileType::Directory => self.process_directory(file.file_path, None)?,
+                _ => {
+                    self.process_input(file)?;
+                }
+            }
         }
         Ok(())
     }
@@ -522,6 +563,7 @@ impl PithosWriter {
         Ok(())
     }
 
+    //TODO: Zipped RO-Crate processing ...
     pub fn process_ro_crate(&mut self, crate_data: &ROCrate) -> Result<(), PithosWriterError> {
         if let Some(base_path) = &crate_data.base_path {
             self.process_directory(base_path, Some(crate_data))?

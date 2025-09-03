@@ -6,25 +6,30 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pithos_lib::helpers::x25519_keys::{
     generate_private_key, private_key_to_pem_bytes, public_key_to_pem_bytes,
 };
+use pithos_lib::io::pithosreader::{PithosReaderError, PithosReaderSimple};
+use pithos_lib::io::pithoswriter::{InputFile, PithosWriter, PithosWriterError};
+use std::io::Write;
+use std::ops::Range;
 use std::path::PathBuf;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
-use utils::conversion::evaluate_log_level;
 use thiserror::Error;
 use tracing::dispatcher::SetGlobalDefaultError;
+use utils::conversion::{evaluate_log_level, parse_range_input};
 use x25519_dalek::PublicKey;
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Default, ValueEnum)]
 enum KeyFormat {
-    Openssl,
-    Crypt4gh,
-    Raw,
+    #[default]
+    Openssl, // PKCS#8 encoded key in PEM format
+    Crypt4gh, // Additional encryption of key
+    Raw,      // Only key bytes
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Default, ValueEnum)]
 enum ExportFormat {
+    #[default]
     Pithos,
     Crypt4gh,
+    RoCrate,
 }
 
 #[derive(Parser)]
@@ -35,15 +40,20 @@ struct Cli {
     log_level: Option<String>,
 
     /// Optionally set the log file
+    #[arg(long, value_name = "LOG_FILE")]
     log_file: Option<PathBuf>,
 
     /// Output destination; Default is stdout
-    #[arg(short, long, global = true)]
+    #[arg(global = true, short, long)]
     output: Option<PathBuf>,
 
-    /// Private key for encryption/decryption
-    #[arg(long)]
-    private_key: Option<PathBuf>, // File path; if None -> Default file: ~/.pithos/sec_key.pem
+    /// Private keys for encryption/decryption
+    #[arg(global = true, short, long, alias = "sk")]
+    secret_keys: Option<PathBuf>, // File paths; if None -> Default file: ~/.pithos/sec_key.pem
+
+    /// Public keys for encryption/decryption
+    #[arg(global = true, short, long, alias = "pk")]
+    public_keys: Option<Vec<PathBuf>>, // File paths; if None -> Default file: ~/.pithos/pub_key.pem
 
     /// Subcommands
     #[command(subcommand)]
@@ -54,7 +64,8 @@ struct Cli {
 enum PithosCommands {
     /// Create a Pithos file from some input
     Create {
-        /// Expect file metadata in JSON format under 'file-path.meta'
+        /*
+        /// Expect file metadata next to input files with '<input-file>.meta'
         #[arg(short, long)]
         metadata: bool,
         /// Check for files containing custom ranges as CSV
@@ -69,7 +80,7 @@ enum PithosCommands {
         /// Public keys of recipients
         #[arg(long)]
         reader_public_keys: Option<Vec<PathBuf>>, // Iterate files and parse all keys
-
+        */
         /// Input files
         #[arg(value_name = "FILES")]
         files: Vec<PathBuf>,
@@ -82,7 +93,7 @@ enum PithosCommands {
     },
     /// Create x25519
     CreateKeypair {
-        /// Key format; Default is openSSL x25519 pem
+        /// Key format; Default is PKCS#8 encoded x25519 keypair in PEM format
         #[arg(short, long)]
         format: Option<KeyFormat>,
     },
@@ -216,44 +227,51 @@ fn main() -> Result<(), PithosCliError> {
             ReadCommands::Search { .. } => {}
         },
         PithosCommands::Create {
-            metadata: _,
-            range_files: _,
-            auto_generate_ranges: _,
-            ranges_regex: _,
+            //metadata: _,
+            //range_files: _,
+            //auto_generate_ranges: _,
+            //ranges_regex: _,
             files,
-            reader_public_keys,
-        } => {}
-        PithosCommands::CreateKeypair { format } => {
-            // x25519 openSSL keypair
-            // x25519 Crypt4GH keypair
-            // Output format parameter?
-            //  - Raw
-            //  - Pem
-            //  - ?
+            //reader_public_keys,
+        } => {
+            if files.is_empty() {
+                return Err(PithosCliError::InvalidArgumentError(
+                    "No files provided".to_string(),
+                ));
+            }
 
-            // Evaluate output format
-            let format = format.as_ref().unwrap_or(&KeyFormat::Openssl);
-
-            // Generate keypair
-            let (seckey_bytes, pubkey_bytes) = match format {
-                KeyFormat::Openssl => {
-                    let openssl_keypair = openssl::pkey::PKey::generate_x25519()?;
-                    (
-                        openssl_keypair.private_key_to_pem_pkcs8()?,
-                        openssl_keypair.public_key_to_pem()?,
-                    )
-                }
-                KeyFormat::Crypt4gh => {
-                    unimplemented!("Crypt4GH key generation not yet implemented")
-                }
-                KeyFormat::Raw => {
-                    let openssl_keypair = openssl::pkey::PKey::generate_x25519()?;
-                    (
-                        openssl_keypair.raw_private_key()?,
-                        openssl_keypair.raw_public_key()?,
-                    )
-                }
+            let output = if let Some(outfile) = cli.output {
+                std::fs::File::create(outfile).map_err(|e| PithosWriterError::Io(e))?
+            } else {
+                // Default outfile
+                println!("No outfile specified, writing output to \"/tmp/out.pithos\""); //TODO: Replace with tracing::warn!()
+                std::fs::File::create("/tmp/out.pithos").map_err(|e| PithosWriterError::Io(e))?
             };
+
+            let sender_key = load_private_key_from_pem(
+                &cli.secret_keys
+                    .clone()
+                    .expect("Private key expected to create Pithos file"),
+            )?;
+            let reader_keys: Result<Vec<PublicKey>, PithosReaderError> = cli
+                .public_keys
+                .expect("At least one recipient expected")
+                .iter()
+                .map(|path| load_public_key_from_pem(path))
+                .collect();
+
+            let input_files: Result<Vec<InputFile>, PithosWriterError> =
+                files.iter().map(|path| InputFile::try_from(path)).collect();
+            let mut writer = PithosWriter::new(sender_key, reader_keys?, Box::new(output))?;
+
+            writer
+                .write_file_header()
+                .map_err(|e| PithosWriterError::Serialization(e))?;
+            writer.process_input_files(input_files?)?;
+            writer
+                .write_directory()
+                .map_err(|e| PithosWriterError::Serialization(e))?;
+        }
         PithosCommands::CreateKeypair { .. } => {
             let private_key = generate_private_key().map_err(PithosWriterError::Crypt)?;
             let public_key = PublicKey::from(&private_key);
@@ -273,10 +291,14 @@ fn main() -> Result<(), PithosCliError> {
                 .write_all(&public_key_to_pem_bytes(&public_key).map_err(PithosWriterError::Crypt)?)
                 .map_err(PithosWriterError::Io)?;
         }
-        PithosCommands::Modify { .. } => {}
-        PithosCommands::Export { .. } => {}
+        PithosCommands::Modify { .. } => {
+            unimplemented!()
+        }
+        PithosCommands::Export { format } => {
+            if let Some(format) = format {}
+            unimplemented!("Export to different formats is not yet implemented")
+        }
     }
 
-    // Continued program logic goes here...
     Ok(())
 }
