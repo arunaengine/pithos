@@ -1,6 +1,6 @@
 [package]
 name = "pithos"
-description = "Client for the Pithos object storage file format"
+description = "CLI for the Pithos container file format"
 version = "0.6.1"
 authors.workspace = true
 edition.workspace = true

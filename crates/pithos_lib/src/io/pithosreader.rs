@@ -168,7 +168,7 @@ impl PithosReaderSimple {
         inner_path: &str,
         directory: &Directory,
         output_path: Option<&PathBuf>,
-        range: Option<Range<u64>>,
+        ranges: Option<Vec<Range<u64>>>,
     ) -> Result<(), PithosReaderError> {
         let file_entry = directory
             .files
@@ -178,22 +178,24 @@ impl PithosReaderSimple {
 
         match &file_entry.file_type {
             FileType::Data | FileType::Metadata => {
-                // Create output file and write file blocks
-                let output_file = File::create(if let Some(base_dir) = output_path {
-                    base_dir.join(inner_path)
+                // Write output
+                let mut output_target: Box<dyn Write> = if let Some(dest) = output_path {
+                    Box::new(File::create(dest).map_err(PithosReaderError::Io)?)
                 } else {
-                    std::env::current_dir()?.join(inner_path)
-                })?;
+                    Box::new(io::stdout())
+                };
 
-                if let Some(range) = range {
-                    self.read_data_range_to_sink(
-                        range,
-                        file_entry,
-                        &directory.blocks,
-                        Box::new(output_file),
-                    )?;
+                if let Some(ranges) = ranges {
+                    for range in ranges {
+                        self.read_data_range_to_sink(
+                            range,
+                            file_entry,
+                            &directory.blocks,
+                            &mut output_target,
+                        )?;
+                    }
                 } else {
-                    self.read_data_to_sink(file_entry, &directory.blocks, Box::new(output_file))?;
+                    self.read_data_to_sink(file_entry, &directory.blocks, output_target)?;
                 }
             }
             FileType::Directory => {
@@ -399,7 +401,7 @@ impl PithosReaderSimple {
         byte_range: Range<u64>,
         file_entry: &FileEntry,
         block_index: &[BlockIndexEntry],
-        mut sink: Box<dyn Write>,
+        sink: &mut Box<dyn Write>,
     ) -> Result<(), PithosReaderError> {
         let mut block_byte_sum = 0;
 
