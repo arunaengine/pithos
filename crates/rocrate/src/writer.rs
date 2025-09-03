@@ -7,7 +7,7 @@ use crate::types::ROCrate;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use zip::{write::FileOptions, CompressionMethod, ZipWriter as ZipWriterTrait};
+use zip::{CompressionMethod, ZipWriter as ZipWriterTrait, write::FileOptions};
 
 /// Trait for RO-Crate writers.
 pub trait ROCrateWriter {
@@ -452,9 +452,9 @@ impl ZipWriterWithFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ROCrateReader;
     use crate::builder::ROCrateBuilder;
     use crate::reader::DirectoryReader;
-    use crate::ROCrateReader;
     use tempfile::TempDir;
 
     fn create_test_crate() -> ROCrate {

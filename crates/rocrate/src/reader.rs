@@ -299,8 +299,6 @@ impl ZipReader {
     /// Read a file from the ZIP archive.
     fn read_file_from_zip(&self, filename: &str) -> Result<String, ROCrateError> {
         let mut archive = self.open_archive()?;
-        dbg!(&archive.file_names().collect::<Vec<_>>());
-
         let mut file = archive
             .by_name(filename)
             .map_err(|_| ROCrateError::MissingFile(filename.to_string()))?;

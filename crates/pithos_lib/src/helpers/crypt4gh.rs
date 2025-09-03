@@ -376,7 +376,7 @@ impl PacketData {
                     Crypt4GHError::DecryptionError(format!("initialize decryptor: {}", e))
                 })?
                 .decrypt(nonce.into(), dec_data.as_slice())
-                .map_err(|e| Crypt4GHError::DecryptionFailed)?;
+                .map_err(|_| Crypt4GHError::DecryptionFailed)?;
 
             *self = Self::Decrypted(Self::packet_from_bytes(&decrypted_bytes)?);
         } else {
