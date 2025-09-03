@@ -40,6 +40,8 @@ pub enum PithosReaderError {
     InvalidBlockDataState(String),
     #[error("File not found: {0}")]
     FileNotFound(String),
+    #[error("File already exists: {0}")]
+    FileAlreadyExists(String),
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -90,7 +92,7 @@ impl PithosReaderSimple {
         //Ok(Self { file, private_key })
     }
 
-    pub fn read_directory(&mut self) -> Result<Directory, PithosReaderError> {
+    pub fn read_directory(&mut self) -> Result<(Directory, (u64, u64)), PithosReaderError> {
         // Read last 12 bytes for crc32 and directory length
         let file_len = self.file.metadata()?.len();
         if file_len < 12 {
@@ -102,31 +104,38 @@ impl PithosReaderSimple {
         let mut footer = [0u8; 12];
         self.file.read_exact(&mut footer)?;
 
-        let dir_len = u64::from_be_bytes(footer[..8].try_into().map_err(|_| {
+        let parent_dir_len = u64::from_be_bytes(footer[..8].try_into().map_err(|_| {
             PithosReaderError::Other("Failed to deserialize directory length".to_string())
         })?);
+        let parent_dir_start = file_len - parent_dir_len;
 
         // Last 4 bytes: crc32, next 8 bytes: directory length (u64, BE)
         let _crc32 = u32::from_be_bytes(footer[8..12].try_into().map_err(|_| {
             PithosReaderError::Other("Failed to deserialize crc32 checksum".to_string())
         })?);
 
-        self.file.seek(SeekFrom::End(0 - dir_len as i64))?;
-        let mut dir_buf = vec![0u8; dir_len as usize];
+        self.file.seek(SeekFrom::End(0 - parent_dir_len as i64))?;
+        let mut dir_buf = vec![0u8; parent_dir_len as usize];
         self.file.read_exact(&mut dir_buf)?;
 
         // Deserialize full directory
-        let mut directory = Directory::deserialize(&mut dir_buf.as_slice())?;
-
-        // Decrypt file indices in recipient sections
         let mut available_file_keys = HashMap::new();
-        let decrypted_file_indices =
-            directory
-                .decrypt_recipient(&self.private_key)
-                .map_err(|_| {
-                    PithosReaderError::Other("Failed to decrypt recipient data".to_string())
-                })?;
-        available_file_keys.extend(decrypted_file_indices);
+        let mut directory = Directory::deserialize(&mut dir_buf.as_slice())?;
+        available_file_keys.extend(directory.decrypt_recipient(&self.private_key)?);
+
+        // Merge with parent directories
+        while let Some((start, len)) = directory.parent_directory_offset {
+            // Read parent directory
+            self.file.seek(SeekFrom::Start(start))?;
+            let mut dir_buf = vec![0u8; len as usize];
+            self.file.read_exact(&mut dir_buf)?;
+            let mut older_directory = Directory::deserialize(&mut dir_buf.as_slice())?;
+            available_file_keys.extend(older_directory.decrypt_recipient(&self.private_key)?);
+
+            // Merge directories and swap
+            older_directory.merge(directory)?;
+            directory = older_directory;
+        }
 
         // Remove all files from directory which cannot be decrypted
         directory.files.retain_mut(|file| match file.block_data {
@@ -140,7 +149,7 @@ impl PithosReaderSimple {
             }
         });
 
-        Ok(directory)
+        Ok((directory, (parent_dir_start, parent_dir_len)))
     }
 
     pub fn read_file_paths(
@@ -232,7 +241,6 @@ impl PithosReaderSimple {
             .ok_or(PithosReaderError::FileNotFound(
                 "File does not exist in Pithos".to_string(),
             ))?;
-        //println!("Data key: {:?}", data_key);
         let packets = HeaderPacket::from_pithos(&self.private_key, reader_keys, &data_key)
             .map_err(|e| {
                 PithosReaderError::Other(format!("Conversion to header packet failed: {e})"))

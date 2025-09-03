@@ -120,8 +120,52 @@ impl Directory {
         DirectoryBuilder::new().build()
     }
 
-    pub fn add_block_to_index(&mut self, block_index_entry: BlockIndexEntry) {
-        self.blocks.push(block_index_entry)
+    pub fn merge(&mut self, newer_directory: Directory) -> Result<(), PithosReaderError> {
+        // Append files (also checks for duplicate file_id and path duplicates)
+        self.add_files_to_index(newer_directory.files)
+            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+
+        // Append blocks
+        self.add_blocks_to_index(newer_directory.blocks)
+            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+
+        // Append relations
+        self.add_relation_definitions(newer_directory.relations)
+            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+
+        // Merge encryption sections
+        //  - Merge sections that can be decrypted
+        //  - Drop encryption sections which already exist ???
+        for (section_key, new_section) in newer_directory.encryption {
+            match self.encryption.entry(section_key) {
+                Entry::Occupied(ref mut entry) => {
+                    // Encryption section does not exist -> merge decrypted recipients
+                    for (recipient_key, new_recipient) in new_section.recipients {
+                        match entry.get_mut().recipients.get_mut(&recipient_key) {
+                            Some(existing_recipient) => {
+                                merge_recipient_data(
+                                    &mut existing_recipient.recipient_data,
+                                    new_recipient.recipient_data,
+                                );
+                            }
+                            None => {
+                                entry
+                                    .get_mut()
+                                    .recipients
+                                    .insert(recipient_key, new_recipient);
+                            }
+                        }
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    // Encryption section does not exist -> insert
+                    entry.insert(new_section);
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn block_exists(&self, hash: blake3::Hash) -> Option<BlockIndexEntry> {
@@ -133,18 +177,57 @@ impl Directory {
         None
     }
 
+    pub fn add_blocks_to_index(
+        &mut self,
+        block_index_entries: Vec<BlockIndexEntry>,
+    ) -> Result<(), PithosWriterError> {
+        for block in block_index_entries {
+            self.add_block_to_index(block)?;
+        }
+        Ok(())
+    }
+
+    pub fn add_block_to_index(
+        &mut self,
+        block_index_entry: BlockIndexEntry,
+    ) -> Result<(), PithosWriterError> {
+        for existing_block in &self.blocks {
+            if existing_block.index == block_index_entry.index {
+                return Err(PithosWriterError::Other(
+                    "Block index already occupied".to_string(),
+                ));
+            }
+        }
+        Ok(self.blocks.push(block_index_entry))
+    }
+
+    pub fn next_free_block_index(&self) -> u64 {
+        if let Some(max_entry) = self.blocks.iter().max_by_key(|block| block.index) {
+            max_entry.index + 1
+        } else {
+            0
+        }
+    }
+
     pub fn add_file_to_index(&mut self, file_entry: &FileEntry) -> Result<(), PithosWriterError> {
-        if self
-            .files
-            .iter()
-            .map(|f| f.path.as_str())
-            .collect::<Vec<&str>>()
-            .contains(&file_entry.path.as_str())
-        {
-            return Err(PithosWriterError::PathOccupied(file_entry.path.clone()));
+        // Check for file_id or path duplicates
+        for file in &self.files {
+            if file.file_id == file_entry.file_id || file.path == file_entry.path {
+                return Err(PithosWriterError::PathOccupied(file_entry.path.clone()));
+            }
         }
 
         self.files.push(file_entry.clone());
+        Ok(())
+    }
+
+    pub fn add_files_to_index(
+        &mut self,
+        file_entry: Vec<FileEntry>,
+    ) -> Result<(), PithosWriterError> {
+        for entry in file_entry {
+            self.add_file_to_index(&entry)?;
+        }
         Ok(())
     }
 
@@ -195,7 +278,40 @@ impl Directory {
         }
     }
 
-    pub fn get_file_entry(&self, path: &str) -> Option<&FileEntry> {
+    pub fn add_relation_definition(
+        &mut self,
+        relation: (u64, String),
+    ) -> Result<(), PithosWriterError> {
+        for existing_relation in &self.relations {
+            if existing_relation.0 == relation.0 {
+                return Err(PithosWriterError::Other(
+                    "Relation id already occupied".to_string(),
+                ));
+            }
+        }
+
+        Ok(self.relations.push(relation))
+    }
+
+    pub fn add_relation_definitions(
+        &mut self,
+        relations: Vec<(u64, String)>,
+    ) -> Result<(), PithosWriterError> {
+        for relation in relations {
+            self.add_relation_definition(relation)?;
+        }
+        Ok(())
+    }
+
+    pub fn next_free_file_index(&self) -> u64 {
+        if let Some(idx) = self.files.iter().max_by_key(|file| file.file_id) {
+            idx.file_id + 1
+        } else {
+            0
+        }
+    }
+
+    pub fn get_file_by_path(&self, path: &str) -> Option<&FileEntry> {
         self.files.iter().find(|file| file.path == path)
     }
 
@@ -246,9 +362,34 @@ impl Directory {
         let mut available_file_indices = Vec::<(u64, [u8; 32])>::new();
         let reader_pubkey = PublicKey::from(reader_key);
 
-        // Iterate available encryption sections
+        // Check if key is sender key -> Decrypt complete encryption section
+        if let Entry::Occupied(mut entry) = self.encryption.entry(*reader_pubkey.as_bytes()) {
+            for (key, r_section) in entry.get_mut().recipients.iter_mut() {
+                let shared_key = reader_key.diffie_hellman(&PublicKey::from(*key));
+                match &r_section.recipient_data {
+                    RecipientData::Encrypted(_) => {
+                        let entries = r_section
+                            .recipient_data
+                            .decrypt(&shared_key)
+                            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+                        available_file_indices.extend(entries);
+                    }
+                    RecipientData::Decrypted(entries) => {
+                        available_file_indices.extend(entries);
+                    }
+                }
+            }
+        }
+
+        // Iterate available encryption sections as the key still could be used as recipient in other sections
         for (sender_pubkey, e_section) in self.encryption.iter_mut() {
             let sender_pubkey = PublicKey::from(*sender_pubkey);
+
+            // Skip section if reader key is from sender -> Already decrypted above
+            if sender_pubkey == reader_pubkey {
+                continue;
+            }
+
             let shared_key = reader_key.diffie_hellman(&sender_pubkey);
 
             match e_section.recipients.entry(*reader_pubkey.as_bytes()) {
@@ -266,7 +407,7 @@ impl Directory {
                     }
                 },
                 Entry::Vacant(_) => {
-                    return Err(PithosReaderError::Other("Recipient not found".to_string())); //TODO: Replace with individual error option
+                    // Recipient does not exist in encryption section
                 }
             }
         }

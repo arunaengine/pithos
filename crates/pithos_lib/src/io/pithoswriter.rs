@@ -3,11 +3,11 @@ use crate::helpers::directory::DirectoryBuilder;
 use crate::helpers::hash::Hasher;
 use crate::helpers::x25519_keys::CryptError;
 use crate::helpers::zstd::{ZstdError, map_to_zstd_level};
-use crate::io::pithosreader::PithosReaderError;
+use crate::io::pithosreader::{PithosReaderError, PithosReaderSimple};
 use crate::model::serialization::SerializationError;
 use crate::model::structs::{
     BlockHeader, BlockIndexEntry, BlockLocation, Directory, EncryptionSection, FileEntry, FileType,
-    ProcessingFlags, RecipientData, RecipientSection, Reference,
+    ProcessingFlags, Reference,
 };
 use crate::{
     helpers::{
@@ -22,10 +22,10 @@ use rand_core::OsRng;
 use rocrate::ROCrate;
 use std::cmp::Ordering;
 use std::fs::{File, symlink_metadata};
-use std::io;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::time::SystemTimeError;
+use std::{fs, io};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Error type for PithosReader operations
@@ -87,6 +87,7 @@ pub struct PithosWriter {
     sink: Box<dyn Write>,
 
     // Processing
+    parent_directory: Option<Directory>,
     directory: Directory,
     chunk_idx: u64,
     file_idx: u64,
@@ -100,13 +101,16 @@ impl PithosWriter {
         sink: Box<dyn Write>,
     ) -> Result<Self, PithosWriterError> {
         // Init encryption section
-        let encryption_sections =
-            IndexMap::from_iter([(writer_key.to_bytes(), EncryptionSection::new(&reader_keys))]);
+        let encryption_sections = IndexMap::from_iter([(
+            PublicKey::from(&writer_key).to_bytes(),
+            EncryptionSection::new(&reader_keys),
+        )]);
 
         Ok(PithosWriter {
             writer_key,
             reader_keys,
             sink,
+            parent_directory: None,
             directory: DirectoryBuilder::new()
                 .encryption(encryption_sections)
                 .build()?,
@@ -116,10 +120,40 @@ impl PithosWriter {
         })
     }
 
-    pub fn new_from_file() -> Result<Self, PithosReaderError> {
-        //TODO: Read directory from file
-        //TODO: Do stuff
-        todo!()
+    pub fn new_from_file<P: AsRef<Path>>(
+        writer_key: StaticSecret,
+        reader_keys: Vec<PublicKey>,
+        pithos_file: P,
+    ) -> Result<Self, PithosReaderError> {
+        // Read existing directories
+        let mut reader = PithosReaderSimple::new_with_key(&pithos_file, writer_key.clone())?;
+        let (parent_directory, offset) = reader.read_directory()?;
+
+        // Open Pithos file in append mode
+        let file = fs::OpenOptions::new()
+            //.read(true) //?
+            .append(true)
+            .open(pithos_file)?;
+        let written_bytes = file.metadata()?.len();
+        let sink = Box::new(file);
+
+        Ok(PithosWriter {
+            chunk_idx: parent_directory.next_free_block_index(),
+            file_idx: parent_directory.next_free_file_index(),
+            parent_directory: Some(parent_directory),
+            directory: DirectoryBuilder::new()
+                .parent_directory_offset(Some(offset))
+                .encryption(IndexMap::from_iter([(
+                    PublicKey::from(&writer_key).to_bytes(),
+                    EncryptionSection::new(&reader_keys),
+                )]))
+                .build()
+                .map_err(|e| PithosReaderError::Other(format!("Directory build failed: {e}")))?,
+            written_bytes,
+            writer_key,
+            reader_keys,
+            sink,
+        })
     }
 
     /* ----- Processing ---------- */
@@ -236,7 +270,7 @@ impl PithosWriter {
             // Write block; Add block to file entry; Add block to index in directory
             self.write_block(&chunk.data)?;
             file_entry.add_block_data((block_index_entry.index, key))?;
-            self.directory.add_block_to_index(block_index_entry);
+            self.directory.add_block_to_index(block_index_entry)?;
 
             // Increment chunk index
             self.chunk_idx = self.chunk_idx.saturating_add(1);
@@ -438,14 +472,6 @@ impl PithosWriter {
         }
 
         Ok(())
-    }
-
-    // Append to an existing Pithos file
-    // Should only be used after existing pithos file was loaded:
-    //   - Omits the file header
-    //   - Also writes a new directory with offset to parent directory
-    pub fn append_files(&mut self) -> anyhow::Result<()> {
-        todo!()
     }
 
     pub fn compress_block(

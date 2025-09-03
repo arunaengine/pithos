@@ -89,7 +89,14 @@ impl ProcessingFlags {
         (self.0 & Self::ENCRYPTION_MASK) != 0
     }
 
-    pub fn set_compression_level(&mut self, compression_level: u8) {
+    pub fn set_compression_level(&mut self, mut compression_level: u8) {
+        // Sanitize
+        compression_level = if compression_level > Self::COMPRESSION_MASK {
+            Self::COMPRESSION_MASK
+        } else {
+            compression_level
+        };
+
         // Only use the lowest 3 bits (0-7)
         self.0 = (self.0 & !Self::COMPRESSION_MASK) | (compression_level & Self::COMPRESSION_MASK);
     }
