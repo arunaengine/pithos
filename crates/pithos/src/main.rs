@@ -136,7 +136,7 @@ enum ReadCommands {
         #[arg(value_name = "PATH")]
         path: PathBuf,
         /// Specific byte ranges in the file
-        #[arg(short, long, value_parser=parse_range_input, value_name = "START:END,...")]
+        #[arg(short, long, value_parser=parse_range_input, value_delimiter=',', value_name = "START:END,...")]
         ranges: Option<Vec<Range<u64>>>,
     },
     /// Read the Table of Contents

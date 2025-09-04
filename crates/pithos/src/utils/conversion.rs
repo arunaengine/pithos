@@ -22,27 +22,14 @@ pub fn _to_hex_string(bytes: Vec<u8>) -> String {
     hex_str.join("")
 }
 
-pub fn parse_range_input(input: &str) -> Result<Vec<Range<u64>>, PithosCliError> {
-    if input.is_empty() {
-        return Err(PithosCliError::InvalidArgumentError(
-            "Provided empty ranges argument".to_string(),
-        ));
-    }
+pub fn parse_range_input(input: &str) -> Result<Range<u64>, PithosCliError> {
+    let parts: Vec<&str> = input.split(':').collect();
+    let start = parts[0].trim().parse::<u64>().map_err(|e| {
+        PithosCliError::InvalidArgumentError(format!("Failed to parse range start: {}", e))
+    })?;
+    let end = parts[1].trim().parse::<u64>().map_err(|e| {
+        PithosCliError::InvalidArgumentError(format!("Failed to parse range end: {}", e))
+    })?;
 
-    let ranges: Vec<&str> = input.split(',').collect();
-    let mut parsed_ranges = Vec::new();
-    for range in ranges {
-        let parts: Vec<&str> = range.split(':').collect();
-
-        let start = parts[0].trim().parse::<u64>().map_err(|e| {
-            PithosCliError::InvalidArgumentError(format!("Failed to parse range start: {}", e))
-        })?;
-        let end = parts[1].trim().parse::<u64>().map_err(|e| {
-            PithosCliError::InvalidArgumentError(format!("Failed to parse range end: {}", e))
-        })?;
-
-        parsed_ranges.push(start..end)
-    }
-
-    Ok(parsed_ranges)
+    Ok(start..end)
 }
