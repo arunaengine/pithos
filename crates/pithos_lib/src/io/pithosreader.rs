@@ -365,27 +365,36 @@ impl PithosReaderSimple {
                         .get(hash)
                         .ok_or(PithosReaderError::BlockHashNotFound(*hash))?;
 
-                    self.file.seek(SeekFrom::Start(block_meta.offset))?;
-
-                    // Read block header for block start validation
                     let mut block_header = [0u8; 4];
-                    self.file.read_exact(&mut block_header)?;
-                    BlockHeader::deserialize(&mut block_header.as_slice())?;
-
-                    // Read block data
-                    let mut block_buf = vec![0u8; block_meta.stored_size as usize];
-                    self.file.read_exact(&mut block_buf)?;
+                    let mut block_data = vec![0u8; block_meta.stored_size as usize];
+                    match &block_meta.location {
+                        BlockLocation::Local => {
+                            self.file.seek(SeekFrom::Start(block_meta.offset))?;
+                            // Read block header for block start validation
+                            self.file.read_exact(&mut block_header)?;
+                            BlockHeader::deserialize(&mut block_header.as_slice())?;
+                            // Read block data
+                            self.file.read_exact(&mut block_data)?;
+                        }
+                        BlockLocation::External { url } => {
+                            let mut response = reqwest::blocking::get(url).unwrap();
+                            // Read block header for block start validation
+                            response.read_exact(&mut block_header)?;
+                            BlockHeader::deserialize(&mut block_header.as_slice())?;
+                            // Read block data
+                            self.file.read_exact(&mut block_data)?;
+                        }
+                    }
 
                     // Decrypt and decompress according to ProcessingFlags
                     if block_meta.flags.is_encrypted() {
-                        block_buf = decrypt_chunk(&block_buf, key)?;
+                        block_data = decrypt_chunk(&block_data, key)?;
                     }
-
                     if block_meta.flags.get_compression_level() > 0 {
-                        block_buf = decompress_data(&block_buf, block_meta.original_size)?;
+                        block_data = decompress_data(&block_data, block_meta.original_size)?;
                     }
 
-                    sink.write_all(&block_buf)?;
+                    sink.write_all(&block_data)?;
                 }
             }
         }
