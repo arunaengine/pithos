@@ -33,3 +33,24 @@ pub fn parse_range_input(input: &str) -> Result<Range<u64>, PithosCliError> {
 
     Ok(start..end)
 }
+
+pub fn parse_cdc_input(input: &str) -> Result<(u32, u32, u32), PithosCliError> {
+    let parts: Vec<&str> = input.split(',').collect();
+    if parts.len() != 3 {
+        return Err(PithosCliError::InvalidArgumentError(
+            "Invalid cdc argument".to_string(),
+        ));
+    }
+
+    let min = parts[0].trim().parse::<u32>().map_err(|e| {
+        PithosCliError::InvalidArgumentError(format!("Failed to parse range start: {}", e))
+    })?;
+    let avg = parts[1].trim().parse::<u32>().map_err(|e| {
+        PithosCliError::InvalidArgumentError(format!("Failed to parse range end: {}", e))
+    })?;
+    let max = parts[2].trim().parse::<u32>().map_err(|e| {
+        PithosCliError::InvalidArgumentError(format!("Failed to parse range end: {}", e))
+    })?;
+
+    Ok((min, avg, max))
+}

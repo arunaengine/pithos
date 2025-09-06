@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::dispatcher::SetGlobalDefaultError;
-use utils::conversion::{evaluate_log_level, parse_range_input};
+use utils::conversion::{evaluate_log_level, parse_cdc_input, parse_range_input};
 use x25519_dalek::PublicKey;
 
 #[derive(Clone, Default, ValueEnum)]
@@ -81,6 +81,9 @@ enum PithosCommands {
         #[arg(long)]
         reader_public_keys: Option<Vec<PathBuf>>, // Iterate files and parse all keys
         */
+        /// Set values for content-defined chunking
+        #[arg(long="cdc", value_parser=parse_cdc_input, value_name = "MIN,AVG,MAX")]
+        cdc: Option<(u32, u32, u32)>,
         /// Input files
         #[arg(value_name = "FILES")]
         files: Vec<PathBuf>,
@@ -259,14 +262,7 @@ fn main() -> Result<(), PithosCliError> {
             }
             ReadCommands::Search { .. } => {}
         },
-        PithosCommands::Create {
-            //metadata: _,
-            //range_files: _,
-            //auto_generate_ranges: _,
-            //ranges_regex: _,
-            files,
-            //reader_public_keys,
-        } => {
+        PithosCommands::Create { cdc, files } => {
             if files.is_empty() {
                 return Err(PithosCliError::InvalidArgumentError(
                     "No files provided".to_string(),
@@ -295,15 +291,13 @@ fn main() -> Result<(), PithosCliError> {
 
             let input_files: Result<Vec<InputFile>, PithosWriterError> =
                 files.iter().map(|path| InputFile::try_from(path)).collect();
-            let mut writer = PithosWriter::new(sender_key, reader_keys?, Box::new(output))?;
+            let mut writer = PithosWriter::new(sender_key, reader_keys?, cdc, Box::new(output))?;
 
             writer
                 .write_file_header()
                 .map_err(|e| PithosWriterError::Serialization(e))?;
             writer.process_input_files(input_files?)?;
-            writer
-                .write_directory()
-                .map_err(|e| PithosWriterError::Serialization(e))?;
+            writer.write_directory()?;
         }
         PithosCommands::CreateKeypair { .. } => {
             let private_key = generate_private_key().map_err(PithosWriterError::Crypt)?;
