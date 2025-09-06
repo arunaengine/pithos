@@ -342,7 +342,6 @@ impl PacketData {
                 }
             }
 
-            //println!("Encrypt packet data with: {:?}", session_key);
             let encrypted = ChaCha20Poly1305::new_from_slice(session_key)
                 .map_err(|_| Crypt4GHError::EncryptionError("Initialize cipher".to_string()))?
                 .encrypt(nonce, enc_data.as_slice())
@@ -351,7 +350,6 @@ impl PacketData {
             let mac: [u8; 16] = encrypted[encrypted.len() - 16..]
                 .try_into()
                 .map_err(|_| Crypt4GHError::EncryptionError("packet mac".to_string()))?;
-            //println!("{:?}\n{:?}\n{:?}", enc_data, encrypted, mac);
             Ok(mac)
         } else {
             Err(Crypt4GHError::EncryptionError(
@@ -367,9 +365,7 @@ impl PacketData {
         mac: &[u8; 16],
     ) -> Result<(), Crypt4GHError> {
         if let Self::Encrypted(enc_data) = &self {
-            //println!("Decrypt packet data with: {:?}", session_key);
             let dec_data = [enc_data.as_slice(), mac.as_slice()].concat();
-            //println!("To decrypt: {:?}", dec_data);
 
             let decrypted_bytes = ChaCha20Poly1305::new_from_slice(session_key)
                 .map_err(|e| {

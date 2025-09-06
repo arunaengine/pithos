@@ -20,8 +20,9 @@ fastcdc = "3.2.1"
 indexmap = "2.11.0"
 integer-encoding = "4.0.2"
 pkcs8 = { version = "0.10.2", features = ["pem", "alloc"] }
-rand = "0.8"
+rand = "0.8.5"
 rand_core = "0.6.4"
+reqwest = {  version = "0.12.23", features = ["blocking"] }
 rocrate = { path = "../rocrate" }
 sha3 = "0.10.8"
 thiserror = { workspace = true }
@@ -30,4 +31,5 @@ x25519-dalek = { workspace = true }
 zstd = "0.13.3"
 
 [dev-dependencies]
-tempfile = "3.20"
+tempfile = "3.21"
+zip = "4.6.1"

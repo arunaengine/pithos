@@ -109,7 +109,7 @@ impl TryFrom<&PathBuf> for InputFile {
             },
             metadata: None,
             encrypt: true,
-            compression_level: Some(3),
+            compression_level: Some(7),
         })
     }
 }
@@ -434,7 +434,7 @@ impl PithosWriter {
                 data: Content::File(entry.path().to_string_lossy().to_string()),
                 metadata: None,
                 encrypt: true,
-                compression_level: Some(3),
+                compression_level: Some(7),
             };
             entries.push(input_file);
         }
