@@ -33,7 +33,7 @@ pub fn map_to_zstd_level(flags: &ProcessingFlags) -> i32 {
 
 /// Compresses a chunk of data with zstd and returns the compression ratio.
 pub fn probe_compression_ratio(input: &[u8], level: Option<i32>) -> Result<f64, ZstdError> {
-    if input.len() == 0 {
+    if input.is_empty() {
         return Ok(1.0);
     }
 

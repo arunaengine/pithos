@@ -1,7 +1,7 @@
-use crate::io::pithoswriter::{Content, PithosWriterError};
-use crate::io::util::{current_timestamp, get_symlink_target};
 use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
 use crate::io::pithosreader::PithosReaderError;
+use crate::io::pithoswriter::{Content, PithosWriterError};
+use crate::io::util::{current_timestamp, get_symlink_target};
 
 use indexmap::IndexMap;
 use integer_encoding::VarIntWriter;
@@ -454,7 +454,7 @@ pub struct EncryptionSection {
 }
 
 impl EncryptionSection {
-    pub fn new(recipient_pubkeys: &Vec<PublicKey>) -> Self {
+    pub fn new(recipient_pubkeys: &[PublicKey]) -> Self {
         EncryptionSection {
             recipients: IndexMap::from_iter(
                 recipient_pubkeys
@@ -487,7 +487,10 @@ impl RecipientSection {
             RecipientData::Encrypted(_) => Err(PithosWriterError::InvalidRecipientDataState(
                 "Cannot add file entry to encrypted recipient data".to_string(),
             )),
-            RecipientData::Decrypted(ref mut entries) => Ok(entries.push(entry)),
+            RecipientData::Decrypted(ref mut entries) => {
+                let _: () = entries.push(entry);
+                Ok(())
+            }
         }
     }
 }

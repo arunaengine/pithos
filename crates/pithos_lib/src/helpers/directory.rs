@@ -224,7 +224,7 @@ impl Directory {
         reader_key: &PublicKey,
         file_entry: (u64, [u8; 32]), // (file index, encryption key)
     ) -> Result<(), PithosWriterError> {
-        Ok(match self.encryption.entry(*writer_key.as_bytes()) {
+        let _: () = match self.encryption.entry(*writer_key.as_bytes()) {
             Entry::Occupied(ref mut entry) => {
                 match entry.get_mut().recipients.entry(reader_key.to_bytes()) {
                     Entry::Occupied(ref mut entry) => {
@@ -247,7 +247,8 @@ impl Directory {
                     )]),
                 });
             }
-        })
+        };
+        Ok(())
     }
 
     pub fn add_file_to_all_recipients(&mut self, entry: (u64, [u8; 32])) {
@@ -277,7 +278,8 @@ impl Directory {
             }
         }
 
-        Ok(self.relations.push(relation))
+        self.relations.push(relation);
+        Ok(())
     }
 
     pub fn add_relation_definitions(

@@ -4,7 +4,9 @@ use crate::helpers::x25519_keys::{CryptError, private_key_from_pem_bytes};
 use crate::helpers::zstd::{ZstdError, decompress_data};
 use crate::io::util::{create_dir, create_symlink};
 use crate::model::deserialization::DeserializationError;
-use crate::model::structs::{BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileType};
+use crate::model::structs::{
+    BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileType,
+};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fs::File;
@@ -315,7 +317,7 @@ impl PithosReaderSimple {
                         } else if buffer.is_empty() && remaining_chunk.len() > CRYPT4GH_BLOCK_SIZE {
                             // Large chunk that exceeds buffer capacity -> Process in buffer-sized pieces
                             let chunk_to_process = &remaining_chunk[..CRYPT4GH_BLOCK_SIZE];
-                            let encrypted = encrypt_chunk(&chunk_to_process, b"", &data_key)?;
+                            let encrypted = encrypt_chunk(chunk_to_process, b"", &data_key)?;
                             sink.write_all(&encrypted)?;
                             //sink.write_all(&encrypt_chunk(&chunk_to_process, b"", &data_key)?)?;
                             chunk_offset += CRYPT4GH_BLOCK_SIZE;

@@ -124,7 +124,10 @@ fn test_rocrate_read_directory() {
         "mailto:josiah.carberry@example.com",
         "https://orcid.org/0000-0002-1825-0097",
     ];
-    let mut collected = rocrate.contextual_entities().keys().collect::<Vec<&String>>();
+    let mut collected = rocrate
+        .contextual_entities()
+        .keys()
+        .collect::<Vec<&String>>();
     collected.retain(|id| !contextual_entities_ids.contains(&id.as_str()));
     assert!(collected.is_empty());
 }

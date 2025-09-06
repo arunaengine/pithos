@@ -74,7 +74,7 @@ impl HeaderPacket {
         let sender_pubkey = PublicKey::from(sender_key);
         let mut header_packets = vec![];
         for reader in reader_keys {
-            let session_key = sender_key.diffie_hellman(&reader);
+            let session_key = sender_key.diffie_hellman(reader);
             let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
             let mut packet_data =
                 PacketData::Decrypted(vec![Packet::Encryption(EncryptionPacket {
@@ -300,8 +300,8 @@ impl HeaderPacket {
         writers_private_key: Option<StaticSecret>,
     ) -> Result<(), Crypt4GHError> {
         let sender_key = match writers_private_key {
-            Some(key) => StaticSecret::from(key),
-            None => StaticSecret::random_from_rng(&mut OsRng),
+            Some(key) => key,
+            None => StaticSecret::random_from_rng(OsRng),
         };
 
         let session_key = sender_key.diffie_hellman(&readers_pubkey);
