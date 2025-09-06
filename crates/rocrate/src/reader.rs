@@ -107,20 +107,13 @@ impl DirectoryReader {
             Ok(EntityType::Skip) // Skip metadata descriptor
         } else if id == "./" {
             Ok(EntityType::Root(self.convert_to_root_entity(json_entity)?))
-        } else if json_entity.has_type("File") || self.is_file_path(&id) {
-            Ok(EntityType::Data(self.convert_to_data_entity(json_entity)?))
-        } else if json_entity.has_type("Dataset") {
+        } else if json_entity.has_type("File") || json_entity.has_type("Dataset") {
             Ok(EntityType::Data(self.convert_to_data_entity(json_entity)?))
         } else {
             Ok(EntityType::Contextual(
                 self.convert_to_contextual_entity(json_entity)?,
             ))
         }
-    }
-
-    /// Check if an ID looks like a file path.
-    fn is_file_path(&self, id: &str) -> bool {
-        !id.starts_with("http") && !id.starts_with("#") && (id.contains('/') || id.contains('.'))
     }
 
     /// Convert JSON entity to RootDataEntity.
@@ -347,19 +340,13 @@ impl ZipReader {
             Ok(EntityType::Root(self.convert_to_root_entity(json_entity)?))
         } else if id == "ro-crate-metadata.json" {
             Ok(EntityType::Skip)
-        } else if json_entity.has_type("File") || self.is_file_path(&id) {
-            Ok(EntityType::Data(self.convert_to_data_entity(json_entity)?))
-        } else if json_entity.has_type("Dataset") {
+        } else if json_entity.has_type("File") || json_entity.has_type("Dataset") {
             Ok(EntityType::Data(self.convert_to_data_entity(json_entity)?))
         } else {
             Ok(EntityType::Contextual(
                 self.convert_to_contextual_entity(json_entity)?,
             ))
         }
-    }
-
-    fn is_file_path(&self, id: &str) -> bool {
-        !id.starts_with("http") && !id.starts_with("#") && (id.contains('/') || id.contains('.'))
     }
 
     fn convert_to_root_entity(&self, entity: Entity) -> Result<RootDataEntity, ROCrateError> {

@@ -11,7 +11,7 @@ pub const ROCRATE_1_2: &str = "https://w3id.org/ro/crate/1.2";
 const ROCRATE_1_2_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
 
 /// Standard RO-Crate 1.1 specification URL.
-const ROCRATE_1_1: &str = "https://w3id.org/ro/crate/1.1";
+const _ROCRATE_1_1: &str = "https://w3id.org/ro/crate/1.1";
 /// Standard RO-Crate 1.1 context URL.
 const ROCRATE_1_1_CONTEXT: &str = "https://w3id.org/ro/crate/1.1/context";
 
