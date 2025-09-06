@@ -56,12 +56,15 @@ impl ProcessingFlags {
         let mut flags = ProcessingFlags(0b0);
 
         // Set compression level
-        if let Some(level) = compression_level {
-            if level > Self::COMPRESSION_MASK {
-                flags.set_compression_level(Self::COMPRESSION_MASK) // Cap at maximum
-            } else {
-                flags.set_compression_level(3) // Default is compression level 3
+        match compression_level {
+            Some(level) => {
+                if level > Self::COMPRESSION_MASK {
+                    flags.set_compression_level(Self::COMPRESSION_MASK) // Cap at maximum
+                } else {
+                    flags.set_compression_level(level)
+                }
             }
+            None => flags.set_compression_level(3), // Default
         }
 
         // Set encryption

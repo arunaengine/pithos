@@ -4,9 +4,6 @@ use crate::helpers::x25519_keys::{CryptError, private_key_from_pem_bytes};
 use crate::helpers::zstd::{ZstdError, decompress_data};
 use crate::io::util::{create_dir, create_symlink};
 use crate::model::deserialization::DeserializationError;
-use crate::model::structs::{
-    BlockDataState, BlockHeader, BlockIndexEntry, Directory, FileEntry, FileType,
-};
 use crate::model::structs::{BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileType};
 use indexmap::IndexMap;
 use std::collections::HashMap;
