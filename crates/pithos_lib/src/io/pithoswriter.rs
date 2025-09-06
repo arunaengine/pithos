@@ -538,7 +538,10 @@ impl PithosWriter {
         Ok(())
     }
 
-    pub fn write_directory(&mut self) -> Result<(), SerializationError> {
+    pub fn write_directory(&mut self) -> Result<(), PithosWriterError> {
+        // Encrypt recipients of writer section
+        self.directory.encrypt_recipients(&self.writer_key)?;
+
         // Update len and crc32
         self.directory.update_len()?;
         self.directory.update_crc32()?;
