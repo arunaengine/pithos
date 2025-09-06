@@ -85,8 +85,6 @@ impl BlockLocation {
 
 impl BlockIndexEntry {
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
-        writer.write_varint(self.index)?;
-        writer.write_all(&self.hash)?;
         writer.write_varint(self.offset)?;
         writer.write_varint(self.stored_size)?;
         writer.write_varint(self.original_size)?;
@@ -112,12 +110,13 @@ impl Directory {
         }
 
         // Write file entries
-        writer.write_varint(self.files.len())?;
+        writer.write_varint(self.files.len() as u64)?;
         for file in &self.files {
             file.serialize(writer)?;
         }
-        writer.write_varint(self.blocks.len())?;
-        for block in &self.blocks {
+        writer.write_varint(self.blocks.len() as u64)?;
+        for (hash, block) in &self.blocks {
+            writer.write_all(hash)?;
             block.serialize(writer)?;
         }
         writer.write_varint(self.relations.len())?;
@@ -155,9 +154,9 @@ impl BlockDataState {
             BlockDataState::Decrypted(list) => {
                 writer.write_all(&[1u8])?;
                 writer.write_varint(list.len())?;
-                for (idx, hash) in list {
-                    writer.write_varint(*idx)?;
+                for (hash, key) in list {
                     writer.write_all(hash)?;
+                    writer.write_all(key)?;
                 }
             }
         }
@@ -168,29 +167,6 @@ impl BlockDataState {
         let mut buf = Vec::new();
         self.serialize(&mut buf)?;
         Ok(buf)
-    }
-
-    pub fn encrypt(&mut self, key: [u8; 32]) -> Result<(), PithosWriterError> {
-        match &self {
-            BlockDataState::Encrypted(_) => {
-                return Err(PithosWriterError::InvalidBlockDataState(
-                    "Block encrypted.".to_string(),
-                ));
-            }
-            BlockDataState::Decrypted(entries) => {
-                let mut data_bytes = Vec::new();
-                data_bytes.write_varint(entries.len())?;
-                for (idx, hash) in entries {
-                    data_bytes.write_varint(*idx)?;
-                    data_bytes.write_all(hash)?;
-                }
-                let encrypted_data = encrypt_chunk(data_bytes.as_slice(), b"", &key)?;
-
-                *self = BlockDataState::Encrypted(encrypted_data.to_vec())
-            }
-        };
-
-        Ok(())
     }
 }
 
@@ -222,14 +198,6 @@ impl FileEntry {
         let mut buf = Vec::new();
         self.serialize(&mut buf)?;
         Ok(buf)
-    }
-
-    pub fn encrypt_block_data(&mut self, key: [u8; 32]) -> Result<(), PithosWriterError> {
-        self.block_data.encrypt(key)
-    }
-
-    pub fn decrypt_block_data(&mut self, _key: [u8; 32]) -> anyhow::Result<()> {
-        Ok(())
     }
 }
 

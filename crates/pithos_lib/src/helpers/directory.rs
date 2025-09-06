@@ -17,7 +17,7 @@ pub struct DirectoryBuilder {
     identifier: [u8; 8],
     parent_directory_offset: Option<(u64, u64)>,
     files: Vec<FileEntry>,
-    blocks: Vec<BlockIndexEntry>,
+    blocks: IndexMap<[u8; 32], BlockIndexEntry>,
     relations: Vec<(u64, String)>,
     encryption: IndexMap<[u8; 32], EncryptionSection>,
     dir_len: u64,
@@ -35,7 +35,7 @@ impl DirectoryBuilder {
             identifier: *b"PITHOSDR",
             parent_directory_offset: None,
             files: vec![],
-            blocks: vec![],
+            blocks: IndexMap::new(),
             relations: vec![],
             encryption: IndexMap::new(),
             dir_len: 8,
@@ -52,7 +52,7 @@ impl DirectoryBuilder {
         self
     }
 
-    pub fn blocks(mut self, blocks: Vec<BlockIndexEntry>) -> Self {
+    pub fn blocks(mut self, blocks: IndexMap<[u8; 32], BlockIndexEntry>) -> Self {
         self.blocks = blocks;
         self
     }
@@ -83,7 +83,8 @@ impl DirectoryBuilder {
         for file in &self.files {
             file.serialize(&mut buf)?
         }
-        for block in &self.blocks {
+        for (hash, block) in &self.blocks {
+            buf.write_all(hash)?;
             block.serialize(&mut buf)?
         }
         buf.write_varint(self.relations.len() as u64)?;
@@ -168,45 +169,31 @@ impl Directory {
         Ok(())
     }
 
-    pub fn block_exists(&self, hash: blake3::Hash) -> Option<BlockIndexEntry> {
-        for block in &self.blocks {
-            if &block.hash == hash.as_bytes() {
-                return Some(block.clone());
-            }
+    pub fn block_hash_exists(&mut self, hash: &blake3::Hash) -> Option<BlockIndexEntry> {
+        if let Entry::Occupied(entry) = self.blocks.entry(*hash.as_bytes()) {
+            Some(entry.get().clone())
+        } else {
+            None
         }
-        None
     }
 
     pub fn add_blocks_to_index(
         &mut self,
-        block_index_entries: Vec<BlockIndexEntry>,
+        block_index_entries: IndexMap<[u8; 32], BlockIndexEntry>,
     ) -> Result<(), PithosWriterError> {
-        for block in block_index_entries {
-            self.add_block_to_index(block)?;
+        for (hash, block) in block_index_entries {
+            self.add_block_to_index(hash, block)?;
         }
         Ok(())
     }
 
     pub fn add_block_to_index(
         &mut self,
-        block_index_entry: BlockIndexEntry,
+        block_hash: [u8; 32],
+        block_entry: BlockIndexEntry,
     ) -> Result<(), PithosWriterError> {
-        for existing_block in &self.blocks {
-            if existing_block.index == block_index_entry.index {
-                return Err(PithosWriterError::Other(
-                    "Block index already occupied".to_string(),
-                ));
-            }
-        }
-        Ok(self.blocks.push(block_index_entry))
-    }
-
-    pub fn next_free_block_index(&self) -> u64 {
-        if let Some(max_entry) = self.blocks.iter().max_by_key(|block| block.index) {
-            max_entry.index + 1
-        } else {
-            0
-        }
+        self.blocks.insert(block_hash, block_entry);
+        Ok(())
     }
 
     pub fn add_file_to_index(&mut self, file_entry: &FileEntry) -> Result<(), PithosWriterError> {
@@ -432,7 +419,8 @@ impl Directory {
         for file in &self.files {
             file.serialize(&mut buf)?
         }
-        for block in &self.blocks {
+        for (hash, block) in &self.blocks {
+            buf.write_all(hash)?;
             block.serialize(&mut buf)?
         }
         buf.write_varint(self.relations.len() as u64)?;

@@ -208,23 +208,20 @@ impl PithosWriter {
         &mut self,
         chunk: &mut ChunkData,
         processing_flags: &ProcessingFlags,
-    ) -> Result<(BlockIndexEntry, [u8; 32], bool), PithosWriterError> {
+    ) -> Result<(BlockIndexEntry, Hashes, bool), PithosWriterError> {
         // Calculate block hashes
         let mut hasher = Hasher::new();
         hasher.update(&chunk.data);
         let hashes = hasher.finalize();
 
         // Check if block already exists in directory
-        if let Some(index) = self.directory.block_exists(hashes.blake3) {
-            // Add block to FileEntry and continue with next chunk
-            //file_entry.add_block_data((index, hashes.shake256))?;
-            return Ok((index, hashes.shake256, true));
+        if let Some(entry) = self.directory.block_hash_exists(&hashes.blake3) {
+            // Return already existing block entry
+            return Ok((entry, hashes, true));
         }
 
         // Init BlockIndexEntry
         let mut block_index_entry = BlockIndexEntry {
-            index: self.chunk_idx,
-            hash: *hashes.blake3.as_bytes(),
             offset: self.written_bytes,
             stored_size: chunk.data.len() as u64,
             original_size: chunk.length as u64,
@@ -239,7 +236,7 @@ impl PithosWriter {
         {
             chunk.data = compress_data(chunk.data.as_slice(), None)?;
         } else {
-            // No compression. But why? 15% is better than nothing.
+            // No compression, as the input is likely to have high entropy
             block_index_entry.flags.set_compression_level(0);
         }
 
@@ -251,7 +248,7 @@ impl PithosWriter {
         // Update stored size to processed block length
         block_index_entry.stored_size = chunk.data.len() as u64;
 
-        Ok((block_index_entry, hashes.shake256, false))
+        Ok((block_index_entry, hashes, false))
     }
 
     /// Processes an entire file and adds it to the directory index.
@@ -299,16 +296,16 @@ impl PithosWriter {
         for result in fastcdc_stream {
             // Process chunk
             let mut chunk = result?;
-            let (block_index_entry, key, deduplicated) =
+            let (block_entry, hashes, deduplicated) =
                 self.process_block(&mut chunk, processing_flags)?;
 
-            // Write block; Add block to file entry; Add block to index in directory
-            self.write_block(&chunk.data)?;
-            file_entry.add_block_data((block_index_entry.index, key))?;
+            // Add block to file entry
+            file_entry.add_block_data((*hashes.blake3.as_bytes(), hashes.shake256))?;
             if !deduplicated {
-                self.directory.add_block_to_index(block_index_entry)?;
-                // Increment chunk index
-                self.chunk_idx = self.chunk_idx.saturating_add(1);
+                // If block is no duplicate write block into sink and add to directory index
+                self.write_block(&chunk.data)?;
+                self.directory
+                    .add_block_to_index(*hashes.blake3.as_bytes(), block_entry)?;
             }
         }
 

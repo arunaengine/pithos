@@ -1,14 +1,14 @@
 use crate::io::pithoswriter::{Content, PithosWriterError};
 use crate::io::util::{current_timestamp, get_symlink_target};
-// Struct and enum definitions for PITHOS serialization.
-// Extracted from serialization.rs for modularity.
-//
-// Import deserialization implementations from helpers/deserialization.rs
-pub use crate::model::deserialization::*;
+use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
+use crate::io::pithosreader::PithosReaderError;
+
 use indexmap::IndexMap;
+use integer_encoding::VarIntWriter;
 use rocrate::DataEntity;
 use rocrate::entity::EntityTrait;
 use std::fs::{Metadata, symlink_metadata};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
 use x25519_dalek::PublicKey;
@@ -32,6 +32,7 @@ impl Default for FileHeader {
 pub struct BlockHeader {
     pub marker: [u8; 4], // MUST be b"BLCK"
 }
+
 impl Default for BlockHeader {
     fn default() -> Self {
         BlockHeader { marker: *b"BLCK" }
@@ -115,13 +116,13 @@ impl Default for ProcessingFlags {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockLocation {
     Local,                    // Block data at specified offset in this file
-    External { url: String }, // URL to external storage //TODO: Auth?
+    External { url: String }, // URL to external storage
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockIndexEntry {
-    pub index: u64,              // varint
-    pub hash: [u8; 32],          // Blake3 hash
+    //pub index: u64,              // varint
+    //pub hash: [u8; 32],          // Blake3 hash
     pub offset: u64,             // varint
     pub stored_size: u64,        // varint
     pub original_size: u64,      // varint
@@ -133,7 +134,7 @@ pub struct BlockIndexEntry {
 pub struct Directory {
     pub identifier: [u8; 8],                               // MUST be b"PITHOSDR"
     pub parent_directory_offset: Option<(u64, u64)>,       // (start, len) varint
-    pub blocks: Vec<BlockIndexEntry>,                      // Blocks in this segment
+    pub blocks: IndexMap<[u8; 32], BlockIndexEntry>,       // Blocks in this segment
     pub files: Vec<FileEntry>,                             // Files in this segment
     pub relations: Vec<(u64, String)>,                     // Relation idx, relationname/id
     pub encryption: IndexMap<[u8; 32], EncryptionSection>, // (Sender's X25519 public key, section with recipients)
@@ -189,8 +190,50 @@ impl TryFrom<&DataEntity> for FileType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockDataState {
-    Encrypted(Vec<u8>),              // Chacha + nonce (Random key)
-    Decrypted(Vec<(u64, [u8; 32])>), // Index / Shake256 hash
+    Encrypted(Vec<u8>),                   // Chacha + nonce (Random key)
+    Decrypted(Vec<([u8; 32], [u8; 32])>), // BLAKE3 hash / Shake256 hash
+}
+
+impl BlockDataState {
+    pub fn encrypt(&mut self, key: [u8; 32]) -> Result<(), PithosWriterError> {
+        match &self {
+            BlockDataState::Encrypted(_) => {
+                return Err(PithosWriterError::InvalidBlockDataState(
+                    "Block encrypted.".to_string(),
+                ));
+            }
+            BlockDataState::Decrypted(entries) => {
+                let mut data_bytes = Vec::new();
+                data_bytes.write_varint(entries.len())?;
+                for (hash, key) in entries {
+                    data_bytes.write_all(hash)?;
+                    data_bytes.write_all(key)?;
+                }
+                let encrypted_data = encrypt_chunk(data_bytes.as_slice(), b"", &key)?;
+
+                *self = BlockDataState::Encrypted(encrypted_data.to_vec())
+            }
+        };
+
+        Ok(())
+    }
+
+    pub fn decrypt(&mut self, key: &[u8; 32]) -> Result<(), PithosReaderError> {
+        match &self {
+            BlockDataState::Encrypted(data) => {
+                let decrypted_bytes = decrypt_chunk(data, key)?;
+                let block_data_entries =
+                    self.deserialize_block_index(&mut decrypted_bytes.as_slice())?;
+
+                *self = BlockDataState::Decrypted(block_data_entries);
+            }
+            BlockDataState::Decrypted(_) => {
+                // Nothing to do
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,7 +407,7 @@ impl FileEntry {
         self.file_id = file_id;
     }
 
-    pub fn add_block_data(&mut self, entry: (u64, [u8; 32])) -> Result<(), PithosWriterError> {
+    pub fn add_block_data(&mut self, entry: ([u8; 32], [u8; 32])) -> Result<(), PithosWriterError> {
         match self.block_data {
             BlockDataState::Encrypted(_) => {
                 return Err(PithosWriterError::InvalidBlockDataState(
@@ -450,10 +493,4 @@ impl RecipientSection {
 pub enum RecipientData {
     Encrypted(Vec<u8>), // Chacha + nonce (Shared key PrivKey Writer <--> PubKey Reader)
     Decrypted(Vec<(u64, [u8; 32])>), // Fileindex / Random key to decrypt BlockDataState
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecipientSection {
-    pub recipient_public_key: [u8; 32], // Recipient's X25519 public key
-    pub recipient_data: RecipientData,  // Encrypted FileKeyEntry list
 }

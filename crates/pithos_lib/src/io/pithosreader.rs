@@ -1,18 +1,19 @@
 use crate::helpers::chacha_poly1305::{ChaChaPoly1305Error, decrypt_chunk, encrypt_chunk};
+use crate::helpers::crypt4gh::{CRYPT4GH_BLOCK_SIZE, Crypt4GHError, Crypt4GHHeader, HeaderPacket};
 use crate::helpers::x25519_keys::{CryptError, private_key_from_pem_bytes};
 use crate::helpers::zstd::{ZstdError, decompress_data};
+use crate::io::util::{create_dir, create_symlink};
 use crate::model::deserialization::DeserializationError;
 use crate::model::structs::{
     BlockDataState, BlockHeader, BlockIndexEntry, Directory, FileEntry, FileType,
 };
+use crate::model::structs::{BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileType};
+use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-
-use crate::helpers::crypt4gh::{CRYPT4GH_BLOCK_SIZE, Crypt4GHError, Crypt4GHHeader, HeaderPacket};
-use crate::io::util::{create_dir, create_symlink};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Error type for PithosReader operations
@@ -32,8 +33,8 @@ pub enum PithosReaderError {
     Compression(#[from] ZstdError),
     #[error("No matching recipient section found for the provided private key")]
     NoMatchingRecipient,
-    #[error("Block key not found for block index {0}")]
-    BlockKeyNotFound(u64),
+    #[error("Block hash not found for block index {0:?}")]
+    BlockHashNotFound([u8; 32]),
     #[error("Block not found for file block index {0}")]
     BlockNotFound(u64),
     #[error("Invalid block data state for file block index {0}")]
@@ -269,13 +270,12 @@ impl PithosReaderSimple {
             }
             BlockDataState::Decrypted(blocks) => {
                 let mut buffer = Vec::with_capacity(65536); // 64kb buffer
-                for (block_idx, key) in blocks {
+                for (hash, key) in blocks {
                     // Fetch block meta from directory
                     let block_meta = directory
                         .blocks
-                        .iter()
-                        .find(|block| block.index == *block_idx)
-                        .ok_or(PithosReaderError::BlockKeyNotFound(*block_idx))?;
+                        .get(hash)
+                        .ok_or(PithosReaderError::BlockHashNotFound(*hash))?;
 
                     // Jump to begin of block in file
                     self.file.seek(SeekFrom::Start(block_meta.offset))?;
@@ -352,7 +352,7 @@ impl PithosReaderSimple {
     fn read_data_to_sink(
         &mut self,
         file_entry: &FileEntry,
-        block_index: &[BlockIndexEntry],
+        block_index: &IndexMap<[u8; 32], BlockIndexEntry>,
         mut sink: Box<dyn Write>,
     ) -> Result<(), PithosReaderError> {
         match &file_entry.block_data {
@@ -362,11 +362,11 @@ impl PithosReaderSimple {
                 ));
             }
             BlockDataState::Decrypted(blocks) => {
-                for (idx, key) in blocks {
+                for (hash, key) in blocks {
+                    // Fetch block meta from directory
                     let block_meta = block_index
-                        .iter()
-                        .find(|block| block.index == *idx)
-                        .ok_or(PithosReaderError::BlockKeyNotFound(*idx))?;
+                        .get(hash)
+                        .ok_or(PithosReaderError::BlockHashNotFound(*hash))?;
 
                     self.file.seek(SeekFrom::Start(block_meta.offset))?;
 
@@ -400,7 +400,7 @@ impl PithosReaderSimple {
         &mut self,
         byte_range: Range<u64>,
         file_entry: &FileEntry,
-        block_index: &[BlockIndexEntry],
+        block_index: &IndexMap<[u8; 32], BlockIndexEntry>,
         sink: &mut Box<dyn Write>,
     ) -> Result<(), PithosReaderError> {
         let mut block_byte_sum = 0;
@@ -412,11 +412,11 @@ impl PithosReaderSimple {
                 ));
             }
             BlockDataState::Decrypted(blocks) => {
-                for (idx, key) in blocks {
+                for (hash, key) in blocks {
+                    // Fetch block meta from directory
                     let block_meta = block_index
-                        .iter()
-                        .find(|block| block.index == *idx)
-                        .ok_or(PithosReaderError::BlockKeyNotFound(*idx))?;
+                        .get(hash)
+                        .ok_or(PithosReaderError::BlockHashNotFound(*hash))?;
 
                     let block_start = block_byte_sum;
                     let block_end = block_byte_sum + block_meta.original_size;

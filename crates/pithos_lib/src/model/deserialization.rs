@@ -7,7 +7,6 @@
 // - Error handling via DeserializationError
 
 use crate::helpers::chacha_poly1305::decrypt_chunk;
-use crate::io::pithosreader::PithosReaderError;
 use crate::model::structs::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use indexmap::IndexMap;
@@ -125,17 +124,12 @@ impl BlockLocation {
 // BlockIndexEntry
 impl BlockIndexEntry {
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let index: u64 = reader.read_varint()?;
-        let mut hash = [0u8; 32];
-        reader.read_exact(&mut hash)?;
         let offset: u64 = reader.read_varint()?;
         let stored_size: u64 = reader.read_varint()?;
         let original_size: u64 = reader.read_varint()?;
         let flags = ProcessingFlags::deserialize(reader)?;
         let location = BlockLocation::deserialize(reader)?;
         Ok(BlockIndexEntry {
-            index,
-            hash,
             offset,
             stored_size,
             original_size,
@@ -172,10 +166,13 @@ impl Directory {
             files.push(FileEntry::deserialize(reader)?);
         }
 
-        let blocks_len = reader.read_varint()?;
-        let mut blocks = Vec::with_capacity(blocks_len);
+        let blocks_len = reader.read_varint::<u64>()?;
+        let mut blocks = IndexMap::new();
         for _ in 0..blocks_len {
-            blocks.push(BlockIndexEntry::deserialize(reader)?);
+            let mut hash = [0u8; 32];
+            reader.read_exact(&mut hash)?;
+            let block = BlockIndexEntry::deserialize(reader)?;
+            blocks.insert(hash, block);
         }
 
         let relations_len = reader.read_varint()?;
@@ -241,10 +238,11 @@ impl BlockDataState {
                 let list_len = reader.read_varint()?;
                 let mut list = Vec::with_capacity(list_len);
                 for _ in 0..list_len {
-                    let idx: u64 = reader.read_varint()?;
                     let mut hash = [0u8; 32];
                     reader.read_exact(&mut hash)?;
-                    list.push((idx, hash));
+                    let mut key = [0u8; 32];
+                    reader.read_exact(&mut key)?;
+                    list.push((hash, key));
                 }
                 Ok(BlockDataState::Decrypted(list))
             }
@@ -255,34 +253,17 @@ impl BlockDataState {
     pub fn deserialize_block_index<R: Read>(
         &self,
         reader: &mut R,
-    ) -> Result<Vec<(u64, [u8; 32])>, DeserializationError> {
+    ) -> Result<Vec<([u8; 32], [u8; 32])>, DeserializationError> {
         let list_len = reader.read_varint()?;
         let mut list = Vec::with_capacity(list_len);
         for _ in 0..list_len {
-            let idx: u64 = reader.read_varint()?;
+            let mut hash = [0u8; 32];
+            reader.read_exact(&mut hash)?;
             let mut key = [0u8; 32];
             reader.read_exact(&mut key)?;
-            list.push((idx, key));
+            list.push((hash, key));
         }
-
         Ok(list)
-    }
-
-    pub fn decrypt(&mut self, key: &[u8; 32]) -> Result<(), PithosReaderError> {
-        match &self {
-            BlockDataState::Encrypted(data) => {
-                let decrypted_bytes = decrypt_chunk(data, key)?;
-                let block_data_entries =
-                    self.deserialize_block_index(&mut decrypted_bytes.as_slice())?;
-
-                *self = BlockDataState::Decrypted(block_data_entries);
-            }
-            BlockDataState::Decrypted(_) => {
-                // Nothing to do
-            }
-        }
-
-        Ok(())
     }
 }
 
