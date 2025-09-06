@@ -1,6 +1,8 @@
 use crate::io::pithosreader::PithosReaderError;
 use crate::io::pithoswriter::PithosWriterError;
+use fastcdc::v2020::{Normalization, StreamCDC};
 use std::env::current_dir;
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -47,4 +49,22 @@ pub fn create_symlink(
     std::os::unix::fs::symlink(path, target)?;
 
     Ok(())
+}
+
+pub fn create_stream_cdc(
+    content: Box<dyn Read>,
+    cdc: Option<(u32, u32, u32)>,
+) -> StreamCDC<Box<dyn Read>> {
+    match cdc {
+        Some((min, avg, max)) => {
+            StreamCDC::with_level(content, min, avg, max, Normalization::Level1)
+        }
+        None => StreamCDC::with_level(
+            content,
+            fastcdc::v2020::MINIMUM_MAX,
+            fastcdc::v2020::AVERAGE_MAX,
+            fastcdc::v2020::MAXIMUM_MAX,
+            Normalization::Level1,
+        ),
+    }
 }

@@ -1,10 +1,10 @@
 use crate::helpers::chacha_poly1305::ChaChaPoly1305Error;
 use crate::helpers::directory::DirectoryBuilder;
-use crate::helpers::hash::Hasher;
+use crate::helpers::hash::{Hasher, Hashes};
 use crate::helpers::x25519_keys::CryptError;
 use crate::helpers::zstd::{ZstdError, map_to_zstd_level};
 use crate::io::pithosreader::{PithosReaderError, PithosReaderSimple};
-use crate::io::util::extract_filename;
+use crate::io::util::{create_stream_cdc, extract_filename};
 use crate::model::serialization::SerializationError;
 use crate::model::structs::{
     BlockHeader, BlockIndexEntry, BlockLocation, Directory, EncryptionSection, FileEntry, FileType,
@@ -17,7 +17,7 @@ use crate::{
     },
     model::structs::FileHeader,
 };
-use fastcdc::v2020::{ChunkData, StreamCDC};
+use fastcdc::v2020::ChunkData;
 use indexmap::IndexMap;
 use rand_core::OsRng;
 use rocrate::ROCrate;
@@ -117,13 +117,11 @@ impl TryFrom<&PathBuf> for InputFile {
 pub struct PithosWriter {
     // Input
     writer_key: StaticSecret, //TODO: Multiple sender keys for individual EncryptionSections
-    reader_keys: Vec<PublicKey>, //TODO: Individual assignment of files to recipients
+    cdc: Option<(u32, u32, u32)>,
     sink: Box<dyn Write>,
 
     // Processing
-    parent_directory: Option<Directory>,
-    directory: Directory,
-    chunk_idx: u64,
+    directory: Directory, // Single or merged from multiple
     file_idx: u64,
     written_bytes: u64,
 }
@@ -132,6 +130,7 @@ impl PithosWriter {
     pub fn new(
         writer_key: StaticSecret,
         reader_keys: Vec<PublicKey>,
+        cdc: Option<(u32, u32, u32)>,
         sink: Box<dyn Write>,
     ) -> Result<Self, PithosWriterError> {
         // Init encryption section
@@ -142,13 +141,11 @@ impl PithosWriter {
 
         Ok(PithosWriter {
             writer_key,
-            reader_keys,
+            cdc,
             sink,
-            parent_directory: None,
             directory: DirectoryBuilder::new()
                 .encryption(encryption_sections)
                 .build()?,
-            chunk_idx: 0,
             file_idx: 0,
             written_bytes: 0,
         })
@@ -157,6 +154,7 @@ impl PithosWriter {
     pub fn new_from_file<P: AsRef<Path>>(
         writer_key: StaticSecret,
         reader_keys: Vec<PublicKey>,
+        cdc: Option<(u32, u32, u32)>,
         pithos_file: P,
     ) -> Result<Self, PithosReaderError> {
         // Read existing directories
@@ -172,9 +170,7 @@ impl PithosWriter {
         let sink = Box::new(file);
 
         Ok(PithosWriter {
-            chunk_idx: parent_directory.next_free_block_index(),
             file_idx: parent_directory.next_free_file_index(),
-            parent_directory: Some(parent_directory),
             directory: DirectoryBuilder::new()
                 .parent_directory_offset(Some(offset))
                 .encryption(IndexMap::from_iter([(
@@ -185,7 +181,7 @@ impl PithosWriter {
                 .map_err(|e| PithosReaderError::Other(format!("Directory build failed: {e}")))?,
             written_bytes,
             writer_key,
-            reader_keys,
+            cdc,
             sink,
         })
     }
@@ -283,14 +279,7 @@ impl PithosWriter {
         }
 
         // Split content in chunks
-        //TODO: Configurable CDC values
-        let fastcdc_stream = StreamCDC::with_level(
-            content,
-            fastcdc::v2020::MINIMUM_MAX, //65536,   //1024,
-            fastcdc::v2020::AVERAGE_MAX, //262144,  //4096,
-            fastcdc::v2020::MAXIMUM_MAX, //1048576, //16384,
-            fastcdc::v2020::Normalization::Level1,
-        );
+        let fastcdc_stream = create_stream_cdc(content, self.cdc);
 
         // Iterate over CDC blocks
         for result in fastcdc_stream {
