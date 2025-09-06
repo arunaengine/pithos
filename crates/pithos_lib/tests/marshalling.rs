@@ -78,8 +78,6 @@ fn block_location_roundtrip() {
 #[test]
 fn block_index_entry_roundtrip() {
     let original = BlockIndexEntry {
-        index: 42,
-        hash: [1u8; 32],
         offset: 100,
         stored_size: 200,
         original_size: 300,
@@ -100,7 +98,7 @@ fn directory_roundtrip() {
         file_id: 1,
         path: "file.txt".to_string(),
         file_type: FileType::Data,
-        block_data: BlockDataState::Decrypted(vec![(1, [2u8; 32])]),
+        block_data: BlockDataState::Decrypted(vec![([1u8; 32], [2u8; 32])]),
         created: 123,
         modified: 456,
         file_size: 789,
@@ -112,8 +110,6 @@ fn directory_roundtrip() {
         symlink_target: Some("target".to_string()),
     };
     let block_index = BlockIndexEntry {
-        index: 1,
-        hash: [3u8; 32],
         offset: 4,
         stored_size: 5,
         original_size: 6,
@@ -133,9 +129,9 @@ fn directory_roundtrip() {
     )]);
     let original = Directory {
         identifier: *b"PITHOSDR",
-        parent_directory_offset: Some((10, 20)),
+        parent_directory_offset: None,
         files: vec![file_entry.clone()],
-        blocks: vec![block_index.clone()],
+        blocks: IndexMap::from_iter([([1u8; 32], block_index)]),
         relations: vec![(1, "rel".to_string())],
         encryption: enc_section,
         dir_len: 12345,
@@ -164,7 +160,8 @@ fn file_type_roundtrip() {
 
 #[test]
 fn block_data_state_roundtrip() {
-    let decrypted = BlockDataState::Decrypted(vec![(42, [1u8; 32]), (43, [2u8; 32])]);
+    let decrypted =
+        BlockDataState::Decrypted(vec![([42u8; 32], [1u8; 32]), ([43u8; 32], [2u8; 32])]);
     let encrypted = BlockDataState::Encrypted(vec![1, 2, 3, 4, 5]);
     for bds in [decrypted, encrypted] {
         let mut buf = Vec::new();
@@ -180,7 +177,7 @@ fn file_entry_roundtrip() {
         file_id: 123,
         path: "foo/bar.txt".to_string(),
         file_type: FileType::Symlink,
-        block_data: BlockDataState::Decrypted(vec![(1, [2u8; 32])]),
+        block_data: BlockDataState::Decrypted(vec![([1u8; 32], [2u8; 32])]),
         created: 111,
         modified: 222,
         file_size: 333,
