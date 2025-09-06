@@ -173,25 +173,25 @@ impl Metadata {
         }
 
         // Validate root entity type
-        if let Some(root) = self.get_root_entity() {
-            if !root.has_type("Dataset") {
-                errors.push(ValidationError::InvalidEntityType {
-                    entity_id: "./".to_string(),
-                    entity_type: root.entity_type.join(", "),
-                    reason: "Root data entity must have type 'Dataset'".to_string(),
-                });
-            }
+        if let Some(root) = self.get_root_entity()
+            && !root.has_type("Dataset")
+        {
+            errors.push(ValidationError::InvalidEntityType {
+                entity_id: "./".to_string(),
+                entity_type: root.entity_type.join(", "),
+                reason: "Root data entity must have type 'Dataset'".to_string(),
+            });
         }
 
         // Validate metadata descriptor type
-        if let Some(descriptor) = self.get_metadata_descriptor() {
-            if !descriptor.has_type("CreativeWork") {
-                errors.push(ValidationError::InvalidEntityType {
-                    entity_id: "ro-crate-metadata.json".to_string(),
-                    entity_type: descriptor.entity_type.join(", "),
-                    reason: "Metadata descriptor must have type 'CreativeWork'".to_string(),
-                });
-            }
+        if let Some(descriptor) = self.get_metadata_descriptor()
+            && !descriptor.has_type("CreativeWork")
+        {
+            errors.push(ValidationError::InvalidEntityType {
+                entity_id: "ro-crate-metadata.json".to_string(),
+                entity_type: descriptor.entity_type.join(", "),
+                reason: "Metadata descriptor must have type 'CreativeWork'".to_string(),
+            });
         }
 
         if errors.is_empty() {

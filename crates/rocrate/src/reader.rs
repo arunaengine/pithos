@@ -140,14 +140,14 @@ impl DirectoryReader {
         }
 
         // Add file information if it's a file and exists on disk
-        if data_entity.is_file() {
-            if let Ok(Some((size, content_type))) = self.read_file_info(&entity.id) {
-                if data_entity.content_size().is_none() {
-                    data_entity.set_content_size(size);
-                }
-                if data_entity.encoding_format().is_none() {
-                    data_entity.set_encoding_format(content_type);
-                }
+        if data_entity.is_file()
+            && let Ok(Some((size, content_type))) = self.read_file_info(&entity.id)
+        {
+            if data_entity.content_size().is_none() {
+                data_entity.set_content_size(size);
+            }
+            if data_entity.encoding_format().is_none() {
+                data_entity.set_encoding_format(content_type);
             }
         }
 
@@ -369,14 +369,14 @@ impl ZipReader {
         }
 
         // Add file information from ZIP if available
-        if data_entity.is_file() {
-            if let Ok(Some((size, content_type))) = self.get_file_info(&entity.id) {
-                if data_entity.content_size().is_none() {
-                    data_entity.set_content_size(size);
-                }
-                if data_entity.encoding_format().is_none() {
-                    data_entity.set_encoding_format(content_type);
-                }
+        if data_entity.is_file()
+            && let Ok(Some((size, content_type))) = self.get_file_info(&entity.id)
+        {
+            if data_entity.content_size().is_none() {
+                data_entity.set_content_size(size);
+            }
+            if data_entity.encoding_format().is_none() {
+                data_entity.set_encoding_format(content_type);
             }
         }
 
@@ -449,7 +449,7 @@ impl ROCrateReader for ZipReader {
 
     fn validate(&self, crate_data: &ROCrate) -> Result<ValidationReport, ROCrateError> {
         let mut validator = ROCrateValidator::new(self.validation_level);
-        Ok(validator.validate(&crate_data))
+        Ok(validator.validate(crate_data))
     }
 
     fn read_metadata(&self) -> Result<Metadata, ROCrateError> {

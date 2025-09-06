@@ -74,7 +74,7 @@ pub fn read_rocrate<P: AsRef<Path>>(path: P) -> Result<ROCrate, ROCrateError> {
     if path.is_dir() {
         let reader = DirectoryReader::new(path, ValidationLevel::Standard)?;
         reader.read_crate()
-    } else if path.extension().map_or(false, |ext| ext == "zip") {
+    } else if path.extension().is_some_and(|ext| ext == "zip") {
         let reader = ZipReader::new(path, ValidationLevel::Standard)?;
         reader.read_crate()
     } else {
@@ -113,7 +113,7 @@ pub fn read_rocrate<P: AsRef<Path>>(path: P) -> Result<ROCrate, ROCrateError> {
 pub fn write_rocrate<P: AsRef<Path>>(crate_data: &ROCrate, path: P) -> Result<(), ROCrateError> {
     let path = path.as_ref();
 
-    if path.extension().map_or(false, |ext| ext == "zip") {
+    if path.extension().is_some_and(|ext| ext == "zip") {
         let writer = ZipWriter::new(path)?;
         writer.write_crate(crate_data)
     } else {
@@ -157,7 +157,7 @@ pub fn validate_rocrate<P: AsRef<Path>>(
         let reader = DirectoryReader::new(path, level)?;
         let rocrate = reader.read_crate()?;
         reader.validate(&rocrate)
-    } else if path.extension().map_or(false, |ext| ext == "zip") {
+    } else if path.extension().is_some_and(|ext| ext == "zip") {
         let reader = ZipReader::new(path, level)?;
         let rocrate = reader.read_crate()?;
         reader.validate(&rocrate)

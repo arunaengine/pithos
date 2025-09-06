@@ -255,26 +255,24 @@ impl ROCrateValidator {
                 self.report
                     .add_error(ValidationError::missing_property("./", "description"));
             }
-        } else if self.level == ValidationLevel::Standard {
-            if root.name().is_none() {
-                self.report.add_warning(ValidationWarning::for_property(
-                    "Root data entity should have a name",
-                    "./",
-                    "name",
-                ));
-            }
+        } else if self.level == ValidationLevel::Standard && root.name().is_none() {
+            self.report.add_warning(ValidationWarning::for_property(
+                "Root data entity should have a name",
+                "./",
+                "name",
+            ));
         }
 
         // Validate dateCreated format if present
-        if let Some(date) = root.date_created() {
-            if !self.is_valid_date_format(date) {
-                self.report
-                    .add_error(ValidationError::invalid_property_value(
-                        "./",
-                        "dateCreated",
-                        "Must be in ISO 8601 format",
-                    ));
-            }
+        if let Some(date) = root.date_created()
+            && !self.is_valid_date_format(date)
+        {
+            self.report
+                .add_error(ValidationError::invalid_property_value(
+                    "./",
+                    "dateCreated",
+                    "Must be in ISO 8601 format",
+                ));
         }
     }
 
@@ -300,26 +298,26 @@ impl ROCrateValidator {
         }
 
         // Check for reasonable content size
-        if let Some(size) = entity.content_size() {
-            if size == 0 {
-                self.report.add_warning(ValidationWarning::for_property(
-                    "Content size is zero",
-                    entity.id(),
-                    "contentSize",
-                ));
-            }
+        if let Some(size) = entity.content_size()
+            && size == 0
+        {
+            self.report.add_warning(ValidationWarning::for_property(
+                "Content size is zero",
+                entity.id(),
+                "contentSize",
+            ));
         }
 
         // Validate SHA256 format if present
-        if let Some(hash) = entity.sha256() {
-            if !self.is_valid_sha256(hash) {
-                self.report
-                    .add_error(ValidationError::invalid_property_value(
-                        entity.id(),
-                        "sha256",
-                        "Must be a valid SHA-256 hash (64 hexadecimal characters)",
-                    ));
-            }
+        if let Some(hash) = entity.sha256()
+            && !self.is_valid_sha256(hash)
+        {
+            self.report
+                .add_error(ValidationError::invalid_property_value(
+                    entity.id(),
+                    "sha256",
+                    "Must be a valid SHA-256 hash (64 hexadecimal characters)",
+                ));
         }
     }
 
@@ -343,27 +341,27 @@ impl ROCrateValidator {
         }
 
         // Validate email format if present
-        if let Some(email) = entity.email() {
-            if !self.is_valid_email(email) {
-                self.report
-                    .add_error(ValidationError::invalid_property_value(
-                        entity.id(),
-                        "email",
-                        "Must be a valid email address",
-                    ));
-            }
+        if let Some(email) = entity.email()
+            && !self.is_valid_email(email)
+        {
+            self.report
+                .add_error(ValidationError::invalid_property_value(
+                    entity.id(),
+                    "email",
+                    "Must be a valid email address",
+                ));
         }
 
         // Validate URL format if present
-        if let Some(url_result) = entity.url() {
-            if url_result.is_err() {
-                self.report
-                    .add_error(ValidationError::invalid_property_value(
-                        entity.id(),
-                        "url",
-                        "Must be a valid URL",
-                    ));
-            }
+        if let Some(url_result) = entity.url()
+            && url_result.is_err()
+        {
+            self.report
+                .add_error(ValidationError::invalid_property_value(
+                    entity.id(),
+                    "url",
+                    "Must be a valid URL",
+                ));
         }
     }
 

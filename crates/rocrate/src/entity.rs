@@ -275,7 +275,7 @@ impl DataEntity {
     pub fn content_url(&self) -> Option<Result<Url, url::ParseError>> {
         self.get_property("url")
             .and_then(|v| v.as_str())
-            .map(|s| Url::parse(s))
+            .map(Url::parse)
     }
 
     /// Create a new dataset entity.
@@ -424,7 +424,7 @@ impl ContextualEntity {
     pub fn url(&self) -> Option<Result<Url, url::ParseError>> {
         self.get_property("url")
             .and_then(|v| v.as_str())
-            .map(|s| Url::parse(s))
+            .map(Url::parse)
     }
 
     /// Set the URL.

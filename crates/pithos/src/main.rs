@@ -270,11 +270,11 @@ fn main() -> Result<(), PithosCliError> {
             }
 
             let output = if let Some(outfile) = cli.output {
-                std::fs::File::create(outfile).map_err(|e| PithosWriterError::Io(e))?
+                std::fs::File::create(outfile).map_err(PithosWriterError::Io)?
             } else {
                 // Default outfile
                 println!("No outfile specified, writing output to \"/tmp/out.pithos\""); //TODO: Replace with tracing::warn!()
-                std::fs::File::create("/tmp/out.pithos").map_err(|e| PithosWriterError::Io(e))?
+                std::fs::File::create("/tmp/out.pithos").map_err(PithosWriterError::Io)?
             };
 
             let sender_key = load_private_key_from_pem(
@@ -286,16 +286,16 @@ fn main() -> Result<(), PithosCliError> {
                 .public_keys
                 .expect("At least one recipient expected")
                 .iter()
-                .map(|path| load_public_key_from_pem(path))
+                .map(load_public_key_from_pem)
                 .collect();
 
             let input_files: Result<Vec<InputFile>, PithosWriterError> =
-                files.iter().map(|path| InputFile::try_from(path)).collect();
+                files.iter().map(InputFile::try_from).collect();
             let mut writer = PithosWriter::new(sender_key, reader_keys?, cdc, Box::new(output))?;
 
             writer
                 .write_file_header()
-                .map_err(|e| PithosWriterError::Serialization(e))?;
+                .map_err(PithosWriterError::Serialization)?;
             writer.process_input_files(input_files?)?;
             writer.write_directory()?;
         }

@@ -136,10 +136,10 @@ impl DirectoryWriter {
         for entity in crate_data.data_entities().values() {
             if entity.is_file() {
                 let file_path = self.output_path.join(entity.id());
-                if let Some(parent) = file_path.parent() {
-                    if !parent.exists() {
-                        fs::create_dir_all(parent)?;
-                    }
+                if let Some(parent) = file_path.parent()
+                    && !parent.exists()
+                {
+                    fs::create_dir_all(parent)?;
                 }
             }
         }
@@ -183,10 +183,10 @@ impl ZipWriter {
         let output_path = path.as_ref().to_path_buf();
 
         // Ensure parent directory exists
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
         }
 
         Ok(Self {
