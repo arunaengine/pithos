@@ -6,24 +6,23 @@
 // - Strings: UTF-8 with varint length prefix
 // - Error handling via DeserializationError
 
-use crate::helpers::chacha_poly1305::decrypt_chunk;
 use crate::model::structs::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use indexmap::IndexMap;
 use integer_encoding::VarIntReader;
 use std::io::{Error as IoError, Read};
+use std::string::FromUtf8Error;
 use thiserror::Error;
-use x25519_dalek::SharedSecret;
 
 /// Custom error type for deserialization operations
 #[derive(Error, Debug)]
 pub enum DeserializationError {
     /// I/O error during deserialization
     #[error("I/O error: {0}")]
-    Io(IoError),
+    Io(#[from] IoError),
     /// UTF-8 decoding error
     #[error("UTF-8 decoding error: {0}")]
-    Utf8(std::string::FromUtf8Error),
+    Utf8(#[from] FromUtf8Error),
     /// Invalid enum value encountered
     #[error("Invalid enum value: {0}")]
     InvalidEnumValue(u8),
@@ -35,17 +34,6 @@ pub enum DeserializationError {
     /// Invalid length encountered
     #[error("Invalid length")]
     InvalidLength,
-}
-
-impl From<IoError> for DeserializationError {
-    fn from(e: IoError) -> Self {
-        DeserializationError::Io(e)
-    }
-}
-impl From<std::string::FromUtf8Error> for DeserializationError {
-    fn from(e: std::string::FromUtf8Error) -> Self {
-        DeserializationError::Utf8(e)
-    }
 }
 
 // Helper: decode string (UTF-8 with varint length prefix)
@@ -373,21 +361,6 @@ impl RecipientData {
         }
 
         Ok(list)
-    }
-
-    pub fn decrypt(&mut self, shared_key: &SharedSecret) -> anyhow::Result<Vec<(u64, [u8; 32])>> {
-        let entries = match &self {
-            RecipientData::Decrypted(entries) => entries.clone(),
-            RecipientData::Encrypted(enc_data) => {
-                let dec_data = decrypt_chunk(enc_data, shared_key.as_bytes())?;
-                let entries = self.deserialize_decrypted_list(&mut dec_data.as_slice())?;
-
-                *self = RecipientData::Decrypted(entries.clone());
-                entries
-            }
-        };
-
-        Ok(entries)
     }
 }
 

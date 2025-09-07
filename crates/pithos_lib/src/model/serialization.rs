@@ -6,28 +6,19 @@
 // - CRC32: not implemented here (use a separate utility)
 // - Only serialization to bytes is implemented (no deserialization)
 
-use crate::helpers::chacha_poly1305::encrypt_chunk;
-use crate::io::pithoswriter::PithosWriterError;
 use crate::model::structs::*;
 use byteorder::{BigEndian, WriteBytesExt};
 use integer_encoding::VarIntWriter;
 use std::io::Write;
 use thiserror::Error;
-use x25519_dalek::SharedSecret;
 
 // Helper: error type for serialization
 #[derive(Error, Debug)]
 pub enum SerializationError {
     #[error("IoError error: {0}")]
-    IoError(std::io::Error),
+    IoError(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
     Other(String),
-}
-
-impl From<std::io::Error> for SerializationError {
-    fn from(e: std::io::Error) -> Self {
-        SerializationError::IoError(e)
-    }
 }
 
 // Helper: encode string (UTF-8 with varint length prefix)
@@ -36,9 +27,6 @@ pub fn encode_string<W: Write>(writer: &mut W, s: &str) -> Result<(), Serializat
     writer.write_all(s.as_bytes())?;
     Ok(())
 }
-
-// --- Serialization methods for PITHOS Spec Structs ---
-// Structs and enums are imported from helpers/structs.rs
 
 impl FileHeader {
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
@@ -239,61 +227,11 @@ impl RecipientData {
         }
         Ok(())
     }
-
-    pub fn encrypt(&mut self, shared_key: &SharedSecret) -> Result<(), PithosWriterError> {
-        match &self {
-            RecipientData::Encrypted(_) => {
-                return Err(PithosWriterError::InvalidRecipientDataState(
-                    "Recipient data encrypted".to_string(),
-                ));
-            }
-            RecipientData::Decrypted(entries) => {
-                let mut data_bytes = Vec::new();
-                data_bytes.write_varint(entries.len())?;
-                for (idx, key) in entries {
-                    data_bytes.write_varint(*idx)?;
-                    data_bytes.write_all(key)?;
-                }
-
-                let encrypted_data =
-                    encrypt_chunk(data_bytes.as_slice(), b"", shared_key.as_bytes())?;
-
-                *self = RecipientData::Encrypted(encrypted_data.to_vec())
-            }
-        };
-
-        Ok(())
-    }
 }
 
 impl RecipientSection {
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         self.recipient_data.serialize(writer)?;
-        Ok(())
-    }
-
-    pub fn encrypt(&mut self, shared_key: SharedSecret) -> Result<(), PithosWriterError> {
-        match &self.recipient_data {
-            RecipientData::Encrypted(_) => {
-                return Err(PithosWriterError::InvalidRecipientDataState(
-                    "Recipient data encrypted".to_string(),
-                ));
-            }
-            RecipientData::Decrypted(entries) => {
-                let mut data_bytes = Vec::new();
-                data_bytes.write_varint(entries.len())?;
-                for (idx, key) in entries {
-                    data_bytes.write_varint(*idx)?;
-                    data_bytes.write_all(key)?;
-                }
-
-                let encrypted_data =
-                    encrypt_chunk(data_bytes.as_slice(), b"", shared_key.as_bytes())?;
-
-                self.recipient_data = RecipientData::Encrypted(encrypted_data.to_vec())
-            }
-        };
-
         Ok(())
     }
 }

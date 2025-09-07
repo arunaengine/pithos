@@ -1,4 +1,3 @@
-use crate::io::pithosreader::PithosReaderError;
 use crate::model::serialization::SerializationError;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chacha20poly1305::aead::{Aead, OsRng};
@@ -70,7 +69,7 @@ impl HeaderPacket {
         sender_key: &StaticSecret,
         reader_keys: Vec<&PublicKey>,
         data_key: &[u8; 32],
-    ) -> Result<Vec<HeaderPacket>, PithosReaderError> {
+    ) -> Result<Vec<HeaderPacket>, Crypt4GHError> {
         let sender_pubkey = PublicKey::from(sender_key);
         let mut header_packets = vec![];
         for reader in reader_keys {
@@ -299,10 +298,8 @@ impl HeaderPacket {
         readers_pubkey: PublicKey,
         writers_private_key: Option<StaticSecret>,
     ) -> Result<(), Crypt4GHError> {
-        let sender_key = match writers_private_key {
-            Some(key) => key,
-            None => StaticSecret::random_from_rng(OsRng),
-        };
+        let sender_key =
+            writers_private_key.unwrap_or_else(|| StaticSecret::random_from_rng(OsRng));
 
         let session_key = sender_key.diffie_hellman(&readers_pubkey);
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -343,17 +340,17 @@ impl PacketData {
             }
 
             let encrypted = ChaCha20Poly1305::new_from_slice(session_key)
-                .map_err(|_| Crypt4GHError::EncryptionError("Initialize cipher".to_string()))?
+                .map_err(|_| Crypt4GHError::EncryptionError("Cipher init failed".to_string()))?
                 .encrypt(nonce, enc_data.as_slice())
                 .map_err(|_| Crypt4GHError::EncryptionError("Encrypt chunk failed".to_string()))?;
             *self = Self::Encrypted(encrypted[..encrypted.len() - 16].to_vec());
-            let mac: [u8; 16] = encrypted[encrypted.len() - 16..]
-                .try_into()
-                .map_err(|_| Crypt4GHError::EncryptionError("packet mac".to_string()))?;
+            let mac: [u8; 16] = encrypted[encrypted.len() - 16..].try_into().map_err(|_| {
+                Crypt4GHError::EncryptionError("Packet data MAC extraction failed".to_string())
+            })?;
             Ok(mac)
         } else {
             Err(Crypt4GHError::EncryptionError(
-                "packet data is already encrypted".to_string(),
+                "Packet data is already encrypted".to_string(),
             ))
         }
     }

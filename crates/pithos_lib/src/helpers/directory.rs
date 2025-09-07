@@ -1,5 +1,4 @@
-use crate::io::pithosreader::PithosReaderError;
-use crate::io::pithoswriter::PithosWriterError;
+use crate::error::PithosError;
 use crate::model::serialization::encode_string;
 use crate::model::structs::{RecipientData, RecipientSection};
 use crate::model::{
@@ -121,18 +120,15 @@ impl Directory {
         DirectoryBuilder::new().build()
     }
 
-    pub fn merge(&mut self, newer_directory: Directory) -> Result<(), PithosReaderError> {
+    pub fn merge(&mut self, newer_directory: Directory) -> Result<(), PithosError> {
         // Append files (also checks for duplicate file_id and path duplicates)
-        self.add_files_to_index(newer_directory.files)
-            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+        self.add_files_to_index(newer_directory.files)?;
 
         // Append blocks
-        self.add_blocks_to_index(newer_directory.blocks)
-            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+        self.add_blocks_to_index(newer_directory.blocks)?;
 
         // Append relations
-        self.add_relation_definitions(newer_directory.relations)
-            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+        self.add_relation_definitions(newer_directory.relations)?;
 
         // Merge encryption sections
         //  - Merge sections that can be decrypted
@@ -180,7 +176,7 @@ impl Directory {
     pub fn add_blocks_to_index(
         &mut self,
         block_index_entries: IndexMap<[u8; 32], BlockIndexEntry>,
-    ) -> Result<(), PithosWriterError> {
+    ) -> Result<(), PithosError> {
         for (hash, block) in block_index_entries {
             self.add_block_to_index(hash, block)?;
         }
@@ -191,16 +187,16 @@ impl Directory {
         &mut self,
         block_hash: [u8; 32],
         block_entry: BlockIndexEntry,
-    ) -> Result<(), PithosWriterError> {
+    ) -> Result<(), PithosError> {
         self.blocks.insert(block_hash, block_entry);
         Ok(())
     }
 
-    pub fn add_file_to_index(&mut self, file_entry: &FileEntry) -> Result<(), PithosWriterError> {
+    pub fn add_file_to_index(&mut self, file_entry: &FileEntry) -> Result<(), PithosError> {
         // Check for file_id or path duplicates
         for file in &self.files {
             if file.file_id == file_entry.file_id || file.path == file_entry.path {
-                return Err(PithosWriterError::PathOccupied(file_entry.path.clone()));
+                return Err(PithosError::PathOccupied(file_entry.path.clone()));
             }
         }
 
@@ -211,7 +207,7 @@ impl Directory {
     pub fn add_files_to_index(
         &mut self,
         file_entry: Vec<FileEntry>,
-    ) -> Result<(), PithosWriterError> {
+    ) -> Result<(), PithosError> {
         for entry in file_entry {
             self.add_file_to_index(&entry)?;
         }
@@ -223,7 +219,7 @@ impl Directory {
         writer_key: &StaticSecret,
         reader_key: &PublicKey,
         file_entry: (u64, [u8; 32]), // (file index, encryption key)
-    ) -> Result<(), PithosWriterError> {
+    ) -> Result<(), PithosError> {
         let _: () = match self.encryption.entry(*writer_key.as_bytes()) {
             Entry::Occupied(ref mut entry) => {
                 match entry.get_mut().recipients.entry(reader_key.to_bytes()) {
@@ -269,12 +265,10 @@ impl Directory {
     pub fn add_relation_definition(
         &mut self,
         relation: (u64, String),
-    ) -> Result<(), PithosWriterError> {
+    ) -> Result<(), PithosError> {
         for existing_relation in &self.relations {
             if existing_relation.0 == relation.0 {
-                return Err(PithosWriterError::Other(
-                    "Relation id already occupied".to_string(),
-                ));
+                return Err(PithosError::RelationIdOccupied(relation.0));
             }
         }
 
@@ -285,7 +279,7 @@ impl Directory {
     pub fn add_relation_definitions(
         &mut self,
         relations: Vec<(u64, String)>,
-    ) -> Result<(), PithosWriterError> {
+    ) -> Result<(), PithosError> {
         for relation in relations {
             self.add_relation_definition(relation)?;
         }
@@ -312,12 +306,9 @@ impl Directory {
     pub fn get_file_encryption_key(&self, file_id: u64) -> Option<[u8; 32]> {
         for (_, e_section) in &self.encryption {
             for (_, r_section) in &e_section.recipients {
-                match &r_section.recipient_data {
-                    RecipientData::Encrypted(_) => {}
-                    RecipientData::Decrypted(entries) => {
-                        if let Some((_, key)) = entries.iter().find(|(k, _)| *k == file_id) {
-                            return Some(*key);
-                        }
+                if let RecipientData::Decrypted(entries) = &r_section.recipient_data {
+                    if let Some((_, key)) = entries.iter().find(|(k, _)| *k == file_id) {
+                        return Some(*key);
                     }
                 }
             }
@@ -328,7 +319,7 @@ impl Directory {
     pub fn encrypt_recipients(
         &mut self,
         writer_key: &StaticSecret,
-    ) -> Result<(), PithosWriterError> {
+    ) -> Result<(), PithosError> {
         let writer_pubkey = PublicKey::from(writer_key);
         for (sender_pubkey, e_section) in self.encryption.iter_mut() {
             if writer_pubkey.as_bytes() == sender_pubkey {
@@ -346,7 +337,7 @@ impl Directory {
     pub fn decrypt_recipient(
         &mut self,
         reader_key: &StaticSecret,
-    ) -> Result<Vec<(u64, [u8; 32])>, PithosReaderError> {
+    ) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
         // Store for decrypted sections
         let mut available_file_indices = Vec::<(u64, [u8; 32])>::new();
         let reader_pubkey = PublicKey::from(reader_key);
@@ -359,8 +350,7 @@ impl Directory {
                     RecipientData::Encrypted(_) => {
                         let entries = r_section
                             .recipient_data
-                            .decrypt(&shared_key)
-                            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+                            .decrypt(&shared_key)?;
                         available_file_indices.extend(entries);
                     }
                     RecipientData::Decrypted(entries) => {
@@ -387,8 +377,7 @@ impl Directory {
                         let entries = entry
                             .get_mut()
                             .recipient_data
-                            .decrypt(&shared_key)
-                            .map_err(|e| PithosReaderError::Other(e.to_string()))?;
+                            .decrypt(&shared_key)?;
                         available_file_indices.extend(entries);
                     }
                     RecipientData::Decrypted(entries) => {

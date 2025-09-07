@@ -1,5 +1,4 @@
-use crate::io::pithosreader::PithosReaderError;
-use crate::io::pithoswriter::PithosWriterError;
+use crate::error::PithosError;
 use fastcdc::v2020::{Normalization, StreamCDC};
 use std::env::current_dir;
 use std::io::Read;
@@ -11,19 +10,19 @@ pub fn extract_filename(path: &str) -> Option<&str> {
     Path::new(path).file_name()?.to_str()
 }
 
-pub fn current_timestamp() -> Result<u64, PithosWriterError> {
+pub fn current_timestamp() -> Result<u64, PithosError> {
     Ok(SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs())
 }
 
-pub fn get_symlink_target(file: &std::fs::File) -> Result<String, PithosWriterError> {
+pub fn get_symlink_target(file: &std::fs::File) -> Result<String, PithosError> {
     let fd = file.as_raw_fd();
     let proc_path = format!("/proc/self/fd/{fd}");
     Ok(std::fs::read_link(proc_path)?.to_string_lossy().to_string())
 }
 
-pub fn create_dir(path: &str, base_dir: Option<&PathBuf>) -> Result<(), PithosReaderError> {
+pub fn create_dir(path: &str, base_dir: Option<&PathBuf>) -> Result<(), PithosError> {
     // If no base dir provided create directory hierarchy in current working directory
     let path = if let Some(base_dir) = base_dir {
         base_dir.join(path)
@@ -39,7 +38,7 @@ pub fn create_symlink(
     path: &str,
     target: &str,
     base_dir: Option<&PathBuf>,
-) -> Result<(), PithosReaderError> {
+) -> Result<(), PithosError> {
     // If no output path provided create symlink in current working directory
     let (path, target) = if let Some(base_dir) = base_dir {
         (base_dir.join(path), base_dir.join(target))

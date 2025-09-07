@@ -1,9 +1,9 @@
-use crate::helpers::chacha_poly1305::{ChaChaPoly1305Error, decrypt_chunk, encrypt_chunk};
-use crate::helpers::crypt4gh::{CRYPT4GH_BLOCK_SIZE, Crypt4GHError, Crypt4GHHeader, HeaderPacket};
-use crate::helpers::x25519_keys::{CryptError, private_key_from_pem_bytes};
-use crate::helpers::zstd::{ZstdError, decompress_data};
+use crate::error::PithosError;
+use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
+use crate::helpers::crypt4gh::{CRYPT4GH_BLOCK_SIZE, Crypt4GHHeader, HeaderPacket};
+use crate::helpers::x25519_keys::private_key_from_pem_bytes;
+use crate::helpers::zstd::decompress_data;
 use crate::io::util::{create_dir, create_symlink};
-use crate::model::deserialization::DeserializationError;
 use crate::model::structs::{
     BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileType,
 };
@@ -14,37 +14,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
-
-/// Error type for PithosReader operations
-#[derive(Debug, thiserror::Error)]
-pub enum PithosReaderError {
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-    #[error("Deserialization error: {0:?}")]
-    Deserialization(#[from] DeserializationError),
-    #[error("Crypt error: {0}")]
-    Crypt(#[from] CryptError),
-    #[error("Crypt4GH error: {0}")]
-    Crypt4GH(#[from] Crypt4GHError),
-    #[error("Decryption error: {0}")]
-    Decryption(#[from] ChaChaPoly1305Error),
-    #[error("Compression error: {0}")]
-    Compression(#[from] ZstdError),
-    #[error("No matching recipient section found for the provided private key")]
-    NoMatchingRecipient,
-    #[error("Block hash not found for block index {0:?}")]
-    BlockHashNotFound([u8; 32]),
-    #[error("Block not found for file block index {0}")]
-    BlockNotFound(u64),
-    #[error("Invalid block data state for file block index {0}")]
-    InvalidBlockDataState(String),
-    #[error("File not found: {0}")]
-    FileNotFound(String),
-    #[error("File already exists: {0}")]
-    FileAlreadyExists(String),
-    #[error("Other error: {0}")]
-    Other(String),
-}
 
 pub struct PithosReaderSimple {
     /// Underlying file handle for the Pithos archive
@@ -58,7 +27,7 @@ impl PithosReaderSimple {
     pub fn new<P: AsRef<Path>>(
         pithos_path: P,
         private_key_pem_path: P,
-    ) -> Result<Self, PithosReaderError> {
+    ) -> Result<Self, PithosError> {
         // Open the Pithos file
         let file = File::open(&pithos_path)?;
 
@@ -73,7 +42,7 @@ impl PithosReaderSimple {
     pub fn new_with_key<P: AsRef<Path>>(
         pithos_path: P,
         private_key: StaticSecret,
-    ) -> Result<Self, PithosReaderError> {
+    ) -> Result<Self, PithosError> {
         // Open the Pithos file
         let file = File::open(&pithos_path)?;
 
@@ -84,7 +53,7 @@ impl PithosReaderSimple {
     pub fn new_with_keys<P: AsRef<Path>>(
         _pithos_path: P,
         _private_key: Vec<StaticSecret>,
-    ) -> Result<Self, PithosReaderError> {
+    ) -> Result<Self, PithosError> {
         unimplemented!("Multiple reader keys");
 
         // Open the Pithos file
@@ -92,11 +61,11 @@ impl PithosReaderSimple {
         //Ok(Self { file, private_key })
     }
 
-    pub fn read_directory(&mut self) -> Result<(Directory, (u64, u64)), PithosReaderError> {
+    pub fn read_directory(&mut self) -> Result<(Directory, (u64, u64)), PithosError> {
         // Read last 12 bytes for crc32 and directory length
         let file_len = self.file.metadata()?.len();
-        if file_len < 12 {
-            return Err(PithosReaderError::Other(
+        if file_len < 25 {
+            return Err(PithosError::Other(
                 "File too small for directory footer".to_string(),
             ));
         }
@@ -105,13 +74,13 @@ impl PithosReaderSimple {
         self.file.read_exact(&mut footer)?;
 
         let parent_dir_len = u64::from_be_bytes(footer[..8].try_into().map_err(|_| {
-            PithosReaderError::Other("Failed to deserialize directory length".to_string())
+            PithosError::Conversion("Failed to convert directory length bytes to u64".to_string())
         })?);
         let parent_dir_start = file_len - parent_dir_len;
 
         // Last 4 bytes: crc32, next 8 bytes: directory length (u64, BE)
         let _crc32 = u32::from_be_bytes(footer[8..12].try_into().map_err(|_| {
-            PithosReaderError::Other("Failed to deserialize crc32 checksum".to_string())
+            PithosError::Conversion("Failed to convert crc32 checksum bytes to u32".to_string())
         })?);
 
         self.file.seek(SeekFrom::End(0 - parent_dir_len as i64))?;
@@ -155,7 +124,7 @@ impl PithosReaderSimple {
     pub fn read_file_paths(
         &self,
         directory: &Directory,
-    ) -> Result<Vec<(FileType, String)>, PithosReaderError> {
+    ) -> Result<Vec<(FileType, String)>, PithosError> {
         Ok(directory
             .files
             .iter()
@@ -169,18 +138,18 @@ impl PithosReaderSimple {
         directory: &Directory,
         output_path: Option<&PathBuf>,
         ranges: Option<Vec<Range<u64>>>,
-    ) -> Result<(), PithosReaderError> {
+    ) -> Result<(), PithosError> {
         let file_entry = directory
             .files
             .iter()
             .find(|file| file.path == inner_path)
-            .ok_or(PithosReaderError::FileNotFound(inner_path.to_string()))?;
+            .ok_or(PithosError::FileNotFound(inner_path.to_string()))?;
 
         match &file_entry.file_type {
             FileType::Data | FileType::Metadata => {
                 // Write output
                 let mut output_target: Box<dyn Write> = if let Some(dest) = output_path {
-                    Box::new(File::create(dest).map_err(PithosReaderError::Io)?)
+                    Box::new(File::create(dest).map_err(PithosError::Io)?)
                 } else {
                     Box::new(io::stdout())
                 };
@@ -224,35 +193,36 @@ impl PithosReaderSimple {
         directory: &Directory,
         reader_keys: Vec<&PublicKey>,
         output: Option<Box<dyn Write>>,
-    ) -> Result<(), PithosReaderError> {
+    ) -> Result<(), PithosError> {
         // Fetch file entry from directory
         let file_entry = directory
             .get_file_by_path(inner_path)
-            .ok_or(PithosReaderError::FileNotFound(inner_path.to_string()))?;
+            .ok_or(PithosError::FileNotFound(inner_path.to_string()))?;
 
         // Validate file type
-        if FileType::Data != file_entry.file_type {
-            return Err(PithosReaderError::Other(
-                "File needs to be data".to_string(),
+        if [FileType::Data, FileType::Metadata].contains(&file_entry.file_type) {
+            return Err(PithosError::InvalidFileType(
+                "Only data/metadata files can be exported to Crypt4GH".to_string(),
             ));
         }
 
         // Generate Crypt4GH header packets from keys
         let data_key = directory
             .get_file_encryption_key(file_entry.file_id)
-            .ok_or(PithosReaderError::FileNotFound(
-                "File does not exist in Pithos".to_string(),
-            ))?;
+            .ok_or(PithosError::FileNotFound(format!(
+                "Could not extract key for file: {}",
+                inner_path
+            )))?;
         let packets = HeaderPacket::from_pithos(&self.private_key, reader_keys, &data_key)
             .map_err(|e| {
-                PithosReaderError::Other(format!("Conversion to header packet failed: {e})"))
+                PithosError::Conversion(format!("Conversion to header packet failed: {e})"))
             })?;
 
         // Init output sink
         let mut sink = if let Some(sink) = output {
             sink
         } else {
-            Box::new(std::io::stdout())
+            Box::new(io::stdout())
         };
 
         // Write Crypt4GH header
@@ -263,7 +233,7 @@ impl PithosReaderSimple {
         // Load blocks and write data in 64kb blocks
         match &file_entry.block_data {
             BlockDataState::Encrypted(_) => {
-                return Err(PithosReaderError::InvalidBlockDataState(
+                return Err(PithosError::InvalidBlockDataState(
                     "Cannot read encrypted block data".to_string(),
                 ));
             }
@@ -274,7 +244,7 @@ impl PithosReaderSimple {
                     let block_meta = directory
                         .blocks
                         .get(hash)
-                        .ok_or(PithosReaderError::BlockHashNotFound(*hash))?;
+                        .ok_or(PithosError::BlockHashNotFound(*hash))?;
 
                     // Jump to begin of block in file
                     self.file.seek(SeekFrom::Start(block_meta.offset))?;
@@ -353,10 +323,10 @@ impl PithosReaderSimple {
         file_entry: &FileEntry,
         block_index: &IndexMap<[u8; 32], BlockIndexEntry>,
         mut sink: Box<dyn Write>,
-    ) -> Result<(), PithosReaderError> {
+    ) -> Result<(), PithosError> {
         match &file_entry.block_data {
             BlockDataState::Encrypted(_) => {
-                return Err(PithosReaderError::InvalidBlockDataState(
+                return Err(PithosError::InvalidBlockDataState(
                     "Block data is encrypted".to_string(),
                 ));
             }
@@ -365,7 +335,7 @@ impl PithosReaderSimple {
                     // Fetch block meta from directory
                     let block_meta = block_index
                         .get(hash)
-                        .ok_or(PithosReaderError::BlockHashNotFound(*hash))?;
+                        .ok_or(PithosError::BlockHashNotFound(*hash))?;
 
                     let mut block_header = [0u8; 4];
                     let mut block_data = vec![0u8; block_meta.stored_size as usize];
@@ -410,12 +380,12 @@ impl PithosReaderSimple {
         file_entry: &FileEntry,
         block_index: &IndexMap<[u8; 32], BlockIndexEntry>,
         sink: &mut Box<dyn Write>,
-    ) -> Result<(), PithosReaderError> {
+    ) -> Result<(), PithosError> {
         let mut block_byte_sum = 0;
 
         match &file_entry.block_data {
             BlockDataState::Encrypted(_) => {
-                return Err(PithosReaderError::InvalidBlockDataState(
+                return Err(PithosError::InvalidBlockDataState(
                     "Block data is still encrypted".to_string(),
                 ));
             }
@@ -424,7 +394,7 @@ impl PithosReaderSimple {
                     // Fetch block meta from directory
                     let block_meta = block_index
                         .get(hash)
-                        .ok_or(PithosReaderError::BlockHashNotFound(*hash))?;
+                        .ok_or(PithosError::BlockHashNotFound(*hash))?;
 
                     let block_start = block_byte_sum;
                     let block_end = block_byte_sum + block_meta.original_size;

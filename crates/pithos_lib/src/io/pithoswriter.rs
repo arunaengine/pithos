@@ -1,9 +1,8 @@
-use crate::helpers::chacha_poly1305::ChaChaPoly1305Error;
+use crate::error::PithosError;
 use crate::helpers::directory::DirectoryBuilder;
 use crate::helpers::hash::{Hasher, Hashes};
-use crate::helpers::x25519_keys::CryptError;
 use crate::helpers::zstd::{ZstdError, map_to_zstd_level};
-use crate::io::pithosreader::{PithosReaderError, PithosReaderSimple};
+use crate::io::pithosreader::PithosReaderSimple;
 use crate::io::util::{create_stream_cdc, extract_filename};
 use crate::model::serialization::SerializationError;
 use crate::model::structs::{
@@ -22,47 +21,11 @@ use indexmap::IndexMap;
 use rand_core::OsRng;
 use rocrate::ROCrate;
 use std::cmp::Ordering;
+use std::fs;
 use std::fs::{File, symlink_metadata};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTimeError;
-use std::{fs, io};
 use x25519_dalek::{PublicKey, StaticSecret};
-
-/// Error type for PithosReader operations
-#[derive(Debug, thiserror::Error)]
-pub enum PithosWriterError {
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-    #[error("Failed to strip prefix: {0}")]
-    StripPrefix(#[from] std::path::StripPrefixError),
-    #[error("Walkdir error: {0}")]
-    Walkdir(#[from] walkdir::Error),
-    #[error("FastCDC error: {0}")]
-    FastCDC(#[from] fastcdc::v2020::Error),
-    #[error("Serialization error: {0:?}")]
-    Serialization(#[from] SerializationError),
-    #[error("Crypt error: {0}")]
-    Crypt(#[from] CryptError),
-    #[error("Encryption error: {0}")]
-    Encryption(#[from] ChaChaPoly1305Error),
-    #[error("Compression error: {0}")]
-    Compression(#[from] ZstdError),
-    #[error("Path already occupied: {0}")]
-    PathOccupied(String),
-    #[error("File not found: {0}")]
-    FileNotFound(String),
-    #[error("Invalid file type: {0}")]
-    InvalidFileType(String),
-    #[error("Invalid block data state: {0}")]
-    InvalidBlockDataState(String),
-    #[error("Invalid recipient data state: {0}")]
-    InvalidRecipientDataState(String),
-    #[error("System time error: {0}")]
-    SystemTimeError(#[from] SystemTimeError),
-    #[error("Other error: {0}")]
-    Other(String),
-}
 
 #[derive(Debug)]
 pub enum Content {
@@ -82,7 +45,7 @@ pub struct InputFile {
 }
 
 impl TryFrom<&PathBuf> for InputFile {
-    type Error = PithosWriterError;
+    type Error = PithosError;
 
     fn try_from(file_path: &PathBuf) -> Result<Self, Self::Error> {
         let file = File::open(file_path)?;
@@ -90,8 +53,8 @@ impl TryFrom<&PathBuf> for InputFile {
         let file_type = FileType::try_from(&metadata)?;
         let file_path_str = file_path
             .to_str()
-            .ok_or(PithosWriterError::Other(
-                "Invalid UTF-8 in path".to_string(),
+            .ok_or(PithosError::Conversion(
+                "Invalid UTF-8 in file path".to_string(),
             ))?
             .to_string();
         let inner_path = match &file_type {
@@ -132,7 +95,7 @@ impl PithosWriter {
         reader_keys: Vec<PublicKey>,
         cdc: Option<(u32, u32, u32)>,
         sink: Box<dyn Write>,
-    ) -> Result<Self, PithosWriterError> {
+    ) -> Result<Self, PithosError> {
         // Init encryption section
         let encryption_sections = IndexMap::from_iter([(
             PublicKey::from(&writer_key).to_bytes(),
@@ -156,7 +119,7 @@ impl PithosWriter {
         reader_keys: Vec<PublicKey>,
         cdc: Option<(u32, u32, u32)>,
         pithos_file: P,
-    ) -> Result<Self, PithosReaderError> {
+    ) -> Result<Self, PithosError> {
         // Read existing directories
         let mut reader = PithosReaderSimple::new_with_key(&pithos_file, writer_key.clone())?;
         let (parent_directory, offset) = reader.read_directory()?;
@@ -177,8 +140,7 @@ impl PithosWriter {
                     PublicKey::from(&writer_key).to_bytes(),
                     EncryptionSection::new(&reader_keys),
                 )]))
-                .build()
-                .map_err(|e| PithosReaderError::Other(format!("Directory build failed: {e}")))?,
+                .build()?,
             written_bytes,
             writer_key,
             cdc,
@@ -204,7 +166,7 @@ impl PithosWriter {
         &mut self,
         chunk: &mut ChunkData,
         processing_flags: &ProcessingFlags,
-    ) -> Result<(BlockIndexEntry, Hashes, bool), PithosWriterError> {
+    ) -> Result<(BlockIndexEntry, Hashes, bool), PithosError> {
         // Calculate block hashes
         let mut hasher = Hasher::new();
         hasher.update(&chunk.data);
@@ -269,7 +231,7 @@ impl PithosWriter {
         file_entry: &mut FileEntry,
         processing_flags: &ProcessingFlags,
         content: Box<dyn Read>,
-    ) -> Result<Reference, PithosWriterError> {
+    ) -> Result<Reference, PithosError> {
         // Directory or Symlink FileEntry are just added to Pithos directory
         if [FileType::Directory, FileType::Symlink].contains(&file_entry.file_type) {
             self.directory.add_file_to_index(file_entry)?;
@@ -314,7 +276,7 @@ impl PithosWriter {
         Reference::try_from(file_entry)
     }
 
-    pub fn process_input(&mut self, input: InputFile) -> Result<Reference, PithosWriterError> {
+    pub fn process_input(&mut self, input: InputFile) -> Result<Reference, PithosError> {
         // Create FileEntry from data file input
         let mut data_fe =
             FileEntry::new_from_content(None, input.file_type, &input.file_path, &input.data)?;
@@ -382,9 +344,10 @@ impl PithosWriter {
                     self.file_idx = self.file_idx.saturating_add(1);
                     Reference::try_from(&mut data_fe)?
                 } else {
-                    return Err(PithosWriterError::FileNotFound(
-                        "Could not find encryption key for file".to_string(),
-                    ));
+                    return Err(PithosError::FileNotFound(format!(
+                        "Could not extract key for file: {}",
+                        ref_fe.path
+                    )));
                 }
             }
         };
@@ -393,8 +356,9 @@ impl PithosWriter {
     }
 
     #[allow(dead_code)]
-    pub fn process_input_files(&mut self, files: Vec<InputFile>) -> Result<(), PithosWriterError> {
+    pub fn process_input_files(&mut self, files: Vec<InputFile>) -> Result<(), PithosError> {
         for file in files {
+            println!("  Processing {:?} {}", file.file_type, file.file_path);
             match file.file_type {
                 FileType::Directory => self.process_directory(file.file_path, None)?,
                 _ => {
@@ -410,7 +374,7 @@ impl PithosWriter {
         &mut self,
         directory: P,
         ro_crate: Option<&ROCrate>,
-    ) -> Result<(), PithosWriterError> {
+    ) -> Result<(), PithosError> {
         // Walk directory and create file entries
         let mut entries = Vec::new();
         for entry in walkdir::WalkDir::new(&directory)
@@ -483,6 +447,7 @@ impl PithosWriter {
         } else {
             // Just process all files
             for entry in entries {
+                println!("  Processing {:?} {}", entry.file_type, entry.file_path);
                 self.process_input(entry)?;
             }
         }
@@ -493,7 +458,7 @@ impl PithosWriter {
     pub fn process_directories<P: AsRef<Path>>(
         &mut self,
         directories: Vec<P>,
-    ) -> Result<(), PithosWriterError> {
+    ) -> Result<(), PithosError> {
         for directory in directories {
             self.process_directory(directory, None)?
         }
@@ -538,7 +503,7 @@ impl PithosWriter {
         Ok(())
     }
 
-    pub fn write_directory(&mut self) -> Result<(), PithosWriterError> {
+    pub fn write_directory(&mut self) -> Result<(), PithosError> {
         // Encrypt recipients of writer section
         self.directory.encrypt_recipients(&self.writer_key)?;
 
@@ -553,7 +518,7 @@ impl PithosWriter {
     }
 
     //TODO: Zipped RO-Crate processing ...
-    pub fn process_ro_crate(&mut self, crate_data: &ROCrate) -> Result<(), PithosWriterError> {
+    pub fn process_ro_crate(&mut self, crate_data: &ROCrate) -> Result<(), PithosError> {
         if let Some(base_path) = &crate_data.base_path {
             self.process_directory(base_path, Some(crate_data))?
         } else {

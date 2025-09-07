@@ -1,8 +1,8 @@
 use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
-use crate::io::pithosreader::PithosReaderError;
-use crate::io::pithoswriter::{Content, PithosWriterError};
+use crate::io::pithoswriter::Content;
 use crate::io::util::{current_timestamp, get_symlink_target};
 
+use crate::error::PithosError;
 use indexmap::IndexMap;
 use integer_encoding::VarIntWriter;
 use rocrate::DataEntity;
@@ -11,7 +11,7 @@ use std::fs::{Metadata, symlink_metadata};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
-use x25519_dalek::PublicKey;
+use x25519_dalek::{PublicKey, SharedSecret};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
@@ -156,7 +156,7 @@ pub enum FileType {
 }
 
 impl TryFrom<&Metadata> for FileType {
-    type Error = PithosWriterError;
+    type Error = PithosError;
 
     fn try_from(value: &Metadata) -> Result<Self, Self::Error> {
         Ok(if value.is_file() {
@@ -166,8 +166,8 @@ impl TryFrom<&Metadata> for FileType {
         } else if value.is_symlink() {
             FileType::Symlink
         } else {
-            return Err(PithosWriterError::Other(format!(
-                "Invalid file type: {:?}",
+            return Err(PithosError::Conversion(format!(
+                "Invalid input file type: {:?}",
                 value.file_type()
             )));
         })
@@ -175,7 +175,7 @@ impl TryFrom<&Metadata> for FileType {
 }
 
 impl TryFrom<&DataEntity> for FileType {
-    type Error = PithosWriterError;
+    type Error = PithosError;
 
     fn try_from(value: &DataEntity) -> Result<Self, Self::Error> {
         if value.entity_type().contains(&"File".to_string()) {
@@ -183,7 +183,7 @@ impl TryFrom<&DataEntity> for FileType {
         } else if value.entity_type().contains(&"Dataset".to_string()) {
             Ok(FileType::Directory)
         } else {
-            Err(PithosWriterError::InvalidFileType(format!(
+            Err(PithosError::InvalidFileType(format!(
                 "Data entity must have type File or Dataset: {:?}",
                 value.entity_type()
             )))
@@ -198,11 +198,11 @@ pub enum BlockDataState {
 }
 
 impl BlockDataState {
-    pub fn encrypt(&mut self, key: [u8; 32]) -> Result<(), PithosWriterError> {
+    pub fn encrypt(&mut self, key: [u8; 32]) -> Result<(), PithosError> {
         match &self {
             BlockDataState::Encrypted(_) => {
-                return Err(PithosWriterError::InvalidBlockDataState(
-                    "Block encrypted.".to_string(),
+                return Err(PithosError::InvalidBlockDataState(
+                    "Block already encrypted.".to_string(),
                 ));
             }
             BlockDataState::Decrypted(entries) => {
@@ -221,7 +221,7 @@ impl BlockDataState {
         Ok(())
     }
 
-    pub fn decrypt(&mut self, key: &[u8; 32]) -> Result<(), PithosReaderError> {
+    pub fn decrypt(&mut self, key: &[u8; 32]) -> Result<(), PithosError> {
         match &self {
             BlockDataState::Encrypted(data) => {
                 let decrypted_bytes = decrypt_chunk(data, key)?;
@@ -260,7 +260,7 @@ impl FileEntry {
         disk_path: &str,
         pithos_path: &str,
         metadata: &Metadata,
-    ) -> Result<Self, PithosWriterError> {
+    ) -> Result<Self, PithosError> {
         Ok(FileEntry {
             file_id: file_id.unwrap_or(0),
             path: pithos_path.to_string(),
@@ -297,7 +297,7 @@ impl FileEntry {
         permissions: Option<u32>,
         references: Vec<Reference>,
         file_size: Option<u64>,
-    ) -> Result<Self, PithosWriterError> {
+    ) -> Result<Self, PithosError> {
         Ok(FileEntry {
             file_id: file_id.unwrap_or(0),
             path: pithos_path.to_string(),
@@ -327,7 +327,7 @@ impl FileEntry {
         file_type: FileType,
         pithos_path: &str,
         content: &Content,
-    ) -> Result<Self, PithosWriterError> {
+    ) -> Result<Self, PithosError> {
         Ok(match content {
             Content::File(disk_path) => {
                 let file_metadata = symlink_metadata(disk_path)?;
@@ -359,7 +359,7 @@ impl FileEntry {
         path: String,
         file: &std::fs::File,
         metadata: Metadata,
-    ) -> Result<Self, PithosWriterError> {
+    ) -> Result<Self, PithosError> {
         // Evaluate file type and create file entry
         let file_type = FileType::try_from(&metadata)?;
         Ok(FileEntry {
@@ -388,7 +388,7 @@ impl FileEntry {
         })
     }
 
-    pub fn meta_from(other_file: &FileEntry, meta_length: u64) -> Result<Self, PithosWriterError> {
+    pub fn meta_from(other_file: &FileEntry, meta_length: u64) -> Result<Self, PithosError> {
         Ok(FileEntry {
             file_id: other_file.file_id - 1,
             path: format!("{}.meta", other_file.path),
@@ -410,10 +410,10 @@ impl FileEntry {
         self.file_id = file_id;
     }
 
-    pub fn add_block_data(&mut self, entry: ([u8; 32], [u8; 32])) -> Result<(), PithosWriterError> {
+    pub fn add_block_data(&mut self, entry: ([u8; 32], [u8; 32])) -> Result<(), PithosError> {
         match self.block_data {
             BlockDataState::Encrypted(_) => {
-                return Err(PithosWriterError::InvalidBlockDataState(
+                return Err(PithosError::InvalidBlockDataState(
                     "Block data already/still encrypted".to_string(),
                 ));
             }
@@ -432,7 +432,7 @@ pub struct Reference {
 }
 
 impl TryFrom<&mut FileEntry> for Reference {
-    type Error = PithosWriterError;
+    type Error = PithosError;
 
     fn try_from(value: &mut FileEntry) -> Result<Self, Self::Error> {
         Ok(Reference {
@@ -479,12 +479,9 @@ pub struct RecipientSection {
 }
 
 impl RecipientSection {
-    pub fn add_file_to_recipient(
-        &mut self,
-        entry: (u64, [u8; 32]),
-    ) -> Result<(), PithosWriterError> {
+    pub fn add_file_to_recipient(&mut self, entry: (u64, [u8; 32])) -> Result<(), PithosError> {
         match self.recipient_data {
-            RecipientData::Encrypted(_) => Err(PithosWriterError::InvalidRecipientDataState(
+            RecipientData::Encrypted(_) => Err(PithosError::InvalidRecipientDataState(
                 "Cannot add file entry to encrypted recipient data".to_string(),
             )),
             RecipientData::Decrypted(ref mut entries) => {
@@ -493,10 +490,77 @@ impl RecipientSection {
             }
         }
     }
+
+    pub fn encrypt(&mut self, shared_key: SharedSecret) -> Result<(), PithosError> {
+        match &self.recipient_data {
+            RecipientData::Encrypted(_) => {
+                return Err(PithosError::InvalidRecipientDataState(
+                    "Recipient data already encrypted".to_string(),
+                ));
+            }
+            RecipientData::Decrypted(entries) => {
+                let mut data_bytes = Vec::new();
+                data_bytes.write_varint(entries.len())?;
+                for (idx, key) in entries {
+                    data_bytes.write_varint(*idx)?;
+                    data_bytes.write_all(key)?;
+                }
+
+                let encrypted_data =
+                    encrypt_chunk(data_bytes.as_slice(), b"", shared_key.as_bytes())?;
+
+                self.recipient_data = RecipientData::Encrypted(encrypted_data.to_vec())
+            }
+        };
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecipientData {
     Encrypted(Vec<u8>), // Chacha + nonce (Shared key PrivKey Writer <--> PubKey Reader)
     Decrypted(Vec<(u64, [u8; 32])>), // Fileindex / Random key to decrypt BlockDataState
+}
+
+impl RecipientData {
+    pub fn encrypt(&mut self, shared_key: &SharedSecret) -> Result<(), PithosError> {
+        match &self {
+            RecipientData::Encrypted(_) => {
+                return Err(PithosError::InvalidRecipientDataState(
+                    "Recipient data already encrypted".to_string(),
+                ));
+            }
+            RecipientData::Decrypted(entries) => {
+                let mut data_bytes = Vec::new();
+                data_bytes.write_varint(entries.len())?;
+                for (idx, key) in entries {
+                    data_bytes.write_varint(*idx)?;
+                    data_bytes.write_all(key)?;
+                }
+
+                let encrypted_data =
+                    encrypt_chunk(data_bytes.as_slice(), b"", shared_key.as_bytes())?;
+
+                *self = RecipientData::Encrypted(encrypted_data.to_vec())
+            }
+        };
+
+        Ok(())
+    }
+
+    pub fn decrypt(&mut self, shared_key: &SharedSecret) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
+        let entries = match &self {
+            RecipientData::Decrypted(entries) => entries.clone(),
+            RecipientData::Encrypted(enc_data) => {
+                let dec_data = decrypt_chunk(enc_data, shared_key.as_bytes())?;
+                let entries = self.deserialize_decrypted_list(&mut dec_data.as_slice())?;
+
+                *self = RecipientData::Decrypted(entries.clone());
+                entries
+            }
+        };
+
+        Ok(entries)
+    }
 }
