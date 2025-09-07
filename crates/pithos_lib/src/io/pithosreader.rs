@@ -154,7 +154,13 @@ impl PithosReaderSimple {
             FileType::Data | FileType::Metadata => {
                 // Write output
                 let mut output_target: Box<dyn Write> = if let Some(dest) = output_path {
-                    Box::new(File::create(dest).map_err(PithosError::Io)?)
+                    let target = if dest.is_dir() {
+                        &dest.join(inner_path)
+                    } else {
+                        dest
+                    };
+
+                    Box::new(File::create(target).map_err(PithosError::Io)?)
                 } else {
                     Box::new(io::stdout())
                 };
