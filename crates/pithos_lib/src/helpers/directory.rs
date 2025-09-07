@@ -36,10 +36,25 @@ impl DirectoryBuilder {
             parent_directory_offset: None,
             files: vec![],
             blocks: IndexMap::new(),
-            relations: vec![],
+            relations: Self::default_relations(),
             encryption: IndexMap::new(),
-            dir_len: 8,
+            dir_len: 25,
         }
+    }
+
+    fn default_relations() -> Vec<(u64, String)> {
+        Vec::from_iter([
+            (0, "Describes".to_string()),
+            (1, "Annotates".to_string()),
+            (2, "Derived_From".to_string()),
+            (3, "Source_Of".to_string()),
+            (4, "Previous_Version".to_string()),
+            (5, "Next_Version".to_string()),
+            (6, "Part_of".to_string()),
+            (7, "Contains".to_string()),
+            (8, "Input_To".to_string()),
+            (9, "Output_From".to_string()),
+        ])
     }
 
     #[tracing::instrument(level = "trace", skip(self, offset))]
@@ -61,8 +76,14 @@ impl DirectoryBuilder {
     }
 
     #[tracing::instrument(level = "trace", skip(self, relations))]
-    pub fn relations(mut self, relations: Vec<(u64, String)>) -> Self {
+    pub fn set_relations(mut self, relations: Vec<(u64, String)>) -> Self {
         self.relations = relations;
+        self
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, relations))]
+    pub fn add_relations(mut self, relations: Vec<(u64, String)>) -> Self {
+        self.relations.extend(relations);
         self
     }
 
@@ -279,7 +300,13 @@ impl Directory {
     #[tracing::instrument(level = "trace", skip(self, relation))]
     pub fn add_relation_definition(&mut self, relation: (u64, String)) -> Result<(), PithosError> {
         for existing_relation in &self.relations {
-            if existing_relation.0 == relation.0 {
+            if relation == *existing_relation {
+                // Same relation already exists
+                continue;
+            }
+
+            if existing_relation.0 == relation.0 && existing_relation.1 != relation.1 {
+                // Try to add existing relation id with different semantic
                 return Err(PithosError::RelationIdOccupied(relation.0));
             }
         }
