@@ -1355,7 +1355,6 @@ dependencies = [
 name = "pithos_lib"
 version = "0.6.1"
 dependencies = [
- "anyhow",
  "blake3",
  "byteorder",
  "chacha20poly1305",

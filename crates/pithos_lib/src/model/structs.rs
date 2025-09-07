@@ -549,7 +549,10 @@ impl RecipientData {
         Ok(())
     }
 
-    pub fn decrypt(&mut self, shared_key: &SharedSecret) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
+    pub fn decrypt(
+        &mut self,
+        shared_key: &SharedSecret,
+    ) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
         let entries = match &self {
             RecipientData::Decrypted(entries) => entries.clone(),
             RecipientData::Encrypted(enc_data) => {

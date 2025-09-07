@@ -204,10 +204,7 @@ impl Directory {
         Ok(())
     }
 
-    pub fn add_files_to_index(
-        &mut self,
-        file_entry: Vec<FileEntry>,
-    ) -> Result<(), PithosError> {
+    pub fn add_files_to_index(&mut self, file_entry: Vec<FileEntry>) -> Result<(), PithosError> {
         for entry in file_entry {
             self.add_file_to_index(&entry)?;
         }
@@ -262,10 +259,7 @@ impl Directory {
         }
     }
 
-    pub fn add_relation_definition(
-        &mut self,
-        relation: (u64, String),
-    ) -> Result<(), PithosError> {
+    pub fn add_relation_definition(&mut self, relation: (u64, String)) -> Result<(), PithosError> {
         for existing_relation in &self.relations {
             if existing_relation.0 == relation.0 {
                 return Err(PithosError::RelationIdOccupied(relation.0));
@@ -306,20 +300,17 @@ impl Directory {
     pub fn get_file_encryption_key(&self, file_id: u64) -> Option<[u8; 32]> {
         for (_, e_section) in &self.encryption {
             for (_, r_section) in &e_section.recipients {
-                if let RecipientData::Decrypted(entries) = &r_section.recipient_data {
-                    if let Some((_, key)) = entries.iter().find(|(k, _)| *k == file_id) {
-                        return Some(*key);
-                    }
+                if let RecipientData::Decrypted(entries) = &r_section.recipient_data
+                    && let Some((_, key)) = entries.iter().find(|(k, _)| *k == file_id)
+                {
+                    return Some(*key);
                 }
             }
         }
         None
     }
 
-    pub fn encrypt_recipients(
-        &mut self,
-        writer_key: &StaticSecret,
-    ) -> Result<(), PithosError> {
+    pub fn encrypt_recipients(&mut self, writer_key: &StaticSecret) -> Result<(), PithosError> {
         let writer_pubkey = PublicKey::from(writer_key);
         for (sender_pubkey, e_section) in self.encryption.iter_mut() {
             if writer_pubkey.as_bytes() == sender_pubkey {
@@ -348,9 +339,7 @@ impl Directory {
                 let shared_key = reader_key.diffie_hellman(&PublicKey::from(*key));
                 match &r_section.recipient_data {
                     RecipientData::Encrypted(_) => {
-                        let entries = r_section
-                            .recipient_data
-                            .decrypt(&shared_key)?;
+                        let entries = r_section.recipient_data.decrypt(&shared_key)?;
                         available_file_indices.extend(entries);
                     }
                     RecipientData::Decrypted(entries) => {
@@ -374,10 +363,7 @@ impl Directory {
             match e_section.recipients.entry(*reader_pubkey.as_bytes()) {
                 Entry::Occupied(ref mut entry) => match &entry.get().recipient_data {
                     RecipientData::Encrypted(_) => {
-                        let entries = entry
-                            .get_mut()
-                            .recipient_data
-                            .decrypt(&shared_key)?;
+                        let entries = entry.get_mut().recipient_data.decrypt(&shared_key)?;
                         available_file_indices.extend(entries);
                     }
                     RecipientData::Decrypted(entries) => {

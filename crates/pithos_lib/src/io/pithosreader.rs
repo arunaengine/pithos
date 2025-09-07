@@ -200,7 +200,7 @@ impl PithosReaderSimple {
             .ok_or(PithosError::FileNotFound(inner_path.to_string()))?;
 
         // Validate file type
-        if [FileType::Data, FileType::Metadata].contains(&file_entry.file_type) {
+        if ![FileType::Data, FileType::Metadata].contains(&file_entry.file_type) {
             return Err(PithosError::InvalidFileType(
                 "Only data/metadata files can be exported to Crypt4GH".to_string(),
             ));

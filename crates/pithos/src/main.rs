@@ -3,11 +3,12 @@ pub mod utils;
 
 use crate::io::utils::{load_private_key_from_pem, load_public_key_from_pem};
 use clap::{Parser, Subcommand, ValueEnum};
+use pithos_lib::error::PithosError;
 use pithos_lib::helpers::x25519_keys::{
     generate_private_key, private_key_to_pem_bytes, public_key_to_pem_bytes,
 };
-use pithos_lib::io::pithosreader::{PithosReaderError, PithosReaderSimple};
-use pithos_lib::io::pithoswriter::{InputFile, PithosWriter, PithosWriterError};
+use pithos_lib::io::pithosreader::PithosReaderSimple;
+use pithos_lib::io::pithoswriter::{InputFile, PithosWriter};
 use std::io::Write;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -36,7 +37,7 @@ enum ExportFormat {
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Optionally set the log level
-    #[arg(long, value_name = "LOG_LEVEL")]
+    #[arg(long, value_name = "LOG_LEVEL", default_value = "Info")]
     log_level: Option<String>,
 
     /// Optionally set the log file
@@ -185,12 +186,10 @@ enum ModifyCommands {
 pub enum PithosCliError {
     #[error("Writer Error: {0}")]
     TracingError(#[from] SetGlobalDefaultError),
-    #[error("Reader Error: {0}")]
-    ReaderError(#[from] PithosReaderError),
-    #[error("Writer Error: {0}")]
-    WriterError(#[from] PithosWriterError),
     #[error("Invalid argument: {0}")]
     InvalidArgumentError(String),
+    #[error("Pithos Error: {0}")]
+    PithosError(#[from] PithosError),
 }
 
 #[tracing::instrument(level = "trace", skip())]
@@ -270,11 +269,11 @@ fn main() -> Result<(), PithosCliError> {
             }
 
             let output = if let Some(outfile) = cli.output {
-                std::fs::File::create(outfile).map_err(PithosWriterError::Io)?
+                std::fs::File::create(outfile).map_err(PithosError::Io)?
             } else {
                 // Default outfile
                 println!("No outfile specified, writing output to \"/tmp/out.pithos\""); //TODO: Replace with tracing::warn!()
-                std::fs::File::create("/tmp/out.pithos").map_err(PithosWriterError::Io)?
+                std::fs::File::create("/tmp/out.pithos").map_err(PithosError::Io)?
             };
 
             let sender_key = load_private_key_from_pem(
@@ -282,41 +281,39 @@ fn main() -> Result<(), PithosCliError> {
                     .clone()
                     .expect("Private key expected to create Pithos file"),
             )?;
-            let reader_keys: Result<Vec<PublicKey>, PithosReaderError> = cli
+            let reader_keys: Result<Vec<PublicKey>, PithosError> = cli
                 .public_keys
                 .expect("At least one recipient expected")
                 .iter()
                 .map(load_public_key_from_pem)
                 .collect();
 
-            let input_files: Result<Vec<InputFile>, PithosWriterError> =
+            let input_files: Result<Vec<InputFile>, PithosError> =
                 files.iter().map(InputFile::try_from).collect();
             let mut writer = PithosWriter::new(sender_key, reader_keys?, cdc, Box::new(output))?;
 
             writer
                 .write_file_header()
-                .map_err(PithosWriterError::Serialization)?;
+                .map_err(PithosError::Serialization)?;
             writer.process_input_files(input_files?)?;
             writer.write_directory()?;
         }
         PithosCommands::CreateKeypair { .. } => {
-            let private_key = generate_private_key().map_err(PithosWriterError::Crypt)?;
+            let private_key = generate_private_key().map_err(PithosError::Crypt)?;
             let public_key = PublicKey::from(&private_key);
 
             // Write output
             let mut output_target: Box<dyn Write> = if let Some(dest) = cli.output {
-                Box::new(std::fs::File::create(dest).map_err(PithosWriterError::Io)?)
+                Box::new(std::fs::File::create(dest).map_err(PithosError::Io)?)
             } else {
                 Box::new(std::io::stdout())
             };
             output_target
-                .write_all(
-                    &private_key_to_pem_bytes(&private_key).map_err(PithosWriterError::Crypt)?,
-                )
-                .map_err(PithosWriterError::Io)?;
+                .write_all(&private_key_to_pem_bytes(&private_key).map_err(PithosError::Crypt)?)
+                .map_err(PithosError::Io)?;
             output_target
-                .write_all(&public_key_to_pem_bytes(&public_key).map_err(PithosWriterError::Crypt)?)
-                .map_err(PithosWriterError::Io)?;
+                .write_all(&public_key_to_pem_bytes(&public_key).map_err(PithosError::Crypt)?)
+                .map_err(PithosError::Io)?;
         }
         PithosCommands::Modify { .. } => {
             unimplemented!()
