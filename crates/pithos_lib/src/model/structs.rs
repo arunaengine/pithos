@@ -1,13 +1,14 @@
 use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
 use crate::io::pithoswriter::Content;
 use crate::io::util::{current_timestamp, get_symlink_target};
+use std::fmt::{Display, Formatter};
 
 use crate::error::PithosError;
 use indexmap::IndexMap;
 use integer_encoding::VarIntWriter;
-use rocrate::DataEntity;
 use rocrate::entity::EntityTrait;
-use std::fs::{Metadata, symlink_metadata};
+use rocrate::DataEntity;
+use std::fs::{symlink_metadata, Metadata};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
@@ -253,6 +254,28 @@ pub struct FileEntry {
     pub permissions: u32,
     pub references: Vec<Reference>,
     pub symlink_target: Option<String>, // Target path for symlinks
+}
+
+impl Display for FileEntry {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&format!("{:<12} {}\n", "File Id:", self.file_id))?;
+        f.write_str(&format!("{:<12} {}\n", "Path:", self.path))?;
+        f.write_str(&format!("{:<12} {:?}\n", "Type:", self.file_type))?;
+        match &self.block_data {
+            BlockDataState::Encrypted(_) => f.write_str("Blocks:      Encrypted\n")?,
+            BlockDataState::Decrypted(_) => f.write_str("Blocks:      Decrypted\n")?,
+        }
+        f.write_str(&format!("{:<12} {}\n", "Created:", self.created))?;
+        f.write_str(&format!("{:<12} {}\n", "Modified:", self.modified))?;
+        f.write_str(&format!("{:<12} {}\n", "Size:", self.file_size))?;
+        f.write_str(&format!("{:<12} {:o}\n", "Permissions:", self.permissions))?;
+        f.write_str(&format!("{:<12} {:?}\n", "References:", self.references))?;
+
+        if let Some(target) = &self.symlink_target {
+            f.write_str(&format!("{:<12} {target}\n", "Target:"))?;
+        }
+        Ok(())
+    }
 }
 
 impl FileEntry {
