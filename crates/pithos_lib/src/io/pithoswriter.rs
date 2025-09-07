@@ -90,6 +90,7 @@ pub struct PithosWriter {
 }
 
 impl PithosWriter {
+    #[tracing::instrument(level = "trace", skip(writer_key, reader_keys, cdc, sink))]
     pub fn new(
         writer_key: StaticSecret,
         reader_keys: Vec<PublicKey>,
@@ -114,6 +115,7 @@ impl PithosWriter {
         })
     }
 
+    #[tracing::instrument(level = "trace", skip(writer_key, reader_keys, cdc, pithos_file))]
     pub fn new_from_file<P: AsRef<Path>>(
         writer_key: StaticSecret,
         reader_keys: Vec<PublicKey>,
@@ -162,6 +164,7 @@ impl PithosWriter {
     ///
     /// # Errors
     /// Returns `PithosWriterError` if any step fails.
+    #[tracing::instrument(skip(self, chunk, processing_flags))]
     pub fn process_block(
         &mut self,
         chunk: &mut ChunkData,
@@ -226,6 +229,7 @@ impl PithosWriter {
     ///
     /// # Errors
     /// Returns `PithosWriterError` if any step fails.
+    #[tracing::instrument(skip(self, file_entry, processing_flags, content))]
     pub fn process_file_entry(
         &mut self,
         file_entry: &mut FileEntry,
@@ -276,6 +280,7 @@ impl PithosWriter {
         Reference::try_from(file_entry)
     }
 
+    #[tracing::instrument(skip(self, input))]
     pub fn process_input(&mut self, input: InputFile) -> Result<Reference, PithosError> {
         // Create FileEntry from data file input
         let mut data_fe =
@@ -355,10 +360,10 @@ impl PithosWriter {
         Ok(data_reference)
     }
 
-    #[allow(dead_code)]
+    #[tracing::instrument(skip(self, files))]
     pub fn process_input_files(&mut self, files: Vec<InputFile>) -> Result<(), PithosError> {
         for file in files {
-            println!("  Processing {:?} {}", file.file_type, file.file_path);
+            tracing::info!("Processing [{:?}] {}", file.file_type, file.file_path);
             match file.file_type {
                 FileType::Directory => self.process_directory(file.file_path, None)?,
                 _ => {
@@ -369,7 +374,7 @@ impl PithosWriter {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[tracing::instrument(skip(self, directory, ro_crate))]
     pub fn process_directory<P: AsRef<Path>>(
         &mut self,
         directory: P,
@@ -435,7 +440,7 @@ impl PithosWriter {
                         .collect::<Vec<_>>()
                         .contains(&&entry.file_path)
                     {
-                        println!(
+                        tracing::info!(
                             "Found {} in ro-crate-metadata.json data entities ids",
                             entry.file_path
                         );
@@ -447,7 +452,7 @@ impl PithosWriter {
         } else {
             // Just process all files
             for entry in entries {
-                println!("  Processing {:?} {}", entry.file_type, entry.file_path);
+                tracing::info!("Processing [{:?}] {}", entry.file_type, entry.file_path);
                 self.process_input(entry)?;
             }
         }
@@ -455,6 +460,7 @@ impl PithosWriter {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, directories))]
     pub fn process_directories<P: AsRef<Path>>(
         &mut self,
         directories: Vec<P>,
@@ -466,6 +472,7 @@ impl PithosWriter {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, block, compression_level))]
     pub fn compress_block(
         &self,
         mut block: Vec<u8>,
@@ -484,13 +491,14 @@ impl PithosWriter {
         Ok(block)
     }
 
-    /* ----- Write to sink ---------- */
+    #[tracing::instrument(skip(self))]
     pub fn write_file_header(&mut self) -> Result<(), SerializationError> {
         FileHeader::default().serialize(&mut self.sink)?;
         self.written_bytes = self.written_bytes.saturating_add(6);
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, block))]
     pub fn write_block(&mut self, block: &[u8]) -> Result<(), SerializationError> {
         // Write BlockHeader
         BlockHeader::default().serialize(&mut self.sink)?;
@@ -503,6 +511,7 @@ impl PithosWriter {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn write_directory(&mut self) -> Result<(), PithosError> {
         // Encrypt recipients of writer section
         self.directory.encrypt_recipients(&self.writer_key)?;
@@ -518,6 +527,7 @@ impl PithosWriter {
     }
 
     //TODO: Zipped RO-Crate processing ...
+    #[tracing::instrument(skip(self, crate_data))]
     pub fn process_ro_crate(&mut self, crate_data: &ROCrate) -> Result<(), PithosError> {
         if let Some(base_path) = &crate_data.base_path {
             self.process_directory(base_path, Some(crate_data))?

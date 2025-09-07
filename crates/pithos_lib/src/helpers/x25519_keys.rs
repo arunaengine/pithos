@@ -83,6 +83,7 @@ pub enum CryptError {
 /// let private_key = generate_private_key().unwrap();
 /// let public_key = x25519_dalek::PublicKey::from(&private_key);
 /// ```
+#[tracing::instrument(level = "trace", skip())]
 pub fn generate_private_key() -> Result<StaticSecret, CryptError> {
     let secret = StaticSecret::random_from_rng(OsRng);
     Ok(secret)
@@ -114,6 +115,7 @@ pub fn generate_private_key() -> Result<StaticSecret, CryptError> {
 /// let shared_ba = derive_shared_key(&private_b, &public_a);
 /// assert_eq!(shared_ab, shared_ba);
 /// ```
+#[tracing::instrument(level = "trace", skip(private_key, public_key))]
 pub fn derive_shared_key(private_key: &StaticSecret, public_key: &PublicKey) -> [u8; 32] {
     let shared = private_key.diffie_hellman(public_key);
     shared.to_bytes()
@@ -137,6 +139,7 @@ pub fn derive_shared_key(private_key: &StaticSecret, public_key: &PublicKey) -> 
 /// let pem_bytes = private_key_to_pem_bytes(&private_key).unwrap();
 /// println!("{}", String::from_utf8_lossy(&pem_bytes));
 /// ```
+#[tracing::instrument(level = "trace", skip(key))]
 pub fn private_key_to_pem_bytes(key: &StaticSecret) -> Result<Vec<u8>, CryptError> {
     // Serialize private key as nested OCTET STRING
     let mut private_key = [0u8; 34];
@@ -180,6 +183,7 @@ pub fn private_key_to_pem_bytes(key: &StaticSecret) -> Result<Vec<u8>, CryptErro
 /// let pem_bytes = private_key_to_pem_bytes(&private_key).unwrap();
 /// let private_key = private_key_from_pem_bytes(&pem_bytes).unwrap();
 /// ```
+#[tracing::instrument(level = "trace", skip(pem_data))]
 pub fn private_key_from_pem_bytes(pem_data: &[u8]) -> Result<StaticSecret, CryptError> {
     let pem_str = std::str::from_utf8(pem_data)
         .map_err(|e| CryptError::InvalidPemFormat(format!("Invalid UTF-8: {e}")))?;
@@ -223,6 +227,7 @@ pub fn private_key_from_pem_bytes(pem_data: &[u8]) -> Result<StaticSecret, Crypt
 /// let public_key = x25519_dalek::PublicKey::from(&private_key);
 /// let pem_bytes = public_key_to_pem_bytes(&public_key).unwrap();
 /// ```
+#[tracing::instrument(level = "trace", skip(key))]
 pub fn public_key_to_pem_bytes(key: &PublicKey) -> Result<Vec<u8>, CryptError> {
     let key_bytes = key.as_bytes();
 
@@ -262,6 +267,7 @@ pub fn public_key_to_pem_bytes(key: &PublicKey) -> Result<Vec<u8>, CryptError> {
 /// let pem_bytes = public_key_to_pem_bytes(&public_key).unwrap();
 /// let public_key = public_key_from_pem_bytes(&pem_bytes).unwrap();
 /// ```
+#[tracing::instrument(level = "trace", skip(pem_data))]
 pub fn public_key_from_pem_bytes(pem_data: &[u8]) -> Result<PublicKey, CryptError> {
     let pem_str = std::str::from_utf8(pem_data)
         .map_err(|e| CryptError::InvalidPemFormat(format!("Invalid UTF-8: {e}")))?;

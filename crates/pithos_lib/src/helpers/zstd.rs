@@ -18,6 +18,7 @@ pub enum ZstdError {
 
 const _ZSTD_MAGIC_NUMBER: u32 = 0xFD2FB528; // 4 Bytes, little-endian format
 
+#[tracing::instrument(level = "trace", skip(flags))]
 pub fn map_to_zstd_level(flags: &ProcessingFlags) -> i32 {
     match flags.get_compression_level() {
         1 => 1,
@@ -32,6 +33,7 @@ pub fn map_to_zstd_level(flags: &ProcessingFlags) -> i32 {
 }
 
 /// Compresses a chunk of data with zstd and returns the compression ratio.
+#[tracing::instrument(level = "trace", skip(input))]
 pub fn probe_compression_ratio(input: &[u8], level: Option<i32>) -> Result<f64, ZstdError> {
     if input.is_empty() {
         return Ok(1.0);
@@ -50,11 +52,13 @@ pub fn probe_compression_ratio(input: &[u8], level: Option<i32>) -> Result<f64, 
     Ok(compressed.len() as f64 / probe_size as f64)
 }
 
+#[tracing::instrument(level = "trace", skip(input, level))]
 pub fn compress_data(input: &[u8], level: Option<i32>) -> Result<Vec<u8>, ZstdError> {
     bulk::compress(input, level.unwrap_or_default())
         .map_err(|e| ZstdError::CompressionError(e.to_string()))
 }
 
+#[tracing::instrument(level = "trace", skip(input, decompressed_size))]
 pub fn decompress_data(input: &[u8], decompressed_size: u64) -> Result<Vec<u8>, ZstdError> {
     bulk::decompress(input, decompressed_size as usize)
         .map_err(|e| ZstdError::DecompressionError(e.to_string()))

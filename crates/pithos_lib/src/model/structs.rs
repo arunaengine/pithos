@@ -198,6 +198,7 @@ pub enum BlockDataState {
 }
 
 impl BlockDataState {
+    #[tracing::instrument(skip(self, key))]
     pub fn encrypt(&mut self, key: [u8; 32]) -> Result<(), PithosError> {
         match &self {
             BlockDataState::Encrypted(_) => {
@@ -221,6 +222,7 @@ impl BlockDataState {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, key))]
     pub fn decrypt(&mut self, key: &[u8; 32]) -> Result<(), PithosError> {
         match &self {
             BlockDataState::Encrypted(data) => {
@@ -254,6 +256,7 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
+    #[tracing::instrument(skip(file_id, file_type, disk_path, pithos_path, metadata))]
     pub fn new(
         file_id: Option<u64>,
         file_type: FileType,
@@ -287,6 +290,17 @@ impl FileEntry {
         })
     }
 
+    #[tracing::instrument(skip(
+        file_id,
+        file_type,
+        disk_path,
+        pithos_path,
+        created,
+        modified,
+        permissions,
+        references,
+        file_size
+    ))]
     pub fn new_ext(
         file_id: Option<u64>,
         file_type: FileType,
@@ -322,6 +336,7 @@ impl FileEntry {
         })
     }
 
+    #[tracing::instrument(skip(file_id, file_type, pithos_path, content))]
     pub fn new_from_content(
         file_id: Option<u64>,
         file_type: FileType,
@@ -354,6 +369,7 @@ impl FileEntry {
         })
     }
 
+    #[tracing::instrument(skip(file_id, path, file, metadata))]
     pub fn new_from_file(
         file_id: u64,
         path: String,
@@ -388,6 +404,7 @@ impl FileEntry {
         })
     }
 
+    #[tracing::instrument(skip(other_file, meta_length))]
     pub fn meta_from(other_file: &FileEntry, meta_length: u64) -> Result<Self, PithosError> {
         Ok(FileEntry {
             file_id: other_file.file_id - 1,
@@ -406,10 +423,12 @@ impl FileEntry {
         })
     }
 
+    #[tracing::instrument(skip(self, file_id))]
     pub fn set_file_id(&mut self, file_id: u64) {
         self.file_id = file_id;
     }
 
+    #[tracing::instrument(skip(self, entry))]
     pub fn add_block_data(&mut self, entry: ([u8; 32], [u8; 32])) -> Result<(), PithosError> {
         match self.block_data {
             BlockDataState::Encrypted(_) => {
@@ -454,6 +473,7 @@ pub struct EncryptionSection {
 }
 
 impl EncryptionSection {
+    #[tracing::instrument(skip(recipient_pubkeys))]
     pub fn new(recipient_pubkeys: &[PublicKey]) -> Self {
         EncryptionSection {
             recipients: IndexMap::from_iter(
@@ -479,6 +499,7 @@ pub struct RecipientSection {
 }
 
 impl RecipientSection {
+    #[tracing::instrument(skip(self, entry))]
     pub fn add_file_to_recipient(&mut self, entry: (u64, [u8; 32])) -> Result<(), PithosError> {
         match self.recipient_data {
             RecipientData::Encrypted(_) => Err(PithosError::InvalidRecipientDataState(
@@ -491,6 +512,7 @@ impl RecipientSection {
         }
     }
 
+    #[tracing::instrument(skip(self, shared_key))]
     pub fn encrypt(&mut self, shared_key: SharedSecret) -> Result<(), PithosError> {
         match &self.recipient_data {
             RecipientData::Encrypted(_) => {
@@ -524,6 +546,7 @@ pub enum RecipientData {
 }
 
 impl RecipientData {
+    #[tracing::instrument(skip(self, shared_key))]
     pub fn encrypt(&mut self, shared_key: &SharedSecret) -> Result<(), PithosError> {
         match &self {
             RecipientData::Encrypted(_) => {
@@ -549,6 +572,7 @@ impl RecipientData {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, shared_key))]
     pub fn decrypt(
         &mut self,
         shared_key: &SharedSecret,

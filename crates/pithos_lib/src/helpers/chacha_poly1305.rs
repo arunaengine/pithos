@@ -22,6 +22,7 @@ pub enum ChaChaPoly1305Error {
     ChunkTooSmall(usize),
 }
 
+#[tracing::instrument(level = "trace", skip(msg, aad, enc))]
 pub fn encrypt_chunk(msg: &[u8], aad: &[u8], enc: &[u8]) -> Result<Vec<u8>, ChaChaPoly1305Error> {
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let payload = Payload { msg, aad };
@@ -42,6 +43,7 @@ pub fn encrypt_chunk(msg: &[u8], aad: &[u8], enc: &[u8]) -> Result<Vec<u8>, ChaC
     Ok(bytes)
 }
 
+#[tracing::instrument(level = "trace", skip(chunk, decryption_key))]
 pub fn decrypt_chunk(
     chunk: &[u8],
     decryption_key: &[u8; 32],

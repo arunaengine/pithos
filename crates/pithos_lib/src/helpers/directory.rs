@@ -29,6 +29,7 @@ impl Default for DirectoryBuilder {
 }
 
 impl DirectoryBuilder {
+    #[tracing::instrument(level = "trace", skip())]
     pub fn new() -> Self {
         DirectoryBuilder {
             identifier: *b"PITHOSDR",
@@ -41,36 +42,43 @@ impl DirectoryBuilder {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, offset))]
     pub fn parent_directory_offset(mut self, offset: Option<(u64, u64)>) -> Self {
         self.parent_directory_offset = offset;
         self
     }
 
+    #[tracing::instrument(level = "trace", skip(self, files))]
     pub fn files(mut self, files: Vec<FileEntry>) -> Self {
         self.files = files;
         self
     }
 
+    #[tracing::instrument(level = "trace", skip(self, blocks))]
     pub fn blocks(mut self, blocks: IndexMap<[u8; 32], BlockIndexEntry>) -> Self {
         self.blocks = blocks;
         self
     }
 
+    #[tracing::instrument(level = "trace", skip(self, relations))]
     pub fn relations(mut self, relations: Vec<(u64, String)>) -> Self {
         self.relations = relations;
         self
     }
 
+    #[tracing::instrument(level = "trace", skip(self, encryption))]
     pub fn encryption(mut self, encryption: IndexMap<[u8; 32], EncryptionSection>) -> Self {
         self.encryption = encryption;
         self
     }
 
+    #[tracing::instrument(level = "trace", skip(self, dir_len))]
     pub fn dir_len(mut self, dir_len: u64) -> Self {
         self.dir_len = dir_len;
         self
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn build(self) -> Result<Directory, SerializationError> {
         // Calculate CRC32 of all fields using bincode serialization
         let mut buf = Vec::new();
@@ -116,10 +124,12 @@ impl DirectoryBuilder {
 }
 
 impl Directory {
+    #[tracing::instrument(level = "trace", skip())]
     pub fn new() -> Result<Self, SerializationError> {
         DirectoryBuilder::new().build()
     }
 
+    #[tracing::instrument(level = "trace", skip(self, newer_directory))]
     pub fn merge(&mut self, newer_directory: Directory) -> Result<(), PithosError> {
         // Append files (also checks for duplicate file_id and path duplicates)
         self.add_files_to_index(newer_directory.files)?;
@@ -165,6 +175,7 @@ impl Directory {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, hash))]
     pub fn block_hash_exists(&mut self, hash: &blake3::Hash) -> Option<BlockIndexEntry> {
         if let Entry::Occupied(entry) = self.blocks.entry(*hash.as_bytes()) {
             Some(entry.get().clone())
@@ -173,6 +184,7 @@ impl Directory {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, block_index_entries))]
     pub fn add_blocks_to_index(
         &mut self,
         block_index_entries: IndexMap<[u8; 32], BlockIndexEntry>,
@@ -183,6 +195,7 @@ impl Directory {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, block_hash, block_entry))]
     pub fn add_block_to_index(
         &mut self,
         block_hash: [u8; 32],
@@ -192,6 +205,7 @@ impl Directory {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, file_entry))]
     pub fn add_file_to_index(&mut self, file_entry: &FileEntry) -> Result<(), PithosError> {
         // Check for file_id or path duplicates
         for file in &self.files {
@@ -204,13 +218,15 @@ impl Directory {
         Ok(())
     }
 
-    pub fn add_files_to_index(&mut self, file_entry: Vec<FileEntry>) -> Result<(), PithosError> {
-        for entry in file_entry {
+    #[tracing::instrument(level = "trace", skip(self, file_entries))]
+    pub fn add_files_to_index(&mut self, file_entries: Vec<FileEntry>) -> Result<(), PithosError> {
+        for entry in file_entries {
             self.add_file_to_index(&entry)?;
         }
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, writer_key, reader_key, file_entry))]
     pub fn add_file_to_recipient(
         &mut self,
         writer_key: &StaticSecret,
@@ -244,6 +260,7 @@ impl Directory {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, entry))]
     pub fn add_file_to_all_recipients(&mut self, entry: (u64, [u8; 32])) {
         for (_, e_section) in self.encryption.iter_mut() {
             for (_, r_section) in e_section.recipients.iter_mut() {
@@ -259,6 +276,7 @@ impl Directory {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, relation))]
     pub fn add_relation_definition(&mut self, relation: (u64, String)) -> Result<(), PithosError> {
         for existing_relation in &self.relations {
             if existing_relation.0 == relation.0 {
@@ -270,6 +288,7 @@ impl Directory {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, relations))]
     pub fn add_relation_definitions(
         &mut self,
         relations: Vec<(u64, String)>,
@@ -280,6 +299,7 @@ impl Directory {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn next_free_file_index(&self) -> u64 {
         if let Some(idx) = self.files.iter().max_by_key(|file| file.file_id) {
             idx.file_id + 1
@@ -288,15 +308,18 @@ impl Directory {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, path))]
     pub fn get_file_by_path(&self, path: &str) -> Option<&FileEntry> {
         self.files.iter().find(|file| file.path == path)
     }
 
+    #[tracing::instrument(level = "trace", skip(self, file_id))]
     pub fn get_file_by_id(&self, file_id: u64) -> Option<&FileEntry> {
         self.files.iter().find(|file| file.file_id == file_id)
     }
 
     // Checks only decrypted recipient sections
+    #[tracing::instrument(level = "trace", skip(self, file_id))]
     pub fn get_file_encryption_key(&self, file_id: u64) -> Option<[u8; 32]> {
         for (_, e_section) in &self.encryption {
             for (_, r_section) in &e_section.recipients {
@@ -310,6 +333,7 @@ impl Directory {
         None
     }
 
+    #[tracing::instrument(level = "trace", skip(self, writer_key))]
     pub fn encrypt_recipients(&mut self, writer_key: &StaticSecret) -> Result<(), PithosError> {
         let writer_pubkey = PublicKey::from(writer_key);
         for (sender_pubkey, e_section) in self.encryption.iter_mut() {
@@ -325,6 +349,7 @@ impl Directory {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, reader_key))]
     pub fn decrypt_recipient(
         &mut self,
         reader_key: &StaticSecret,
@@ -379,6 +404,7 @@ impl Directory {
         Ok(available_file_indices)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn update_len(&mut self) -> Result<(), SerializationError> {
         let mut buf = Vec::new();
         self.serialize(&mut buf)?;
@@ -386,6 +412,7 @@ impl Directory {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn update_crc32(&mut self) -> Result<(), SerializationError> {
         let mut buf = Vec::new();
         if let Some((start, len)) = self.parent_directory_offset {
@@ -420,6 +447,7 @@ impl Directory {
     }
 }
 
+#[tracing::instrument(level = "trace", skip(existing, new))]
 fn merge_recipient_data(existing: &mut RecipientData, new: RecipientData) {
     if let (RecipientData::Decrypted(existing_files), RecipientData::Decrypted(new_files)) =
         (existing, new)

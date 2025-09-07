@@ -18,6 +18,7 @@ impl Default for Hasher {
 }
 
 impl Hasher {
+    #[tracing::instrument(level = "trace", skip())]
     pub fn new() -> Self {
         Hasher {
             blake3: blake3::Hasher::new(),
@@ -25,11 +26,13 @@ impl Hasher {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, bytes))]
     pub fn update(&mut self, bytes: &[u8]) {
         self.blake3.update(bytes);
         self.shake256.update(bytes);
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn finalize(&mut self) -> Hashes {
         let mut key_buf = [0u8; 32];
         self.shake256.clone().finalize_xof().read(&mut key_buf);

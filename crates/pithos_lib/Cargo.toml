@@ -25,10 +25,11 @@ reqwest = {  version = "0.12.23", features = ["blocking"] }
 rocrate = { path = "../rocrate" }
 sha3 = "0.10.8"
 thiserror = { workspace = true }
+tracing = { workspace = true }
 walkdir = "2.5.0"
 x25519-dalek = { workspace = true }
 zstd = "0.13.3"
 
 [dev-dependencies]
 tempfile = "3.21"
-zip = "4.6.1"
+zip = "5.0.0"

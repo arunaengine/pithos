@@ -37,6 +37,7 @@ pub enum DeserializationError {
 }
 
 // Helper: decode string (UTF-8 with varint length prefix)
+#[tracing::instrument(skip(reader))]
 pub fn decode_string<R: Read>(reader: &mut R) -> Result<String, DeserializationError> {
     let len = reader.read_varint()?;
     let mut buf = vec![0u8; len];
@@ -48,6 +49,7 @@ pub fn decode_string<R: Read>(reader: &mut R) -> Result<String, DeserializationE
 impl FileHeader {
     const FILE_HEADER_MARKER: [u8; 4] = *b"PITH";
 
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut marker = [0u8; 4];
         reader.read_exact(&mut marker)?;
@@ -70,6 +72,8 @@ impl FileHeader {
 // BlockHeader
 impl BlockHeader {
     const BLOCK_HEADER_MARKER: [u8; 4] = *b"BLCK";
+
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut marker = [0u8; 4];
         reader.read_exact(&mut marker)?;
@@ -86,6 +90,7 @@ impl BlockHeader {
 
 // ProcessingFlags
 impl ProcessingFlags {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut buf = [0u8; 1];
         reader.read_exact(&mut buf)?;
@@ -95,6 +100,7 @@ impl ProcessingFlags {
 
 // BlockLocation
 impl BlockLocation {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag)?;
@@ -111,6 +117,7 @@ impl BlockLocation {
 
 // BlockIndexEntry
 impl BlockIndexEntry {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let offset: u64 = reader.read_varint()?;
         let stored_size: u64 = reader.read_varint()?;
@@ -129,6 +136,7 @@ impl BlockIndexEntry {
 
 // Directory
 impl Directory {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         // Read static directory identifier
         let mut identifier = [0u8; 8];
@@ -197,6 +205,7 @@ impl Directory {
 
 // FileType
 impl FileType {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut buf = [0u8; 1];
         reader.read_exact(&mut buf)?;
@@ -212,6 +221,7 @@ impl FileType {
 
 // BlockDataState
 impl BlockDataState {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag)?;
@@ -238,6 +248,7 @@ impl BlockDataState {
         }
     }
 
+    #[tracing::instrument(skip(self, reader))]
     pub fn deserialize_block_index<R: Read>(
         &self,
         reader: &mut R,
@@ -257,6 +268,7 @@ impl BlockDataState {
 
 // FileEntry
 impl FileEntry {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let file_id: u64 = reader.read_varint()?;
         let path = decode_string(reader)?;
@@ -295,6 +307,7 @@ impl FileEntry {
 
 // Reference
 impl Reference {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let target_file_id: u64 = reader.read_varint()?;
         let relationship: u64 = reader.read_varint()?;
@@ -307,6 +320,7 @@ impl Reference {
 
 // EncryptionSection
 impl EncryptionSection {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let recipients_len = reader.read_varint::<u64>()?;
         let mut recipients = IndexMap::new();
@@ -321,6 +335,7 @@ impl EncryptionSection {
 
 // RecipientData
 impl RecipientData {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag)?;
@@ -347,6 +362,7 @@ impl RecipientData {
         }
     }
 
+    #[tracing::instrument(skip(self, reader))]
     pub fn deserialize_decrypted_list<R: Read>(
         &self,
         reader: &mut R,
@@ -366,6 +382,7 @@ impl RecipientData {
 
 // RecipientSection
 impl RecipientSection {
+    #[tracing::instrument(skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
         let recipient_data = RecipientData::deserialize(reader)?;
         Ok(RecipientSection { recipient_data })

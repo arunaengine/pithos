@@ -24,6 +24,7 @@ pub struct PithosReaderSimple {
 
 impl PithosReaderSimple {
     /// Open a Pithos archive and prepare for reading
+    #[tracing::instrument(level = "trace", skip(pithos_path, private_key_pem_path))]
     pub fn new<P: AsRef<Path>>(
         pithos_path: P,
         private_key_pem_path: P,
@@ -39,6 +40,7 @@ impl PithosReaderSimple {
     }
 
     /// Init a simple Pithos reader
+    #[tracing::instrument(level = "trace", skip(pithos_path, private_key))]
     pub fn new_with_key<P: AsRef<Path>>(
         pithos_path: P,
         private_key: StaticSecret,
@@ -50,17 +52,15 @@ impl PithosReaderSimple {
     }
 
     /// Init a simple Pithos reader
+    #[tracing::instrument(level = "trace", skip(_pithos_path, _private_key))]
     pub fn new_with_keys<P: AsRef<Path>>(
         _pithos_path: P,
         _private_key: Vec<StaticSecret>,
     ) -> Result<Self, PithosError> {
         unimplemented!("Multiple reader keys");
-
-        // Open the Pithos file
-        //let file = File::open(&_pithos_path)?;
-        //Ok(Self { file, private_key })
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn read_directory(&mut self) -> Result<(Directory, (u64, u64)), PithosError> {
         // Read last 12 bytes for crc32 and directory length
         let file_len = self.file.metadata()?.len();
@@ -121,6 +121,7 @@ impl PithosReaderSimple {
         Ok((directory, (parent_dir_start, parent_dir_len)))
     }
 
+    #[tracing::instrument(level = "trace", skip(self, directory))]
     pub fn read_file_paths(
         &self,
         directory: &Directory,
@@ -132,6 +133,10 @@ impl PithosReaderSimple {
             .collect())
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, inner_path, directory, output_path, ranges)
+    )]
     pub fn read_file(
         &mut self,
         inner_path: &str,
@@ -187,6 +192,7 @@ impl PithosReaderSimple {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, inner_path, directory, output))]
     pub fn read_file_to_crypt4gh(
         &mut self,
         inner_path: &str,
@@ -318,6 +324,7 @@ impl PithosReaderSimple {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, file_entry, block_index, sink))]
     fn read_data_to_sink(
         &mut self,
         file_entry: &FileEntry,
@@ -374,6 +381,7 @@ impl PithosReaderSimple {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, byte_range, file_entry, block_index, sink))]
     pub fn read_data_range_to_sink(
         &mut self,
         byte_range: Range<u64>,

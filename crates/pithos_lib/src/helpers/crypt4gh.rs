@@ -43,6 +43,7 @@ impl Crypt4GHHeader {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_all(&self.magic)?;
         writer.write_u32::<LittleEndian>(self.version)?;
@@ -65,6 +66,7 @@ pub struct HeaderPacket {
 }
 
 impl HeaderPacket {
+    #[tracing::instrument(level = "trace", skip(sender_key, reader_keys, data_key))]
     pub fn from_pithos(
         sender_key: &StaticSecret,
         reader_keys: Vec<&PublicKey>,
@@ -97,6 +99,7 @@ impl HeaderPacket {
         Ok(header_packets)
     }
 
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_u32::<LittleEndian>(self.length)?;
         writer.write_u32::<LittleEndian>(self.encryption_method)?;
@@ -125,6 +128,7 @@ pub enum PacketData {
 }
 
 impl PacketData {
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_len(&self) -> usize {
         match self {
             Self::Encrypted(enc_data) => enc_data.len(),
@@ -158,6 +162,7 @@ pub struct EncryptionPacket {
 }
 
 impl EncryptionPacket {
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_encryption_key(&self) -> &[u8; 32] {
         &self.encryption_key
     }
@@ -171,6 +176,8 @@ pub struct EditListPacket {
 
 impl TryFrom<&[u8]> for Crypt4GHHeader {
     type Error = Crypt4GHError;
+
+    #[tracing::instrument(level = "trace", skip(bytes))]
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         let mut header = Crypt4GHHeader {
             magic: [0; 8],
@@ -215,6 +222,8 @@ impl TryFrom<&[u8]> for Crypt4GHHeader {
 
 impl TryInto<Vec<u8>> for Crypt4GHHeader {
     type Error = Crypt4GHError;
+
+    #[tracing::instrument(level = "trace", skip(self))]
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.magic);
@@ -240,6 +249,7 @@ impl TryInto<Vec<u8>> for Crypt4GHHeader {
 }
 
 impl HeaderPacket {
+    #[tracing::instrument(level = "trace", skip(packets))]
     pub fn new(packets: Vec<Packet>) -> Self {
         HeaderPacket {
             length: 0,
@@ -251,6 +261,7 @@ impl HeaderPacket {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(bytes, len))]
     pub fn from_buf(bytes: Vec<u8>, len: usize) -> Result<Self, Crypt4GHError> {
         let mut bytes = Cursor::new(bytes);
         let encryption_method = bytes
@@ -285,6 +296,7 @@ impl HeaderPacket {
         })
     }
 
+    #[tracing::instrument(level = "trace", skip(self, readers_private_key))]
     pub fn decrypt(&mut self, readers_private_key: &StaticSecret) -> Result<(), Crypt4GHError> {
         let writers_pub_key = PublicKey::from(self.writers_pubkey);
         let session_key = readers_private_key.diffie_hellman(&writers_pub_key);
@@ -293,6 +305,7 @@ impl HeaderPacket {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, readers_pubkey, writers_private_key))]
     pub fn encrypt(
         &mut self,
         readers_pubkey: PublicKey,
@@ -315,6 +328,7 @@ impl HeaderPacket {
 }
 
 impl PacketData {
+    #[tracing::instrument(level = "trace", skip(self, session_key, nonce))]
     pub fn encrypt(
         &mut self,
         session_key: &[u8; 32],
@@ -355,6 +369,7 @@ impl PacketData {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, session_key, nonce, mac))]
     pub fn decrypt(
         &mut self,
         session_key: &[u8; 32],
@@ -380,6 +395,7 @@ impl PacketData {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(bytes))]
     pub fn packet_from_bytes(bytes: &[u8]) -> Result<Vec<Packet>, Crypt4GHError> {
         let mut cursor = Cursor::new(bytes);
         let mut packets = Vec::new();
