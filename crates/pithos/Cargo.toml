@@ -1,7 +1,7 @@
 [package]
 name = "pithos"
 description = "CLI for the Pithos container file format"
-version = "0.6.1"
+version = "0.7.0"
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
