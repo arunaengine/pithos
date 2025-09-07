@@ -8,7 +8,6 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow = "1.0.93"
 clap = { version = "4.5.21", features = ["derive"] }
 pithos_lib = { path = "../pithos_lib" }
 thiserror = { workspace = true }

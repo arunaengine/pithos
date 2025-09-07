@@ -14,6 +14,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::dispatcher::SetGlobalDefaultError;
+use tracing_subscriber::prelude::*;
 use utils::conversion::{evaluate_log_level, parse_cdc_input, parse_range_input};
 use x25519_dalek::PublicKey;
 
@@ -39,6 +40,10 @@ struct Cli {
     /// Optionally set the log level
     #[arg(long, value_name = "LOG_LEVEL", default_value = "Info")]
     log_level: Option<String>,
+
+    /// Optionally set the log level
+    #[arg(short, long)]
+    verbose: bool,
 
     /// Optionally set the log file
     #[arg(long, value_name = "LOG_FILE")]
@@ -197,19 +202,15 @@ fn main() -> Result<(), PithosCliError> {
     // Parse CLI parameter input
     let cli = Cli::parse();
 
-    // Evaluate provided log level
-    let log_level = evaluate_log_level(cli.log_level);
+    // Initialize tracing logger
+    let logging_filter = evaluate_log_level(cli.log_level);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_file(cli.verbose)
+        .with_line_number(cli.verbose)
+        .with_target(cli.verbose)
+        .with_filter(logging_filter);
 
-    // Initialize logger
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .compact()
-            .with_max_level(log_level)
-            .with_file(true)
-            .with_line_number(true)
-            .with_target(false)
-            .finish(),
-    )?;
+    tracing_subscriber::registry().with(fmt_layer).init();
 
     // Evaluate subcommand
     match cli.command {
@@ -222,7 +223,6 @@ fn main() -> Result<(), PithosCliError> {
                 )?;
                 let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
                 let (directory, _) = reader.read_directory()?;
-
                 println!("\nAvailable files in {file:?}:\n{}", "-".repeat(50));
                 directory
                     .files
@@ -292,6 +292,7 @@ fn main() -> Result<(), PithosCliError> {
                 files.iter().map(InputFile::try_from).collect();
             let mut writer = PithosWriter::new(sender_key, reader_keys?, cdc, Box::new(output))?;
 
+            tracing::info!("Start creating Pithos file");
             writer
                 .write_file_header()
                 .map_err(PithosError::Serialization)?;

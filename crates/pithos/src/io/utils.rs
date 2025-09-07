@@ -1,4 +1,3 @@
-use anyhow::Result;
 use pithos_lib::error::PithosError;
 use std::fs::File;
 use std::io::Read;

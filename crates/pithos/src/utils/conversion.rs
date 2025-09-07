@@ -1,20 +1,18 @@
 use crate::PithosCliError;
 use std::ops::Range;
-use tracing::Level;
+use tracing_subscriber::EnvFilter;
 
-pub fn evaluate_log_level(input: Option<String>) -> Level {
-    if let Some(log_level) = input {
-        match log_level.to_lowercase().as_str() {
-            "info" => Level::INFO,
-            "warn" => Level::WARN,
-            "error" => Level::ERROR,
-            "debug" => Level::DEBUG,
-            "trace" => Level::TRACE,
-            _ => Level::INFO,
-        }
+pub fn evaluate_log_level(input: Option<String>) -> EnvFilter {
+    let level = if let Some(log_level) = input {
+        &log_level.to_lowercase()
     } else {
-        Level::INFO
-    }
+        "info"
+    };
+
+    EnvFilter::try_from_default_env()
+        .unwrap_or("none".into())
+        .add_directive(format!("pithos={level}").parse().unwrap())
+        .add_directive(format!("pithos_lib={level}").parse().unwrap())
 }
 
 pub fn _to_hex_string(bytes: Vec<u8>) -> String {
