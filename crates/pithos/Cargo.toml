@@ -14,4 +14,4 @@ thiserror = { workspace = true }
 tracing = "0.1.40"
 tracing-subscriber = {version = "0.3.18", features = ["env-filter", "time"]}
 x25519-dalek = {workspace = true}
-indicatif = "0.17.9"
+#indicatif = "0.17.9"

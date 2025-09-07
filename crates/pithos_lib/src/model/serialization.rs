@@ -22,7 +22,7 @@ pub enum SerializationError {
 }
 
 // Helper: encode string (UTF-8 with varint length prefix)
-#[tracing::instrument(skip(writer, s))]
+#[tracing::instrument(level = "trace", skip(writer, s))]
 pub fn encode_string<W: Write>(writer: &mut W, s: &str) -> Result<(), SerializationError> {
     writer.write_varint(s.len())?;
     writer.write_all(s.as_bytes())?;
@@ -30,14 +30,14 @@ pub fn encode_string<W: Write>(writer: &mut W, s: &str) -> Result<(), Serializat
 }
 
 impl FileHeader {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_all(&self.magic)?;
         writer.write_varint(self.version)?;
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, SerializationError> {
         let mut buf = Vec::new();
         self.serialize(&mut buf)?;
@@ -46,7 +46,7 @@ impl FileHeader {
 }
 
 impl BlockHeader {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_all(&self.marker)?;
         Ok(())
@@ -54,7 +54,7 @@ impl BlockHeader {
 }
 
 impl ProcessingFlags {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_all(&[self.0])?;
         Ok(())
@@ -62,7 +62,7 @@ impl ProcessingFlags {
 }
 
 impl BlockLocation {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         match self {
             BlockLocation::Local => {
@@ -78,7 +78,7 @@ impl BlockLocation {
 }
 
 impl BlockIndexEntry {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_varint(self.offset)?;
         writer.write_varint(self.stored_size)?;
@@ -90,7 +90,7 @@ impl BlockIndexEntry {
 }
 
 impl Directory {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         // Write static identifier
         writer.write_all(&self.identifier)?;
@@ -133,7 +133,7 @@ impl Directory {
 }
 
 impl FileType {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_all(&[*self as u8])?;
         Ok(())
@@ -141,7 +141,7 @@ impl FileType {
 }
 
 impl BlockDataState {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         match self {
             BlockDataState::Encrypted(data) => {
@@ -161,7 +161,7 @@ impl BlockDataState {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, SerializationError> {
         let mut buf = Vec::new();
         self.serialize(&mut buf)?;
@@ -170,7 +170,7 @@ impl BlockDataState {
 }
 
 impl FileEntry {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_varint(self.file_id)?;
         encode_string(writer, &self.path)?;
@@ -194,7 +194,7 @@ impl FileEntry {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, SerializationError> {
         let mut buf = Vec::new();
         self.serialize(&mut buf)?;
@@ -203,7 +203,7 @@ impl FileEntry {
 }
 
 impl Reference {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_varint(self.target_file_id)?;
         writer.write_varint(self.relationship)?;
@@ -212,7 +212,7 @@ impl Reference {
 }
 
 impl EncryptionSection {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         writer.write_varint(self.recipients.len() as u64)?;
         for (key, recipient) in &self.recipients {
@@ -224,7 +224,7 @@ impl EncryptionSection {
 }
 
 impl RecipientData {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         match self {
             RecipientData::Encrypted(data) => {
@@ -246,7 +246,7 @@ impl RecipientData {
 }
 
 impl RecipientSection {
-    #[tracing::instrument(skip(self, writer))]
+    #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
         self.recipient_data.serialize(writer)?;
         Ok(())

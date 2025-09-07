@@ -205,6 +205,7 @@ fn main() -> Result<(), PithosCliError> {
     // Initialize tracing logger
     let logging_filter = evaluate_log_level(cli.log_level);
     let fmt_layer = tracing_subscriber::fmt::layer()
+        .compact()
         .with_file(cli.verbose)
         .with_line_number(cli.verbose)
         .with_target(cli.verbose)
