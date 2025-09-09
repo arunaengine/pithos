@@ -1,15 +1,17 @@
-# PITHOS File Format Specification
+# Pithos File Format Specification
 
 **Version:** 1.0
 **Status:** Draft
-**Date:** July 2025
+**Date:** September 2025
 **Purpose:** Next-generation file format for scientific data management, optimized for object storage with built-in deduplication, encryption, and metadata support
 
 ## 1. Introduction
 
-This document specifies the PITHOS file format using the key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
+This document specifies the Pithos file format using the key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
 
-PITHOS is an append-only archive format designed for efficient storage and sharing of scientific data. It combines content-defined deduplication, convergent encryption, and flexible metadata support in a privacy-preserving architecture optimized for object storage systems.
+Pithos is an append-only archive format designed for efficient storage and sharing of scientific data. It combines content-defined deduplication, convergent encryption, and flexible metadata support in a privacy-preserving architecture optimized for object storage systems.
+
+The code examples in this document are only intended to illustrate the architecture. Optimized implementations of the individual structures may of course differ.
 
 ## 2. Core Design Principles
 
@@ -23,24 +25,24 @@ PITHOS is an append-only archive format designed for efficient storage and shari
 
 ## 3. File Structure
 
-A PITHOS file MUST have the following structure:
+A Pithos file MUST have the following structure:
 
 ```
-[FileHeader]                    // REQUIRED: Format identifier and version
-[Block Data...]                 // Zero or more data blocks with headers
-[Directory + EncryptionSection] // REQUIRED: Can repeat (append-only)
-[Block Data...]                 // Zero or more additional blocks
-[Directory + EncryptionSection] // REQUIRED: File MUST end with directory
+[FileHeader]      // REQUIRED: Format identifier and version
+[Block Data...]   // Zero or more data blocks with headers
+[Directory]       // REQUIRED: Can repeat (append-only)
+[Block Data...]   // Zero or more additional blocks
+[Directory]       // REQUIRED: File MUST end with directory
 ```
 
 ## 4. Core Data Structures
 
 ### 4.1 File Header
 
-Every PITHOS file MUST begin with a FileHeader:
+Every Pithos file MUST begin with a FileHeader:
 
 ```rust
-/// File header - appears once at the beginning of every PITHOS file
+/// File header - appears once at the beginning of every Pithos file
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub magic: [u8; 4],    // MUST be b"PITH"
@@ -120,10 +122,9 @@ pub struct Directory {
     pub parent_directory_offset: Option<(u64, u64)>,    // Previous directory (start, len) (varint, backwards chain)
     pub files: Vec<FileEntry>,                          // Files in this segment
     pub blocks: Vec<BlockIndexEntry>,                   // Blocks in this segment
-    pub relations: Vec<(u64, String)>                   // Relation idx, relationname / id
+    pub relations: Vec<(u64, String)>,                  // Relation idx, relationname / id
     pub encryption: Vec<EncryptionSection>,
     pub dir_len: u64,
-    //pub encryption_section_offset: u64,               // Offset to encryption section (varint)
     pub crc32: u32,                                     // CRC32 of all preceding fields
 }
 ```
@@ -155,8 +156,8 @@ Each file MUST be represented by a FileEntry:
 
 
 pub enum BlockDataState {
-    Encrypted(Vec<u8>), // Chacha + nonce
-    Decrypted(Vec<(u64, [u8; 32])) // Index / Shake256 hash
+    Encrypted(Vec<u8>),             // Nonce + ChaCha20Poly1305
+    Decrypted(Vec<(u64, [u8; 32])>) // Index / SHAKE256 hash
 }
 
 
@@ -172,7 +173,6 @@ pub struct FileEntry {
     pub modified: u64,                   // Unix timestamp (seconds since epoch)
     pub file_size: u64,                  // Total size in bytes (varint)
     pub permissions: u32,                // Unix-style permissions
-    // TODO: Uid / guid ?
     pub references: Vec<Reference>,      // Data->Metadata references only
     pub symlink_target: Option<String>,  // Target path for symlinks
 }
@@ -192,16 +192,16 @@ pub struct Reference {
 ```
 
 **Standard relationship types:**
-- `DESCRIBES = 0`: Metadata describing target
-- `ANNOTATES = 1`: Additional annotations
-- `DERIVED_FROM = 2`: Derived from target
-- `SOURCE_OF = 3`: Source of target
+- `DESCRIBES = 0`:        Metadata describing target
+- `ANNOTATES = 1`:        Additional annotations
+- `DERIVED_FROM = 2`:     Derived from target
+- `SOURCE_OF = 3`:        Source of target
 - `PREVIOUS_VERSION = 4`: Previous version
-- `NEXT_VERSION = 5`: Next version
-- `PART_OF = 6`: Part of collection
-- `CONTAINS = 7`: Contains target
-- `INPUT_TO = 8`: Input to process
-- `OUTPUT_FROM = 9`: Output from process
+- `NEXT_VERSION = 5`:     Next version
+- `PART_OF = 6`:          Part of collection
+- `CONTAINS = 7`:         Contains target
+- `INPUT_TO = 8`:         Input to process
+- `OUTPUT_FROM = 9`:      Output from process
 - Custom relationships start at `1000`
 
 ### 4.5 Encryption Section
@@ -212,13 +212,13 @@ Encryption sections MUST follow each directory:
 /// Encryption section - privacy-preserving access control
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptionSection {
-    pub sender_public_key: [u8; 32],           // X25519 public key
-    pub recipients: Vec<RecipientSection>,     // Per-recipient data
+    pub sender_public_key: [u8; 32],       // X25519 public key
+    pub recipients: Vec<RecipientSection>, // Per-recipient data
 }
 
 pub enum RecipientData {
-    Encrypted(Vec<u8>), // Chacha + nonce
-    Decrypted(Vec<(u64, [u8; 32])) // Fileindex / Shake256 hash
+    Encrypted(Vec<u8>),             // Chacha + nonce
+    Decrypted(Vec<(u64, [u8; 32])>) // Fileindex / Shake256 hash
 }
 
 
@@ -226,7 +226,7 @@ pub enum RecipientData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecipientSection {
     pub recipient_public_key: [u8; 32],  // Recipient's X25519 public key
-    pub recipient_data: RecipientData,         // Encrypted FileKeyEntry list
+    pub recipient_data: RecipientData,   // Encrypted FileKeyEntry list
 }
 ```
 
@@ -234,40 +234,29 @@ pub struct RecipientSection {
 
 ```rust
 #[derive(Debug)]
-pub enum FormatError {
-    // Format errors
-    InvalidMagic,
-    UnsupportedVersion(u16),
-    UnknownFileType(u8),
-    InvalidUtf8,
-    VarintOverflow,
-    VarintIncomplete,
-    StringTruncated,
-
-    // Validation errors
-    InvalidBlockIndex(u64),
-    FileNotFound,
-    DataFileWithReferences,
-    NonMetadataFileWithReferences,
-    SymlinkWithoutTarget,
-    NonSymlinkWithTarget,
-    InvalidBlocksForFileType,
-    MissingBlocks,
-    InvalidOperation,
-
-    // Path errors
-    EmptyPath,
-    PathTraversal,
-    AbsolutePathNotAllowed,
-    InvalidSymlinkTarget,
-    MissingParentDirectory {
-        path: String,
-        parent: String,
-        index: usize,
-    },
-
-    // IO errors
-    IoError(std::io::Error),
+pub enum PithosError {
+    Io(#[from] io::Error),
+    Conversion(String),
+    SystemTimeError(#[from] SystemTimeError),
+    StripPrefix(#[from] std::path::StripPrefixError),
+    WalkDir(#[from] walkdir::Error),
+    FastCDC(#[from] fastcdc::v2020::Error),
+    Serialization(#[from] SerializationError),
+    Deserialization(#[from] DeserializationError), 
+    Crypt(#[from] CryptError),
+    Crypt4GH(#[from] Crypt4GHError),
+    Cipher(#[from] ChaChaPoly1305Error),
+    Compression(#[from] ZstdError),
+    InvalidBlockDataState(String),
+    BlockHashNotFound([u8; 32]),
+    FileNotFound(String),
+    DuplicateFileId(String),
+    RelationIdOccupied(u64),
+    PathOccupied(String),
+    InvalidFileType(String),
+    NoMatchingRecipient,
+    InvalidRecipientDataState(String),
+    Other(String),
 }
 ```
 
@@ -426,7 +415,6 @@ Extensions MUST maintain backwards compatibility for reading.
 - File Header: `b"PITH"`
 - Block Header: `b"BLCK"`
 - Directory: `b"PITHOSDR"`
-- Encryption Section: `b"PITHOSEN"`
 
 ### 11.2 Version Numbers
 
