@@ -22,8 +22,8 @@ use x25519_dalek::PublicKey;
 enum KeyFormat {
     #[default]
     Openssl, // PKCS#8 encoded key in PEM format
-    Crypt4gh, // Additional encryption of key
-    Raw,      // Only key bytes
+             //Crypt4gh, // Additional encryption of key
+             //Raw,      // Only key bytes
 }
 
 #[derive(Clone, Default, ValueEnum)]
@@ -106,11 +106,14 @@ enum PithosCommands {
         #[command(subcommand)]
         read_command: ReadCommands,
     },
-    /// Create x25519
-    CreateKeypair {
+    /// Create keypair
+    Keypair {
         /// Key format; Default is PKCS#8 encoded x25519 keypair in PEM format
         #[arg(short, long)]
         format: Option<KeyFormat>,
+        /// Key file prefix (e.g. sender -> sender.<sec/pub>.pem)
+        #[arg(short, long)]
+        prefix: Option<String>,
     },
     /// Export a Pithos file into another compatible file format
     Export {
@@ -353,20 +356,34 @@ fn main() -> Result<(), PithosCliError> {
             writer.process_input_files(input_files?)?;
             writer.write_directory()?;
         }
-        PithosCommands::CreateKeypair { .. } => {
+        PithosCommands::Keypair { prefix, .. } => {
             let private_key = generate_private_key().map_err(PithosError::Crypt)?;
             let public_key = PublicKey::from(&private_key);
+            let prefix = prefix.unwrap_or("pithos_key".to_string());
 
             // Write output
-            let mut output_target: Box<dyn Write> = if let Some(dest) = cli.output {
-                Box::new(std::fs::File::create(dest).map_err(PithosError::Io)?)
-            } else {
-                Box::new(std::io::stdout())
-            };
-            output_target
+            let (mut sec_output, mut pub_output): (Box<dyn Write>, Box<dyn Write>) =
+                if let Some(dest) = cli.output {
+                    let (sec_target, pub_target) = if dest.is_dir() {
+                        (
+                            &dest.join(format!("{prefix}.sec.pem")),
+                            &dest.join(format!("{prefix}.pub.pem")),
+                        )
+                    } else {
+                        (&dest, &dest)
+                    };
+                    (
+                        Box::new(File::create(sec_target).map_err(PithosError::Io)?),
+                        Box::new(File::create(pub_target).map_err(PithosError::Io)?),
+                    )
+                } else {
+                    (Box::new(std::io::stdout()), Box::new(std::io::stdout()))
+                };
+
+            sec_output
                 .write_all(&private_key_to_pem_bytes(&private_key).map_err(PithosError::Crypt)?)
                 .map_err(PithosError::Io)?;
-            output_target
+            pub_output
                 .write_all(&public_key_to_pem_bytes(&public_key).map_err(PithosError::Crypt)?)
                 .map_err(PithosError::Io)?;
         }
