@@ -203,9 +203,6 @@ enum AppendCommands {
         /// Path to Pithos file
         #[arg(short, long, value_name = "PITHOS FILE")]
         file: PathBuf,
-        // Readers public key for shared key generation
-        #[arg(long)]
-        reader_public_key: Option<String>,
         /// Input files
         #[arg(value_name = "FILES")]
         files: Vec<PathBuf>,
@@ -283,7 +280,11 @@ fn main() -> Result<(), PithosCliError> {
                     reader.read_file(&fe.path, &directory, cli.output.as_ref(), None)?;
                 }
             }
-            ReadCommands::Data { file, paths, ranges } => {
+            ReadCommands::Data {
+                file,
+                paths,
+                ranges,
+            } => {
                 let key = load_private_key_from_pem(
                     &cli.secret_keys
                         .clone()
@@ -310,7 +311,7 @@ fn main() -> Result<(), PithosCliError> {
                         .expect("Private key expected to read directory"),
                 )?;
                 let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
-                
+
                 println!("{:#?}", reader.read_directory()?);
             }
         },
@@ -369,7 +370,34 @@ fn main() -> Result<(), PithosCliError> {
                 .write_all(&public_key_to_pem_bytes(&public_key).map_err(PithosError::Crypt)?)
                 .map_err(PithosError::Io)?;
         }
-        PithosCommands::Append { .. } => {
+        PithosCommands::Append { command } => {
+            match command {
+                AppendCommands::Readers { .. } => {}
+                AppendCommands::Files { file, files } => {
+                    let sender_key = load_private_key_from_pem(
+                        &cli.secret_keys
+                            .clone()
+                            .expect("Private key expected to append to Pithos file"),
+                    )?;
+                    let reader_keys: Result<Vec<PublicKey>, PithosError> = cli
+                        .public_keys
+                        .expect("At least one recipient expected")
+                        .iter()
+                        .map(load_public_key_from_pem)
+                        .collect();
+
+                    let append_files: Result<Vec<InputFile>, PithosError> =
+                        files.iter().map(InputFile::try_from).collect();
+
+                    let mut writer =
+                        PithosWriter::new_from_file(sender_key, reader_keys?, None, &file)?;
+
+                    // Append files
+                    writer.process_input_files(append_files?)?;
+                    writer.write_directory()?;
+                }
+            }
+
             unimplemented!()
         }
         PithosCommands::Export { file, path, .. } => {
@@ -397,8 +425,13 @@ fn main() -> Result<(), PithosCliError> {
             } else {
                 Box::new(std::io::stdout())
             };
-            
-            reader.read_file_to_crypt4gh(path_str, &directory, reader_keys?, Some(output_target))?;
+
+            reader.read_file_to_crypt4gh(
+                path_str,
+                &directory,
+                reader_keys?,
+                Some(output_target),
+            )?;
         }
     }
 
