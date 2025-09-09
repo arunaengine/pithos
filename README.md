@@ -21,7 +21,7 @@
 
 ## Description
 
-Pithos (a large ancient greek storage container) is a packaging file format for arbitrary data that enhances the use of Object Storage for (research) data management. This is done by combining multiple existing file standards with new enhancements. A format specification can be found [[here]](./spec/SPECIFICATION.md).
+Pithos (a large ancient greek storage container) is a packaging file format for arbitrary data that enhances the use of Object Storage for (research) data management. This is done by combining multiple existing file standards with new enhancements. A format specification can be found [[here]](./spec/PITHOS_1.0.0_draft.md).
 
 ## Features
 
