@@ -1,66 +1,67 @@
 mod io;
-mod structs;
 pub mod utils;
 
-use crate::io::utils::load_key_from_pem;
-use anyhow::{anyhow, Result};
-use async_channel::TryRecvError;
+use crate::io::utils::{load_private_key_from_pem, load_public_key_from_pem};
 use clap::{Parser, Subcommand, ValueEnum};
-use futures_util::StreamExt;
-use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
-use pithos_lib::helpers::footer_parser::{Footer, FooterParser, FooterParserState};
-use pithos_lib::helpers::notifications::{DirOrFileIdx, Message};
-use pithos_lib::helpers::structs::FileContext;
-use pithos_lib::pithos::pithosreader::PithosReader;
-use pithos_lib::pithos::pithoswriter::PithosWriter;
-use pithos_lib::pithos::structs::{
-    DirContextVariants, EndOfFileMetadata, FileContextVariants, EOF_META_LEN,
+use pithos_lib::error::PithosError;
+use pithos_lib::helpers::x25519_keys::{
+    generate_private_key, private_key_to_pem_bytes, public_key_to_pem_bytes,
 };
-use rand::distr::Alphanumeric;
-use rand::Rng;
-use std::fmt::Write;
-use std::io::SeekFrom;
-use std::os::unix::fs::MetadataExt;
+use pithos_lib::io::pithosreader::PithosReaderSimple;
+use pithos_lib::io::pithoswriter::{InputFile, PithosWriter};
+use pithos_lib::model::structs::FileEntry;
+use std::fs::File;
+use std::io::Write;
+use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Semaphore;
-use tokio::{pin, task};
-use tokio_util::io::ReaderStream;
-use tracing::trace;
-use utils::conversion::evaluate_log_level;
+use thiserror::Error;
+use tracing::dispatcher::SetGlobalDefaultError;
+use tracing_subscriber::prelude::*;
+use utils::conversion::{evaluate_log_level, parse_cdc_input, parse_range_input};
+use x25519_dalek::PublicKey;
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Default, ValueEnum)]
 enum KeyFormat {
-    Openssl,
-    Crypt4gh,
-    Raw,
+    #[default]
+    Openssl, // PKCS#8 encoded key in PEM format
+             //Crypt4gh, // Additional encryption of key
+             //Raw,      // Only key bytes
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Default, ValueEnum)]
 enum ExportFormat {
-    Pithos,
+    //Pithos,
+    #[default]
     Crypt4gh,
+    //RoCrate,
 }
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Optionally set the log level
-    #[arg(long, value_name = "LOG_LEVEL")]
+    /// Set the log level
+    #[arg(long, value_name = "LOG_LEVEL", default_value = "Info")]
     log_level: Option<String>,
 
-    /// Optionally set the log file
+    /// Display additional logging information (file, line number, target)
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Set the log file
+    #[arg(long, value_name = "LOG_FILE")]
     log_file: Option<PathBuf>,
 
-    /// Private key for encryption/decryption
-    #[arg(long)]
-    private_key: Option<PathBuf>, // File path; if None -> Default file: ~/.pithos/sec_key.pem
-
     /// Output destination; Default is stdout
-    #[arg(short, long)]
+    #[arg(global = true, short, long)]
     output: Option<PathBuf>,
+
+    /// Private keys for encryption/decryption
+    #[arg(global = true, short, long, alias = "sk")]
+    secret_key: Option<PathBuf>, // File paths; if None -> Default file: ~/.pithos/sec_key.pem
+
+    /// Public keys for encryption/decryption
+    #[arg(global = true, short, long, alias = "pk")]
+    public_keys: Option<Vec<PathBuf>>, // File paths; if None -> Default file: ~/.pithos/pub_key.pem
 
     /// Subcommands
     #[command(subcommand)]
@@ -71,7 +72,8 @@ struct Cli {
 enum PithosCommands {
     /// Create a Pithos file from some input
     Create {
-        /// Expect file metadata in JSON format under 'file-path.meta'
+        /*
+        /// Expect file metadata next to input files with '<input-file>.meta'
         #[arg(short, long)]
         metadata: bool,
         /// Check for files containing custom ranges as CSV
@@ -86,10 +88,19 @@ enum PithosCommands {
         /// Public keys of recipients
         #[arg(long)]
         reader_public_keys: Option<Vec<PathBuf>>, // Iterate files and parse all keys
-
+        */
+        /// Set values for content-defined chunking
+        #[arg(long="cdc", value_parser=parse_cdc_input, value_name = "MIN,AVG,MAX")]
+        cdc: Option<(u32, u32, u32)>,
         /// Input files
         #[arg(value_name = "FILES")]
         files: Vec<PathBuf>,
+    },
+    /// Modify the Pithos footer
+    Append {
+        /// Subcommands
+        #[command(subcommand)]
+        command: AppendCommands,
     },
     /// Read pithos file
     Read {
@@ -97,502 +108,407 @@ enum PithosCommands {
         #[command(subcommand)]
         read_command: ReadCommands,
     },
-    /// Create x25519
-    CreateKeypair {
-        /// Key format; Default is openSSL x25519 pem
+    /// Create keypair
+    Keypair {
+        /// Key format; Default is PKCS#8 encoded x25519 keypair in PEM format
         #[arg(short, long)]
         format: Option<KeyFormat>,
-    },
-    /// Modify the Pithos footer
-    Modify {
-        /// Subcommands
-        #[command(subcommand)]
-        command: Option<ModifyCommands>,
+        /// Key file prefix (e.g. sender -> sender.<sec/pub>.pem)
+        #[arg(short, long)]
+        prefix: Option<String>,
     },
     /// Export a Pithos file into another compatible file format
     Export {
         #[arg(short, long, value_enum)]
-        format: Option<ExportFormat>,
+        format: ExportFormat,
+        /// Input file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Path in Pithos file
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
     },
 }
 
 #[derive(Subcommand)]
 enum ReadCommands {
-    /// Read the technical metadata of the file
+    /// Read the metadata of a specific file
     Info {
         /// Input file
         #[arg(value_name = "FILE")]
         file: PathBuf,
+        /// Path in Pithos file
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
     },
-    /// Read the complete file
+    /// List paths of all available files
+    List {
+        /// Input file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Read data of all available files
     All {
         /// Input file
         #[arg(value_name = "FILE")]
         file: PathBuf,
     },
-    /// Read the data
+    /// Read data of a specific file
     Data {
+        /// Path to Pithos file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Path in Pithos file
+        #[arg(value_name = "PATHS")]
+        paths: Vec<PathBuf>,
+        /// Specific byte ranges in the file
+        #[arg(short, long, value_parser=parse_range_input, value_delimiter=',', value_name = "START:END,...")]
+        ranges: Option<Vec<Range<u64>>>,
+    },
+    /// Read the directory
+    Directory {
         /// Input file
         ///
         ///ToDo: Filter to display only specific entries of the ToC?
         #[arg(value_name = "FILE")]
         file: PathBuf,
     },
-    /// Read the Table of Contents
-    ContentList {
-        /// Input file
-        ///
-        ///ToDo: Filter to display only specific entries of the ToC?
-        #[arg(value_name = "FILE")]
-        file: PathBuf,
-    },
+    /*
     Search {
         /// Extract search hits in output target
         #[arg(short, long)]
         extract: bool,
-        /// Output destination; Default is stdout
-        #[arg(short, long)]
-        output: Option<PathBuf>,
         /// Fuzzy search or exact
         #[arg(short, long)]
         fuzzy_search: bool,
-
         /// Input file
-        ///
         ///ToDo: Filter to display only specific entries of the ToC?
         #[arg(value_name = "FILE")]
         file: PathBuf,
     },
+    */
 }
 
 #[derive(Subcommand)]
-enum ModifyCommands {
-    /// Add a reader to the encryption metadata
-    AddReader {
-        // Readers public key for shared key generation
-        #[arg(long)]
-        reader_public_key: Option<String>,
+enum AppendCommands {
+    /// Add one or multiple readers to the encryption section
+    Readers {
+        // List of file ids the readers shall get access to
+        #[arg(short, long)]
+        ids: Option<Vec<u64>>,
+        /// Path to Pithos file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
     },
-    /// Set all readers in the encryption metadata
-    SetReaders {
-        // List of public keys for encryption packe generation
-        #[arg(long)]
-        reader_public_keys: Option<Vec<String>>,
+    /// Add files to an existing Pithos container
+    Files {
+        /// Path to Pithos file
+        #[arg(short, long, value_name = "PITHOS FILE")]
+        file: PathBuf,
+        /// Input files
+        #[arg(value_name = "FILES")]
+        files: Vec<PathBuf>,
     },
 }
 
+#[derive(Error, Debug)]
+pub enum PithosCliError {
+    #[error("Writer Error: {0}")]
+    TracingError(#[from] SetGlobalDefaultError),
+    #[error("Invalid argument: {0}")]
+    InvalidArgumentError(String),
+    #[error("Pithos Error: {0}")]
+    PithosError(#[from] PithosError),
+}
+
 #[tracing::instrument(level = "trace", skip())]
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<(), PithosCliError> {
     // Parse CLI parameter input
     let cli = Cli::parse();
 
-    // Evaluate provided log level
-    let log_level = evaluate_log_level(cli.log_level);
+    // Initialize tracing logger
+    let logging_filter = evaluate_log_level(cli.log_level);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .compact()
+        .with_file(cli.verbose)
+        .with_line_number(cli.verbose)
+        .with_target(cli.verbose)
+        .with_filter(logging_filter);
 
-    // Initialize logger
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .compact()
-            .with_max_level(log_level)
-            .with_file(true)
-            .with_line_number(true)
-            .with_target(false)
-            .finish(),
-    )?;
-
-    // Load private key if provided
-    let private_key = if let Some(key_path) = cli.private_key {
-        Some(load_key_from_pem(&key_path, true)?)
-    } else if let Ok(key_bytes) =
-        load_key_from_pem(&PathBuf::from("~/.pithos/private_key.pem"), true)
-    {
-        Some(key_bytes)
-    } else {
-        None
-    };
+    tracing_subscriber::registry().with(fmt_layer).init();
 
     // Evaluate subcommand
     match cli.command {
         PithosCommands::Read { read_command } => match read_command {
-            ReadCommands::Info { file } => {
-                // Open file
-                let mut input_file = File::open(file).await?;
-
-                // Read EndOfFileMetadata bytes
-                input_file
-                    .seek(SeekFrom::Start(
-                        input_file.metadata().await?.len() - EOF_META_LEN as u64,
-                    ))
-                    .await?;
-                let mut buf = [0; EOF_META_LEN];
-                input_file.read_exact(&mut buf).await?;
-
-                // Try to parse EndOfFileMetadata
-                let eof_meta: EndOfFileMetadata = borsh::from_slice(&buf)?;
-
-                println!("{eof_meta}");
-
-                //ToDo: OutputWriter
-            }
-            ReadCommands::All { .. } => {
-
-                //ToDo: Ranges & Metadata individual files
-            }
-            ReadCommands::Data { file } => {
-                // Parse Footer
-                let mut input_file = File::open(file.clone()).await?;
-                let file_meta = input_file.metadata().await?;
-
-                let footer_prediction = if file_meta.len() < 65536 * 2 {
-                    file_meta.len() // 131072 always fits in i64 ...
-                } else {
-                    65536 * 2
-                };
-
-                // Read footer bytes in FooterParser
-                input_file
-                    .seek(SeekFrom::End(-(footer_prediction as i64)))
-                    .await?;
-                let buf = &mut vec![0; footer_prediction as usize]; // Has to be vec as length is defined by dynamic value
-                input_file.read_exact(buf).await?;
-
-                let mut parser = FooterParser::new(buf)?;
-                if let Some(p_key) = private_key.as_ref() {
-                    parser = parser.add_recipient(p_key)
-                };
-                parser = parser.parse()?;
-
-                // Check if bytes are missing
-                let mut missing_buf;
-                if let FooterParserState::Missing(missing_bytes) = parser.state {
-                    let needed_bytes = footer_prediction + missing_bytes as u64;
-                    input_file
-                        .seek(SeekFrom::End(-(needed_bytes as i64)))
-                        .await?;
-                    missing_buf = vec![0; missing_bytes as usize]; // Has to be vec as length is defined by dynamic value
-                    input_file.read_exact(&mut missing_buf).await?;
-
-                    parser = parser.add_bytes(&missing_buf)?;
-                    parser = parser.parse()?
+            ReadCommands::Info { file, path } => {
+                let path_str = path
+                    .to_str()
+                    .expect("No inner path provided or path contains invalid UTF-8");
+                let key = load_private_key_from_pem(
+                    &cli.secret_key
+                        .clone()
+                        .expect("Private key expected to read directory"),
+                )?;
+                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
+                let (directory, _) = reader.read_directory()?;
+                match directory.get_file_by_path(path_str) {
+                    Some(entry) => println!("{entry}"),
+                    None => Err(PithosError::FileNotFound(path_str.to_string()))?,
                 }
-
-                // Parse the footer bytes and display Table of Contents
-                let footer: Footer = parser.try_into()?;
-
-                // Output target ... ?
-                let base_path = Arc::new(PathBuf::from(
-                    cli.output
-                        .ok_or_else(|| anyhow!("No output target provided"))?,
-                ));
-
-                // Create directory structure
-                for dir in footer.table_of_contents.directories {
-                    if let DirContextVariants::DirDecrypted(dir_ctx) = dir {
-                        //ToDo: Sanitize file path
-                        tokio::fs::create_dir(base_path.clone().join(dir_ctx.file_path)).await?;
-                    }
-                }
-
-                // Create PithosReader for each file
-                let sem = Arc::new(Semaphore::new(16));
-                let mut process_handles = Vec::with_capacity(footer.table_of_contents.files.len());
-
-                let keys = footer
-                    .encryption_keys
-                    .map(|keys| {
-                        keys.keys
-                            .iter()
-                            .filter_map(|(k, idx)| {
-                                if let DirOrFileIdx::File(i) = idx {
-                                    Some((k.clone(), *i))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-
-                let m = Arc::new(MultiProgress::new());
-                let style = ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                    ?
-                    .with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
-                    .progress_chars("#>-");
-
-                for (idx, file_ctx_variant) in
-                    footer.table_of_contents.files.into_iter().enumerate()
-                {
-                    let permit = Arc::clone(&sem).acquire_owned().await;
-                    let base_path_clone = Arc::clone(&base_path);
-                    let file_clone = file.clone();
-                    let key_clone = keys.clone();
-                    let style = style.clone();
-                    let m = m.clone();
-                    if let FileContextVariants::FileDecrypted(file_ctx) = file_ctx_variant {
-                        process_handles.push(task::spawn(async move {
-                            let _permit = permit;
-                            trace!(base = ?base_path_clone);
-
-                            let file_path = base_path_clone
-                                .join(file_ctx.file_path.to_string().trim_start_matches('/'));
-
-                            trace!(file_path = ?file_path, "Processing file");
-                            let file_handle = File::create(&file_path).await?;
-
-                            // Open pithos file handle and read file range
-                            let mut pithos_file = File::open(file_clone).await?;
-                            pithos_file
-                                .seek(SeekFrom::Start(file_ctx.file_start))
-                                .await?;
-
-                            let disk_size: usize =
-                                (file_ctx.file_end - file_ctx.file_start).try_into()?;
-
-                            let pb = m.add(ProgressBar::new(disk_size as u64));
-                            pb.set_style(style);
-
-                            // Send at least file_ctx.compressed_size bytes pithos_file
-                            let (data_sender, data_receiver) = async_channel::bounded(3);
-                            tokio::spawn(async move {
-                                let mut remaining = disk_size;
-                                let mut input_stream = ReaderStream::new(pithos_file);
-                                while let Some(bytes) = input_stream.next().await {
-                                    let mut bytes = bytes?;
-                                    pb.inc(bytes.len() as u64);
-                                    if bytes.len() < remaining {
-                                        remaining = remaining.saturating_sub(bytes.len());
-                                        data_sender.send(Ok(bytes)).await?;
-                                    } else {
-                                        data_sender
-                                            .send(Ok(bytes.split_to(remaining as usize)))
-                                            .await?;
-                                        break;
-                                    }
-                                }
-                                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-                            });
-
-                            // Generate FileContext without encryption keys
-                            let ctx = file_ctx.try_into_file_context(idx)?;
-
-                            pin!(data_receiver);
-                            let mut reader = PithosReader::new_with_writer(
-                                data_receiver,
-                                file_handle,
-                                ctx,
-                                key_clone,
-                                None,
-                            )
-                            .await?;
-                            reader.process_bytes().await?;
-
-                            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-                        }));
-                    }
-                }
-
-                // Await all readers
-                futures::future::join_all(process_handles)
-                    .await
-                    .into_iter()
-                    .for_each(|e| e.unwrap().unwrap());
             }
-            ReadCommands::ContentList { file } => {
-                // Parse Footer
-                let mut input_file = File::open(file.clone()).await?;
-                let file_meta = input_file.metadata().await?;
-
-                let footer_prediction = if file_meta.len() < 65536 * 2 {
-                    file_meta.len() // 131072 always fits in i64 ...
-                } else {
-                    65536 * 2
-                };
-
-                // Read footer bytes in FooterParser
-                input_file
-                    .seek(SeekFrom::End(-(footer_prediction as i64)))
-                    .await?;
-                let buf = &mut vec![0; footer_prediction as usize]; // Has to be vec as length is defined by dynamic value
-                input_file.read_exact(buf).await?;
-
-                let mut parser = FooterParser::new(buf)?;
-                if let Some(p_key) = private_key.as_ref() {
-                    parser = parser.add_recipient(p_key)
-                };
-                parser = parser.parse()?;
-
-                // Check if bytes are missing
-                let mut missing_buf;
-                if let FooterParserState::Missing(missing_bytes) = parser.state {
-                    let needed_bytes = footer_prediction + missing_bytes as u64;
-                    input_file
-                        .seek(SeekFrom::End(-(needed_bytes as i64)))
-                        .await?;
-                    missing_buf = vec![0; missing_bytes as usize]; // Has to be vec as length is defined by dynamic value
-                    input_file.read_exact(&mut missing_buf).await?;
-
-                    parser = parser.add_bytes(&missing_buf)?;
-                    parser = parser.parse()?
-                }
-
-                // Parse the footer bytes and display Table of Contents
-                let footer: Footer = parser.try_into()?;
-                println!("{:#?}", footer.table_of_contents);
-
-                //TODO: Output writer
-            }
-            ReadCommands::Search { .. } => {}
-        },
-        PithosCommands::Create {
-            metadata: _,
-            range_files: _,
-            auto_generate_ranges: _,
-            ranges_regex: _,
-            files,
-            reader_public_keys,
-        } => {
-            // Generate random symmetric "key" for encryption
-            let key: [u8; 32] = rand::rng()
-                .sample_iter(&Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect::<String>()
-                .to_ascii_lowercase()
-                .as_bytes()
-                .try_into()?;
-
-            // Load public keys from pem files
-            let recipient_keys: Result<Vec<_>> = reader_public_keys
-                .unwrap_or_default()
-                .iter()
-                .map(|pk| load_key_from_pem(pk, false))
-                .collect();
-            let recipient_keys = recipient_keys?;
-
-            // Create file context and data stream
-            let (ctx_sender, ctx_receiver) = async_channel::unbounded(); // Channel cap?
-            let (stream_sender, stream_receiver) = async_channel::bounded(10); // Channel cap?
-
-            let pb = Arc::new(ProgressBar::new(
-                files
+            ReadCommands::List { file } => {
+                let key = load_private_key_from_pem(
+                    &cli.secret_key
+                        .clone()
+                        .expect("Private key expected to read directory"),
+                )?;
+                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
+                let (directory, _) = reader.read_directory()?;
+                directory
+                    .files
                     .iter()
-                    .map(|f| f.metadata().map(|m| m.size()).unwrap_or(0))
-                    .sum::<u64>(),
-            ));
-            pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                ?
-                .with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
-                .progress_chars("#>-"));
+                    .for_each(|f| println!("{} {:?} {}", f.file_id, f.file_type, f.path))
+            }
+            ReadCommands::All { file } => {
+                let key = load_private_key_from_pem(
+                    &cli.secret_key
+                        .clone()
+                        .expect("Private key expected to read directory"),
+                )?;
+                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
+                let (directory, _) = reader.read_directory()?;
 
-            // Async send the file contexts
-            tokio::spawn(async move {
-                for (i, file_path) in files.iter().enumerate() {
-                    let (file_context, stream_reader) = FileContext::from_meta(
-                        i,
-                        file_path,
-                        (Some(key), Some(key)),
-                        recipient_keys.clone(),
-                    )
-                    .await?;
-
-                    ctx_sender.send(Message::FileContext(file_context)).await?;
-                    stream_sender.send(stream_reader).await?;
+                for fe in directory.files.iter() {
+                    reader.read_file(&fe.path, &directory, cli.output.as_ref(), None)?;
                 }
+            }
+            ReadCommands::Data {
+                file,
+                paths,
+                ranges,
+            } => {
+                let key = load_private_key_from_pem(
+                    &cli.secret_key
+                        .clone()
+                        .expect("Private key expected to read directory"),
+                )?;
 
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-            });
+                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
+                let (directory, _) = reader.read_directory()?;
 
-            let pb_clone = pb.clone();
-
-            // Send all file data into channel
-            let (data_sender, data_receiver) = async_channel::bounded(100); // Channel cap?
-            tokio::spawn(async move {
-                loop {
-                    match stream_receiver.try_recv() {
-                        Ok(mut input_stream) => {
-                            while let Some(bytes) = input_stream.next().await {
-                                pb_clone.inc(bytes.as_ref().map(|a| a.len()).unwrap_or(0) as u64);
-                                data_sender.send(Ok(bytes?)).await?
-                            }
-                        }
-                        Err(TryRecvError::Empty) => {
-                            // Do nothing. Try again.
-                        }
-                        Err(TryRecvError::Closed) => break, // No more input streams available
-                    }
+                for path in paths {
+                    reader.read_file(
+                        path.to_str()
+                            .expect("No inner path provided or path contains invalid UTF-8"),
+                        &directory,
+                        cli.output.as_ref(),
+                        ranges.clone(),
+                    )?;
                 }
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-            });
-            pin!(data_receiver);
+            }
+            ReadCommands::Directory { file } => {
+                let key = load_private_key_from_pem(
+                    &cli.secret_key
+                        .clone()
+                        .expect("Private key expected to read directory"),
+                )?;
+                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
 
-            // Init default PithosWriter with standard Transformers
-            let mut writer = if let Some(output_path) = cli.output {
-                PithosWriter::new_with_writer(
-                    data_receiver,
-                    File::create(output_path).await?,
-                    ctx_receiver,
-                    private_key,
-                )
-                .await?
+                println!("{:#?}", reader.read_directory()?);
+            }
+        },
+        PithosCommands::Create { cdc, files } => {
+            if files.is_empty() {
+                return Err(PithosCliError::InvalidArgumentError(
+                    "No files provided".to_string(),
+                ));
+            }
+
+            let output = if let Some(outfile) = cli.output {
+                File::create(outfile).map_err(PithosError::Io)?
             } else {
-                PithosWriter::new_with_writer(
-                    data_receiver,
-                    tokio::io::stdout(),
-                    ctx_receiver,
-                    private_key,
-                )
-                .await?
+                // Default outfile
+                println!("No outfile specified, writing output to \"/tmp/out.pithos\""); //TODO: Replace with tracing::warn!()
+                File::create("/tmp/out.pithos").map_err(PithosError::Io)?
             };
-            writer.process_bytes().await?;
+
+            let sender_key = load_private_key_from_pem(
+                &cli.secret_key
+                    .clone()
+                    .expect("Private key expected to create Pithos file"),
+            )?;
+            let reader_keys: Result<Vec<PublicKey>, PithosError> = cli
+                .public_keys
+                .expect("At least one recipient expected")
+                .iter()
+                .map(load_public_key_from_pem)
+                .collect();
+
+            let input_files: Result<Vec<InputFile>, PithosError> =
+                files.iter().map(InputFile::try_from).collect();
+            let mut writer = PithosWriter::new(sender_key, reader_keys?, cdc, Box::new(output))?;
+
+            tracing::info!("Start creating Pithos file");
+            writer
+                .write_file_header()
+                .map_err(PithosError::Serialization)?;
+            writer.process_input_files(input_files?)?;
+            writer.write_directory()?;
         }
-        PithosCommands::CreateKeypair { format } => {
-            // x25519 openSSL keypair
-            // x25519 Crypt4GH keypair
-            // Output format parameter?
-            //  - Raw
-            //  - Pem
-            //  - ?
-
-            // Evaluate output format
-            let format = format.as_ref().unwrap_or(&KeyFormat::Openssl);
-
-            // Generate keypair
-            let (seckey_bytes, pubkey_bytes) = match format {
-                KeyFormat::Openssl => {
-                    let openssl_keypair = openssl::pkey::PKey::generate_x25519()?;
-                    (
-                        openssl_keypair.private_key_to_pem_pkcs8()?,
-                        openssl_keypair.public_key_to_pem()?,
-                    )
-                }
-                KeyFormat::Crypt4gh => {
-                    unimplemented!("Crypt4GH key generation not yet implemented")
-                }
-                KeyFormat::Raw => {
-                    let openssl_keypair = openssl::pkey::PKey::generate_x25519()?;
-                    (
-                        openssl_keypair.raw_private_key()?,
-                        openssl_keypair.raw_public_key()?,
-                    )
-                }
-            };
+        PithosCommands::Keypair { prefix, .. } => {
+            let private_key = generate_private_key().map_err(PithosError::Crypt)?;
+            let public_key = PublicKey::from(&private_key);
+            let prefix = prefix.unwrap_or("pithos_key".to_string());
 
             // Write output
-            if let Some(dest) = cli.output {
-                let mut output_target = File::create(dest).await?;
-                output_target.write_all(&seckey_bytes).await?;
-                output_target.write_all(&pubkey_bytes).await?;
-            } else {
-                let mut output_target = tokio::io::stdout();
-                output_target.write_all(&seckey_bytes).await?;
-                output_target.write_all(&pubkey_bytes).await?;
-            }
+            let (mut sec_output, mut pub_output): (Box<dyn Write>, Box<dyn Write>) =
+                if let Some(dest) = cli.output {
+                    let (sec_target, pub_target) = if dest.is_dir() {
+                        (
+                            &dest.join(format!("{prefix}.sec.pem")),
+                            &dest.join(format!("{prefix}.pub.pem")),
+                        )
+                    } else {
+                        (&dest, &dest)
+                    };
+                    (
+                        Box::new(File::create(sec_target).map_err(PithosError::Io)?),
+                        Box::new(File::create(pub_target).map_err(PithosError::Io)?),
+                    )
+                } else {
+                    (Box::new(std::io::stdout()), Box::new(std::io::stdout()))
+                };
+
+            sec_output
+                .write_all(&private_key_to_pem_bytes(&private_key).map_err(PithosError::Crypt)?)
+                .map_err(PithosError::Io)?;
+            pub_output
+                .write_all(&public_key_to_pem_bytes(&public_key).map_err(PithosError::Crypt)?)
+                .map_err(PithosError::Io)?;
         }
-        PithosCommands::Modify { .. } => {}
-        PithosCommands::Export { .. } => {}
+        PithosCommands::Append { command } => {
+            match command {
+                AppendCommands::Readers { file, ids } => {
+                    let sender_key = load_private_key_from_pem(
+                        &cli.secret_key
+                            .clone()
+                            .expect("Private key expected to append to Pithos file"),
+                    )?;
+                    let reader_keys_result: Result<Vec<PublicKey>, PithosError> = cli
+                        .public_keys
+                        .expect("At least one recipient expected")
+                        .iter()
+                        .map(load_public_key_from_pem)
+                        .collect();
+                    let reader_keys = reader_keys_result?;
+
+                    let mut reader = PithosReaderSimple::new_with_key(&file, sender_key.clone())?;
+                    let (directory, _) = reader.read_directory()?;
+
+                    let mut fes = vec![];
+                    if let Some(ids) = ids {
+                        for id in ids {
+                            fes.push(directory.get_file_by_id(id).ok_or(
+                                PithosError::FileNotFound(format!(
+                                    "File with id {id} not available."
+                                )),
+                            )?);
+                        }
+                    }
+                    if fes.is_empty() {
+                        return Err(PithosCliError::InvalidArgumentError(
+                            "No available id or path provided".to_string(),
+                        ));
+                    }
+
+                    let mut writer = PithosWriter::new_from_file(
+                        sender_key.clone(),
+                        reader_keys.clone(),
+                        None,
+                        &file,
+                    )?;
+
+                    let directory = writer.get_directory_mut();
+                    for fe in fes {
+                        let enc_key = directory.get_file_encryption_key(fe.file_id).ok_or(
+                            PithosError::Other(format!(
+                                "Could not extract encryption key for file {}",
+                                fe.file_id
+                            )),
+                        )?;
+
+                        for reader in &reader_keys {
+                            directory.add_file_to_recipient(
+                                &sender_key,
+                                reader,
+                                (fe.file_id, enc_key),
+                            )?;
+                        }
+                    }
+
+                    writer.write_directory()?
+                }
+                AppendCommands::Files { file, files } => {
+                    let sender_key = load_private_key_from_pem(
+                        &cli.secret_key
+                            .clone()
+                            .expect("Private key expected to append to Pithos file"),
+                    )?;
+                    let reader_keys: Result<Vec<PublicKey>, PithosError> = cli
+                        .public_keys
+                        .expect("At least one recipient expected")
+                        .iter()
+                        .map(load_public_key_from_pem)
+                        .collect();
+
+                    let append_files: Result<Vec<InputFile>, PithosError> =
+                        files.iter().map(InputFile::try_from).collect();
+
+                    let mut writer =
+                        PithosWriter::new_from_file(sender_key, reader_keys?, None, &file)?;
+
+                    // Append files
+                    writer.process_input_files(append_files?)?;
+                    writer.write_directory()?;
+                }
+            }
+
+            unimplemented!()
+        }
+        PithosCommands::Export { file, path, .. } => {
+            let path_str = path
+                .to_str()
+                .expect("No inner path provided or path contains invalid UTF-8");
+            let sender_key = load_private_key_from_pem(
+                &cli.secret_key
+                    .clone()
+                    .expect("Private key expected to create Pithos file"),
+            )?;
+            let reader_keys: Result<Vec<PublicKey>, PithosError> = cli
+                .public_keys
+                .expect("At least one recipient expected")
+                .iter()
+                .map(load_public_key_from_pem)
+                .collect();
+
+            let mut reader = PithosReaderSimple::new_with_key(&file, sender_key)?;
+            let (directory, _) = reader.read_directory()?;
+
+            // Write output
+            let output_target: Box<dyn Write> = if let Some(dest) = cli.output {
+                Box::new(std::fs::File::create(dest).map_err(PithosError::Io)?)
+            } else {
+                Box::new(std::io::stdout())
+            };
+
+            reader.read_file_to_crypt4gh(
+                path_str,
+                &directory,
+                reader_keys?,
+                Some(output_target),
+            )?;
+        }
     }
 
-    // Continued program logic goes here...
     Ok(())
 }
