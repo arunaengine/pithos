@@ -268,7 +268,7 @@ fn main() -> Result<(), PithosCliError> {
                 directory
                     .files
                     .iter()
-                    .for_each(|f| println!("{:?} | {}", f.file_type, f.path))
+                    .for_each(|f| println!("{} {:?} {}", f.file_id, f.file_type, f.path))
             }
             ReadCommands::All { file } => {
                 let key = load_private_key_from_pem(
