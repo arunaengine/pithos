@@ -228,13 +228,6 @@ impl Directory {
 
     #[tracing::instrument(level = "trace", skip(self, file_entry))]
     pub fn add_file_to_index(&mut self, file_entry: &FileEntry) -> Result<(), PithosError> {
-        // Check for file_id or path duplicates
-        for file in &self.files {
-            if file.file_id == file_entry.file_id || file.path == file_entry.path {
-                return Err(PithosError::PathOccupied(file_entry.path.clone()));
-            }
-        }
-
         self.files.push(file_entry.clone());
         Ok(())
     }

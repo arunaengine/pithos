@@ -148,8 +148,8 @@ enum ReadCommands {
         #[arg(value_name = "FILE")]
         file: PathBuf,
         /// Path in Pithos file
-        #[arg(value_name = "PATH")]
-        path: PathBuf,
+        #[arg(value_name = "PATHS")]
+        paths: Vec<PathBuf>,
         /// Specific byte ranges in the file
         #[arg(short, long, value_parser=parse_range_input, value_delimiter=',', value_name = "START:END,...")]
         ranges: Option<Vec<Range<u64>>>,
@@ -204,14 +204,6 @@ enum AppendCommands {
         #[arg(value_name = "FILES")]
         files: Vec<PathBuf>,
     },
-    /*
-    /// Set all readers in the encryption metadata
-    SetReaders {
-        // List of public keys for encryption packe generation
-        #[arg(long)]
-        reader_public_keys: Option<Vec<String>>,
-    },
-    */
 }
 
 #[derive(Error, Debug)]
@@ -285,7 +277,7 @@ fn main() -> Result<(), PithosCliError> {
                     reader.read_file(&fe.path, &directory, cli.output.as_ref(), None)?;
                 }
             }
-            ReadCommands::Data { file, path, ranges } => {
+            ReadCommands::Data { file, paths, ranges } => {
                 let key = load_private_key_from_pem(
                     &cli.secret_keys
                         .clone()
@@ -295,13 +287,15 @@ fn main() -> Result<(), PithosCliError> {
                 let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
                 let (directory, _) = reader.read_directory()?;
 
-                reader.read_file(
-                    path.to_str()
-                        .expect("No inner path provided or path contains invalid UTF-8"),
-                    &directory,
-                    cli.output.as_ref(),
-                    ranges,
-                )?;
+                for path in paths {
+                    reader.read_file(
+                        path.to_str()
+                            .expect("No inner path provided or path contains invalid UTF-8"),
+                        &directory,
+                        cli.output.as_ref(),
+                        ranges.clone(),
+                    )?;
+                }
             }
             ReadCommands::Directory { file } => {
                 let key = load_private_key_from_pem(
@@ -310,12 +304,9 @@ fn main() -> Result<(), PithosCliError> {
                         .expect("Private key expected to read directory"),
                 )?;
                 let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
+                
                 println!("{:#?}", reader.read_directory()?);
-            } /*
-              ReadCommands::Search { .. } => {
-                  unimplemented!("Pithos CLI currently doesn't support search")
-              }
-              */
+            }
         },
         PithosCommands::Create { cdc, files } => {
             if files.is_empty() {
