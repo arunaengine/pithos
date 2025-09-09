@@ -9,6 +9,8 @@ use pithos_lib::helpers::x25519_keys::{
 };
 use pithos_lib::io::pithosreader::PithosReaderSimple;
 use pithos_lib::io::pithoswriter::{InputFile, PithosWriter};
+use pithos_lib::model::structs::FileEntry;
+use std::fs::File;
 use std::io::Write;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -98,7 +100,7 @@ enum PithosCommands {
     Append {
         /// Subcommands
         #[command(subcommand)]
-        command: Option<AppendCommands>,
+        command: AppendCommands,
     },
     /// Read pithos file
     Read {
@@ -191,12 +193,9 @@ enum ReadCommands {
 enum AppendCommands {
     /// Add one or multiple readers to the encryption section
     Readers {
-        // Readers public key for shared key generation
-        #[arg(long)]
-        reader_public_key: Option<String>,
         // List of file ids the readers shall get access to
         #[arg(short, long)]
-        file_ids: Option<Vec<u64>>,
+        ids: Option<Vec<u64>>,
         /// Path to Pithos file
         #[arg(value_name = "FILE")]
         file: PathBuf,
@@ -389,7 +388,77 @@ fn main() -> Result<(), PithosCliError> {
         }
         PithosCommands::Append { command } => {
             match command {
-                AppendCommands::Readers { .. } => {}
+                AppendCommands::Readers { file, ids } => {
+                    let sender_key = load_private_key_from_pem(
+                        &cli.secret_key
+                            .clone()
+                            .expect("Private key expected to append to Pithos file"),
+                    )?;
+                    let reader_keys_result: Result<Vec<PublicKey>, PithosError> = cli
+                        .public_keys
+                        .expect("At least one recipient expected")
+                        .iter()
+                        .map(load_public_key_from_pem)
+                        .collect();
+                    let reader_keys = reader_keys_result?;
+
+                    let mut reader = PithosReaderSimple::new_with_key(&file, sender_key.clone())?;
+                    let (directory, _) = reader.read_directory()?;
+
+                    let mut fes = vec![];
+                    if let Some(ids) = ids {
+                        let id_fes: Result<Vec<&FileEntry>, PithosError> = ids
+                            .iter()
+                            .map(|id| {
+                                directory
+                                    .get_file_by_id(*id)
+                                    .ok_or(PithosError::FileNotFound(format!(
+                                        "File with id {id} not available."
+                                    )))
+                            })
+                            .collect();
+
+                        for id in ids {
+                            fes.push(directory.get_file_by_id(id).ok_or(
+                                PithosError::FileNotFound(format!(
+                                    "File with id {id} not available."
+                                )),
+                            )?);
+                        }
+                    }
+                    if fes.is_empty() {
+                        return Err(PithosCliError::InvalidArgumentError(
+                            "No available id or path provided".to_string(),
+                        ));
+                    }
+
+                    let mut writer = PithosWriter::new_from_file(
+                        sender_key.clone(),
+                        reader_keys.clone(),
+                        None,
+                        &file,
+                    )?;
+
+                    let directory = writer.get_directory_mut();
+                    for fe in fes {
+                        let enc_key = directory.get_file_encryption_key(fe.file_id).ok_or(
+                            PithosError::Other(format!(
+                                "Could not extract encryption key for file {}",
+                                fe.file_id
+                            )),
+                        )?;
+
+                        for reader in &reader_keys {
+                            directory.add_file_to_recipient(
+                                &sender_key,
+                                reader,
+                                (fe.file_id, enc_key),
+                            )?;
+                        }
+                    }
+
+                    writer.write_directory()?
+                }
                 AppendCommands::Files { file, files } => {
                     let sender_key = load_private_key_from_pem(
                         &cli.secret_keys
