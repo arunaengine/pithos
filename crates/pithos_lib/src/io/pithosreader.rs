@@ -203,7 +203,7 @@ impl PithosReaderSimple {
         &mut self,
         inner_path: &str,
         directory: &Directory,
-        reader_keys: Vec<&PublicKey>,
+        reader_keys: Vec<PublicKey>,
         output: Option<Box<dyn Write>>,
     ) -> Result<(), PithosError> {
         // Fetch file entry from directory

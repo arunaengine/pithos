@@ -169,7 +169,7 @@ fn test_read_to_crypt4gh() {
         .read_file_to_crypt4gh(
             "t8.shakespeare.txt",
             &directory,
-            vec![&recipient_key],
+            vec![recipient_key],
             Some(crypt4gh_output),
         )
         .unwrap();

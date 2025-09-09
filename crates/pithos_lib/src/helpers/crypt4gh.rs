@@ -69,13 +69,13 @@ impl HeaderPacket {
     #[tracing::instrument(level = "trace", skip(sender_key, reader_keys, data_key))]
     pub fn from_pithos(
         sender_key: &StaticSecret,
-        reader_keys: Vec<&PublicKey>,
+        reader_keys: Vec<PublicKey>,
         data_key: &[u8; 32],
     ) -> Result<Vec<HeaderPacket>, Crypt4GHError> {
         let sender_pubkey = PublicKey::from(sender_key);
         let mut header_packets = vec![];
         for reader in reader_keys {
-            let session_key = sender_key.diffie_hellman(reader);
+            let session_key = sender_key.diffie_hellman(&reader);
             let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
             let mut packet_data =
                 PacketData::Decrypted(vec![Packet::Encryption(EncryptionPacket {

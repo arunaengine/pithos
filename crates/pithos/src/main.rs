@@ -28,10 +28,10 @@ enum KeyFormat {
 
 #[derive(Clone, Default, ValueEnum)]
 enum ExportFormat {
+    //Pithos,
     #[default]
-    Pithos,
     Crypt4gh,
-    RoCrate,
+    //RoCrate,
 }
 
 #[derive(Parser)]
@@ -115,7 +115,13 @@ enum PithosCommands {
     /// Export a Pithos file into another compatible file format
     Export {
         #[arg(short, long, value_enum)]
-        format: Option<ExportFormat>,
+        format: ExportFormat,
+        /// Input file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Path in Pithos file
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
     },
 }
 
@@ -366,9 +372,33 @@ fn main() -> Result<(), PithosCliError> {
         PithosCommands::Append { .. } => {
             unimplemented!()
         }
-        PithosCommands::Export { format } => {
-            if let Some(format) = format {}
-            unimplemented!("Export to different formats is not yet implemented")
+        PithosCommands::Export { file, path, .. } => {
+            let path_str = path
+                .to_str()
+                .expect("No inner path provided or path contains invalid UTF-8");
+            let sender_key = load_private_key_from_pem(
+                &cli.secret_keys
+                    .clone()
+                    .expect("Private key expected to create Pithos file"),
+            )?;
+            let reader_keys: Result<Vec<PublicKey>, PithosError> = cli
+                .public_keys
+                .expect("At least one recipient expected")
+                .iter()
+                .map(load_public_key_from_pem)
+                .collect();
+
+            let mut reader = PithosReaderSimple::new_with_key(&file, sender_key)?;
+            let (directory, _) = reader.read_directory()?;
+
+            // Write output
+            let output_target: Box<dyn Write> = if let Some(dest) = cli.output {
+                Box::new(std::fs::File::create(dest).map_err(PithosError::Io)?)
+            } else {
+                Box::new(std::io::stdout())
+            };
+            
+            reader.read_file_to_crypt4gh(path_str, &directory, reader_keys?, Some(output_target))?;
         }
     }
 
