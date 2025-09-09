@@ -39,15 +39,15 @@ enum ExportFormat {
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Optionally set the log level
+    /// Set the log level
     #[arg(long, value_name = "LOG_LEVEL", default_value = "Info")]
     log_level: Option<String>,
 
-    /// Optionally set the log level
+    /// Display additional logging information (file, line number, target)
     #[arg(short, long)]
     verbose: bool,
 
-    /// Optionally set the log file
+    /// Set the log file
     #[arg(long, value_name = "LOG_FILE")]
     log_file: Option<PathBuf>,
 
@@ -57,7 +57,7 @@ struct Cli {
 
     /// Private keys for encryption/decryption
     #[arg(global = true, short, long, alias = "sk")]
-    secret_keys: Option<PathBuf>, // File paths; if None -> Default file: ~/.pithos/sec_key.pem
+    secret_key: Option<PathBuf>, // File paths; if None -> Default file: ~/.pithos/sec_key.pem
 
     /// Public keys for encryption/decryption
     #[arg(global = true, short, long, alias = "pk")]
@@ -245,7 +245,7 @@ fn main() -> Result<(), PithosCliError> {
                     .to_str()
                     .expect("No inner path provided or path contains invalid UTF-8");
                 let key = load_private_key_from_pem(
-                    &cli.secret_keys
+                    &cli.secret_key
                         .clone()
                         .expect("Private key expected to read directory"),
                 )?;
@@ -258,7 +258,7 @@ fn main() -> Result<(), PithosCliError> {
             }
             ReadCommands::List { file } => {
                 let key = load_private_key_from_pem(
-                    &cli.secret_keys
+                    &cli.secret_key
                         .clone()
                         .expect("Private key expected to read directory"),
                 )?;
@@ -271,7 +271,7 @@ fn main() -> Result<(), PithosCliError> {
             }
             ReadCommands::All { file } => {
                 let key = load_private_key_from_pem(
-                    &cli.secret_keys
+                    &cli.secret_key
                         .clone()
                         .expect("Private key expected to read directory"),
                 )?;
@@ -288,7 +288,7 @@ fn main() -> Result<(), PithosCliError> {
                 ranges,
             } => {
                 let key = load_private_key_from_pem(
-                    &cli.secret_keys
+                    &cli.secret_key
                         .clone()
                         .expect("Private key expected to read directory"),
                 )?;
@@ -308,7 +308,7 @@ fn main() -> Result<(), PithosCliError> {
             }
             ReadCommands::Directory { file } => {
                 let key = load_private_key_from_pem(
-                    &cli.secret_keys
+                    &cli.secret_key
                         .clone()
                         .expect("Private key expected to read directory"),
                 )?;
@@ -325,15 +325,15 @@ fn main() -> Result<(), PithosCliError> {
             }
 
             let output = if let Some(outfile) = cli.output {
-                std::fs::File::create(outfile).map_err(PithosError::Io)?
+                File::create(outfile).map_err(PithosError::Io)?
             } else {
                 // Default outfile
                 println!("No outfile specified, writing output to \"/tmp/out.pithos\""); //TODO: Replace with tracing::warn!()
-                std::fs::File::create("/tmp/out.pithos").map_err(PithosError::Io)?
+                File::create("/tmp/out.pithos").map_err(PithosError::Io)?
             };
 
             let sender_key = load_private_key_from_pem(
-                &cli.secret_keys
+                &cli.secret_key
                     .clone()
                     .expect("Private key expected to create Pithos file"),
             )?;
@@ -407,17 +407,6 @@ fn main() -> Result<(), PithosCliError> {
 
                     let mut fes = vec![];
                     if let Some(ids) = ids {
-                        let id_fes: Result<Vec<&FileEntry>, PithosError> = ids
-                            .iter()
-                            .map(|id| {
-                                directory
-                                    .get_file_by_id(*id)
-                                    .ok_or(PithosError::FileNotFound(format!(
-                                        "File with id {id} not available."
-                                    )))
-                            })
-                            .collect();
-
                         for id in ids {
                             fes.push(directory.get_file_by_id(id).ok_or(
                                 PithosError::FileNotFound(format!(
@@ -461,7 +450,7 @@ fn main() -> Result<(), PithosCliError> {
                 }
                 AppendCommands::Files { file, files } => {
                     let sender_key = load_private_key_from_pem(
-                        &cli.secret_keys
+                        &cli.secret_key
                             .clone()
                             .expect("Private key expected to append to Pithos file"),
                     )?;
@@ -491,7 +480,7 @@ fn main() -> Result<(), PithosCliError> {
                 .to_str()
                 .expect("No inner path provided or path contains invalid UTF-8");
             let sender_key = load_private_key_from_pem(
-                &cli.secret_keys
+                &cli.secret_key
                     .clone()
                     .expect("Private key expected to create Pithos file"),
             )?;

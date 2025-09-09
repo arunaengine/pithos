@@ -72,7 +72,7 @@ impl TryFrom<&PathBuf> for InputFile {
             },
             metadata: None,
             encrypt: true,
-            compression_level: Some(7),
+            compression_level: Some(2),
         })
     }
 }
@@ -148,6 +148,10 @@ impl PithosWriter {
             cdc,
             sink,
         })
+    }
+
+    pub fn get_directory_mut(&mut self) -> &mut Directory {
+        &mut self.directory
     }
 
     /* ----- Processing ---------- */
@@ -403,7 +407,7 @@ impl PithosWriter {
                 data: Content::File(entry.path().to_string_lossy().to_string()),
                 metadata: None,
                 encrypt: true,
-                compression_level: Some(7),
+                compression_level: Some(2),
             };
             entries.push(input_file);
         }
