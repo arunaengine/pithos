@@ -1071,26 +1071,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1171693293099992e19cddea4e8b849964e9846f4acee11b3948bcc337be8776"
 
 [[package]]
-name = "liblzma"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0791ab7e08ccc8e0ce893f6906eb2703ed8739d8e89b57c0714e71bad09024c8"
-dependencies = [
- "liblzma-sys",
-]
-
-[[package]]
-name = "liblzma-sys"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01b9596486f6d60c3bbe644c0e1be1aa6ccc472ad630fe8927b456973d7cb736"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
-]
-
-[[package]]
 name = "libz-rs-sys"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1346,7 +1326,7 @@ dependencies = [
  "tracing",
  "walkdir",
  "x25519-dalek",
- "zip 5.0.0",
+ "zip",
  "zstd",
 ]
 
@@ -1579,7 +1559,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "url",
- "zip 4.6.1",
+ "zip",
 ]
 
 [[package]]
@@ -2697,33 +2677,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "zip"
-version = "4.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
-dependencies = [
- "aes",
- "arbitrary",
- "bzip2",
- "constant_time_eq",
- "crc32fast",
- "deflate64",
- "flate2",
- "getrandom 0.3.3",
- "hmac",
- "indexmap",
- "liblzma",
- "memchr",
- "pbkdf2",
- "ppmd-rust",
- "sha1",
- "time",
- "zeroize",
- "zopfli",
- "zstd",
 ]
 
 [[package]]
