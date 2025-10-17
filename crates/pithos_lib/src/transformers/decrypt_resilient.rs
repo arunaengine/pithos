@@ -40,11 +40,17 @@ impl ChaChaResilient {
         // Always start with the default CIPHER_SEGMENT_SIZE
         residues.insert(CIPHER_SEGMENT_SIZE as u64, u32::MAX);
 
-        for lengths in &lengths {
-            let residue = *lengths % CIPHER_SEGMENT_SIZE as u64;
+        for length in &lengths {
+            let residue = *length % CIPHER_SEGMENT_SIZE as u64;
             if residue != 0 {
-                let entry = residues.entry(*lengths).or_insert(1);
+                let entry = residues.entry(*length).or_insert(1);
                 *entry += 1;
+
+                // Also add residue if length > CIPHER_SEGMENT_SIZE
+                if residue != *length {
+                    let entry = residues.entry(residue).or_insert(1);
+                    *entry += 1;
+                }
             }
         }
 
@@ -67,13 +73,16 @@ impl ChaChaResilient {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    fn process_messages(&mut self) -> Result<bool> {
+    fn process_messages(&mut self) -> Result<(bool, bool)> {
         if let Some(rx) = &self.msg_receiver {
             loop {
                 match rx.try_recv() {
-                    Ok(Message::Finished) => return Ok(true),
+                    Ok(Message::Finished) => return Ok((true, true)),
                     Ok(Message::Skip) => {
                         self.skip_me = true;
+                    }
+                    Ok(Message::ShouldFlush) => {
+                        return Ok((false, true));
                     }
                     Ok(_) => {}
                     Err(TryRecvError::Empty) => {
@@ -86,7 +95,7 @@ impl ChaChaResilient {
                 }
             }
         }
-        Ok(false)
+        Ok((false, false))
     }
 }
 
@@ -101,13 +110,14 @@ impl Transformer for ChaChaResilient {
     }
 
     #[tracing::instrument(level = "trace", skip(self, buf))]
-    async fn process_bytes(&mut self, buf: &mut bytes::BytesMut) -> Result<()> {
+    async fn process_bytes(&mut self, buf: &mut BytesMut) -> Result<()> {
         if self.skip_me {
             debug!("skipped");
             return Ok(());
         }
 
         let Ok(finished) = self.process_messages() else {
+        let Ok((finished, flush)) = self.process_messages() else {
             return Err(anyhow!("Error processing messages"));
         };
 
@@ -131,7 +141,7 @@ impl Transformer for ChaChaResilient {
             };
 
             if self.input_buffer.len() < next_chunksize as usize {
-                if finished {
+                if finished || flush {
                     // If we are finished we must advance the chunklength calculator
                     // until we are below the buffer size, since it will not grow anymore
                     counter += 1;
@@ -145,12 +155,28 @@ impl Transformer for ChaChaResilient {
                 &self.input_buffer.split_to(next_chunksize as usize),
                 &self.decryption_key,
             ) {
+            let chunk = &self.input_buffer[0..next_chunksize as usize];
+            match decrypt_chunk(chunk, &self.decryption_key) {
                 Ok(bytes) => {
+                    let _disposed = self.input_buffer.split_to(next_chunksize as usize);
                     buf.put(bytes);
-                    if self.input_buffer.len() > CIPHER_SEGMENT_SIZE {
+
+                    // If flush and still bytes available or more bytes in input buffer than smallest of provided lengths
+                    if (flush && !self.input_buffer.is_empty())
+                        || self.input_buffer.len() as u64
+                            >= *self
+                                .chunk_lengths
+                                .iter()
+                                .min()
+                                .unwrap_or(&(CIPHER_SEGMENT_SIZE as u64))
+                    {
                         // Reset and continue
                         counter = 0;
-                        current = CIPHER_SEGMENT_SIZE as u64;
+                        current = self
+                            .chunk_lengths
+                            .first()
+                            .unwrap_or(&(CIPHER_SEGMENT_SIZE as u64))
+                            .clone();
                         continue;
                     } else {
                         break;
