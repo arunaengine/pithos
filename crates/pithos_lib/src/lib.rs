@@ -11,7 +11,6 @@ mod tests {
     use std::io::SeekFrom;
 
     use crate::helpers::footer_parser::{Footer, FooterParser, FooterParserState};
-    //use crate::helpers::footer_parser::{FooterParser, Range};
     use crate::helpers::notifications::{DirOrFileIdx, Message};
     use crate::helpers::structs::{EncryptionKey, FileContext, Range};
     use crate::pithos::structs::FileContextVariants;
@@ -27,6 +26,7 @@ mod tests {
     use crate::transformers::footer_extractor::FooterExtractor;
     use crate::transformers::footer_updater::FooterUpdater;
     use crate::transformers::gzip_comp::GzipEnc;
+    use crate::transformers::hashing_transformer::HashingTransformer;
     use crate::transformers::pithos_comp_enc::PithosTransformer;
     use crate::transformers::size_probe::SizeProbe;
     use crate::transformers::tar::TarEnc;
@@ -37,39 +37,52 @@ mod tests {
     use digest::Digest;
     use futures::{StreamExt, TryStreamExt};
     use md5::Md5;
+    use sha2::Sha256;
     use tempfile::TempDir;
     use tokio::fs::File;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     #[tokio::test]
     async fn e2e_compressor_test_with_file() {
-        let file = File::open("test.txt").await.unwrap();
-        let file2 = File::create("test.txt.out.1").await.unwrap();
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.comp");
+        let out_file = File::create(&out_path).await.unwrap();
+        let in_file = File::open("test.txt").await.unwrap();
 
-        // Create a new GenericReadWriter
-        GenericReadWriter::new_with_writer(file, file2)
+        // Create a new GenericReadWriter to compress and decompress the input
+        GenericReadWriter::new_with_writer(in_file, out_file)
             .add_transformer(ZstdEnc::new())
             .add_transformer(ZstdDec::new())
             .process()
             .await
             .unwrap();
 
-        let mut file = File::open("test.txt").await.unwrap();
-        let mut file2 = File::open("test.txt.out.1").await.unwrap();
-        let mut buf1 = String::new();
-        let mut buf2 = String::new();
-        file.read_to_string(&mut buf1).await.unwrap();
-        file2.read_to_string(&mut buf2).await.unwrap();
-        assert!(buf1 == buf2)
+        // Assert that input and output is equal
+        let mut original_file = File::open("test.txt").await.unwrap();
+        let mut original_bytes = String::new();
+        original_file
+            .read_to_string(&mut original_bytes)
+            .await
+            .unwrap();
+
+        let mut also_original_file = File::open(out_path).await.unwrap();
+        let mut also_original_bytes = String::new();
+        also_original_file
+            .read_to_string(&mut also_original_bytes)
+            .await
+            .unwrap();
+
+        assert_eq!(original_bytes, also_original_bytes)
     }
 
     #[tokio::test]
     async fn e2e_encrypt_test_with_vec_no_pad() {
-        let file = b"This is a very very important test".to_vec();
-        let mut file2 = Vec::new();
+        let input = b"This is a very very important test".to_vec();
+        let mut output = Vec::new();
 
         // Create a new GenericReadWriter
-        GenericReadWriter::new_with_writer(file.as_ref(), &mut file2)
+        GenericReadWriter::new_with_writer(input.as_ref(), &mut output)
             .add_transformer(
                 ChaCha20Enc::new_with_fixed(
                     b"99wj3485nxgyq5ub9zd3e7jsrq7a92ea"
@@ -94,16 +107,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(file, file2);
+        assert_eq!(input, output);
     }
 
     #[tokio::test]
     async fn e2e_encrypt_test_with_file_no_pad() {
-        let file = File::open("test.txt").await.unwrap();
-        let file2 = File::create("test.txt.out.2").await.unwrap();
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.out");
+        let file_out = File::create(&out_path).await.unwrap();
+        let file_in = File::open("test.txt").await.unwrap();
 
         // Create a new GenericReadWriter
-        GenericReadWriter::new_with_writer(file, file2)
+        GenericReadWriter::new_with_writer(file_in, file_out)
             .add_transformer(
                 ChaCha20Enc::new_with_fixed(
                     b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea"
@@ -128,22 +144,26 @@ mod tests {
             .await
             .unwrap();
 
-        let mut file = File::open("test.txt").await.unwrap();
-        let mut file2 = File::open("test.txt.out.2").await.unwrap();
+        let mut original_file = File::open("test.txt").await.unwrap();
+        let mut also_original_file = File::open(out_path).await.unwrap();
         let mut buf1 = String::new();
         let mut buf2 = String::new();
-        file.read_to_string(&mut buf1).await.unwrap();
-        file2.read_to_string(&mut buf2).await.unwrap();
-        assert!(buf1 == buf2)
+        original_file.read_to_string(&mut buf1).await.unwrap();
+        also_original_file.read_to_string(&mut buf2).await.unwrap();
+
+        assert_eq!(buf1, buf2)
     }
 
     #[tokio::test]
     async fn e2e_test_roundtrip_with_file() {
-        let file = File::open("test.txt").await.unwrap();
-        let file2 = File::create("test.txt.out.4").await.unwrap();
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.out");
+        let file_out = File::create(&out_path).await.unwrap();
+        let file_in = File::open("test.txt").await.unwrap();
 
         // Create a new GenericReadWriter
-        GenericReadWriter::new_with_writer(file, file2)
+        GenericReadWriter::new_with_writer(file_in, file_out)
             .add_transformer(ZstdEnc::new())
             .add_transformer(ZstdEnc::new())
             .add_transformer(
@@ -193,21 +213,22 @@ mod tests {
             .unwrap();
 
         let mut file = File::open("test.txt").await.unwrap();
-        let mut file2 = File::open("test.txt.out.4").await.unwrap();
+        let mut file2 = File::open(out_path).await.unwrap();
         let mut buf1 = String::new();
         let mut buf2 = String::new();
         file.read_to_string(&mut buf1).await.unwrap();
         file2.read_to_string(&mut buf2).await.unwrap();
-        assert!(buf1 == buf2)
+
+        assert_eq!(buf1, buf2)
     }
 
     #[tokio::test]
     async fn test_with_vec() {
-        let file = b"This is a very very important test".to_vec();
-        let mut file2 = Vec::new();
+        let input = b"This is a very very important test".to_vec();
+        let mut output = Vec::new();
 
         // Create a new GenericReadWriter
-        GenericReadWriter::new_with_writer(file.as_ref(), &mut file2)
+        GenericReadWriter::new_with_writer(input.as_ref(), &mut output)
             .add_transformer(ZstdEnc::new())
             .add_transformer(ZstdEnc::new()) // Double compression because we can
             .add_transformer(
@@ -255,14 +276,19 @@ mod tests {
             .process()
             .await
             .unwrap();
-        assert!(file == file2)
+
+        assert_eq!(input, output)
     }
 
     #[tokio::test]
     async fn test_footer_parsing() {
-        let file = File::open("test.txt").await.unwrap();
-        let file2 = File::create("test.txt.out.6").await.unwrap();
-        GenericReadWriter::new_with_writer(file, file2)
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.out");
+        let file_out = File::create(&out_path).await.unwrap();
+        let file_in = File::open("test.txt").await.unwrap();
+
+        GenericReadWriter::new_with_writer(file_in, file_out)
             .add_transformer(ZstdEnc::new())
             .add_transformer(
                 FooterGenerator::new_with_ctx(FileContext {
@@ -275,40 +301,28 @@ mod tests {
             .await
             .unwrap();
 
-        let mut file2 = File::open("test.txt.out.6").await.unwrap();
-        file2
-            .seek(std::io::SeekFrom::End(-65536 * 2))
-            .await
-            .unwrap();
+        let mut footer_file = File::open(out_path).await.unwrap();
+        footer_file.seek(SeekFrom::End(-65536 * 2)).await.unwrap();
 
         let buf: &mut [u8; 65536 * 2] = &mut [0; 65536 * 2];
-        file2.read_exact(buf).await.unwrap();
+        footer_file.read_exact(buf).await.unwrap();
 
-        //let mut fp = FooterParser::new(buf);
+        let mut fp = FooterParser::new(buf).unwrap();
+        fp = fp.parse().unwrap();
 
-        //fp.parse().unwrap();
-
-        // let (a, b) = fp
-        //     .get_offsets_by_range(Range { from: 0, to: 1000 })
-        //     .unwrap();
-
-        // assert!(a.to % (65536) == 0);
-
-        // assert_eq!(
-        //     a,
-        //     Range {
-        //         from: 0,
-        //         to: 25 * 65536
-        //     }
-        // );
-        // assert!(b == Range { from: 0, to: 1000 })
+        assert!(matches!(fp.state, FooterParserState::Decoded))
     }
 
     #[tokio::test]
     async fn test_footer_parsing_encrypted() {
-        let file = File::open("test.txt").await.unwrap();
-        let file2 = File::create("test.txt.out.7").await.unwrap();
-        GenericReadWriter::new_with_writer(file, file2)
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.out");
+        let file_out = File::create(&out_path).await.unwrap();
+        let file_in = File::open("test.txt").await.unwrap();
+
+        // Compression + Encryption + Footer
+        GenericReadWriter::new_with_writer(file_in, file_out)
             .add_transformer(ZstdEnc::new())
             .add_transformer(
                 ChaCha20Enc::new_with_fixed(
@@ -336,40 +350,66 @@ mod tests {
             .await
             .unwrap();
 
-        let mut file2 = File::open("test.txt.out.7").await.unwrap();
-        file2
-            .seek(std::io::SeekFrom::End((-65536 - 28) * 2))
+        let mut footer_file = File::open(out_path).await.unwrap();
+        footer_file
+            .seek(SeekFrom::End((-65536 - 28) * 2))
             .await
             .unwrap();
 
         let buf: &mut [u8; (65536 + 28) * 2] = &mut [0; (65536 + 28) * 2];
-        file2.read_exact(buf).await.unwrap();
+        footer_file.read_exact(buf).await.unwrap();
 
-        // let mut fp = FooterParser::new(buf);
-        // fp.parse().unwrap();
+        let mut fp = FooterParser::new(buf).unwrap();
+        fp = fp.add_recipient(b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea");
+        fp = fp.parse().unwrap();
+        assert!(matches!(fp.state, FooterParserState::Decoded));
 
-        // let (a, b) = fp
-        //     .get_offsets_by_range(Range { from: 0, to: 1000 })
-        //     .unwrap();
-
-        // assert!(a.to % (65536 + 28) == 0);
-
-        // assert!(
-        //     a == Range {
-        //         from: 0,
-        //         to: 25 * (65536 + 28)
-        //     }
-        // );
-        // assert!(b == Range { from: 0, to: 1000 })
+        let _: Footer = fp.try_into().unwrap();
     }
 
     #[tokio::test]
-    async fn test_with_filter() {
-        let file = b"This is a very very important test".to_vec();
-        let mut file2 = Vec::new();
+    async fn test_simple_filter_range() {
+        // Filter from start
+        let input1 = b"This is a very very important test".to_vec();
+        let mut output_01 = Vec::new();
+        GenericReadWriter::new_with_writer(input1.as_ref(), &mut output_01)
+            .add_transformer(Filter::new_with_range(Range { from: 0, to: 3 }))
+            .process()
+            .await
+            .unwrap();
+        assert_eq!(output_01, b"Thi".to_vec());
+
+        // Filter in middle
+        let input2 = b"This is a very very important test".to_vec();
+        let mut output_02 = Vec::new();
+        GenericReadWriter::new_with_writer(input2.as_ref(), &mut output_02)
+            .add_transformer(Filter::new_with_range(Range { from: 6, to: 16 }))
+            .process()
+            .await
+            .unwrap();
+        assert_eq!(output_02, b"s a very v".to_vec());
+
+        // Filter until end
+        let input3 = b"This is a very very important test".to_vec();
+        let mut output_03 = Vec::new();
+        GenericReadWriter::new_with_writer(input3.as_ref(), &mut output_03)
+            .add_transformer(Filter::new_with_range(Range {
+                from: 25,
+                to: input3.len() as u64,
+            }))
+            .process()
+            .await
+            .unwrap();
+        assert_eq!(output_03, b"tant test".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_complex_filter() {
+        let input = b"This is a very very important test".to_vec();
+        let mut output = Vec::new();
 
         // Create a new GenericReadWriter
-        GenericReadWriter::new_with_writer(file.as_ref(), &mut file2)
+        GenericReadWriter::new_with_writer(input.as_ref(), &mut output)
             .add_transformer(ZstdEnc::new())
             .add_transformer(ZstdEnc::new()) // Double compression because we can
             .add_transformer(
@@ -419,15 +459,15 @@ mod tests {
             .await
             .unwrap();
 
-        println!("{:?}", file2);
-        assert_eq!(file2, b"Thi".to_vec());
+        println!("{:?}", output);
+        assert_eq!(output, b"Thi".to_vec());
     }
 
     #[tokio::test]
     async fn test_read_write_multifile() {
-        let file1 = b"This is a very very important test".to_vec();
-        let file2 = b"This is a very very important test".to_vec();
-        let mut file3: Vec<u8> = Vec::new();
+        let file1 = b"Lorem ipsum dolor sit amet, consetetur sadipscing elitr.".to_vec();
+        let file2 = b"Stet clita kasd gubergren, no sea takimata sanctus.".to_vec();
+        let mut output: Vec<u8> = Vec::new();
 
         let combined = Vec::from_iter(file1.clone().into_iter().chain(file2.clone()));
 
@@ -453,34 +493,13 @@ mod tests {
         .unwrap();
 
         // Create a new GenericReadWriter
-        let mut aswr = GenericReadWriter::new_with_writer(combined.as_ref(), &mut file3);
+        let mut aswr = GenericReadWriter::new_with_writer(combined.as_ref(), &mut output);
         aswr.add_message_receiver(rx).await.unwrap();
         aswr = aswr
             .add_transformer(ZstdEnc::new())
-            .add_transformer(ZstdEnc::new()) // Double compression because we can
             .add_transformer(
                 ChaCha20Enc::new_with_fixed(
                     b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea"
-                        .to_vec()
-                        .to_vec()
-                        .try_into()
-                        .unwrap(),
-                )
-                .unwrap(),
-            )
-            .add_transformer(
-                ChaCha20Enc::new_with_fixed(
-                    b"99wj3485nxgyq5ub9zd3e7jsrq7a92ea"
-                        .to_vec()
-                        .to_vec()
-                        .try_into()
-                        .unwrap(),
-                )
-                .unwrap(),
-            )
-            .add_transformer(
-                ChaCha20Dec::new_with_fixed(
-                    b"99wj3485nxgyq5ub9zd3e7jsrq7a92ea"
                         .to_vec()
                         .to_vec()
                         .try_into()
@@ -498,56 +517,33 @@ mod tests {
                 )
                 .unwrap(),
             )
-            .add_transformer(ZstdDec::new())
-            .add_transformer(ZstdDec::new())
-            .add_transformer(Filter::new_with_range(Range { from: 0, to: 3 }));
+            .add_transformer(ZstdDec::new());
         aswr.process().await.unwrap();
         drop(aswr);
 
-        println!("{:?}", file3);
-        assert_eq!(file3, b"Thi".to_vec());
+        assert_eq!(output, combined);
     }
 
     #[tokio::test]
     async fn stream_test() {
-        let mut file2 = Vec::new();
-
         use futures::stream;
 
-        let stream = stream::iter(vec![
-            Ok(Bytes::from_iter(
-                b"This is a very very important test".to_vec(),
+        let bytes_stream = stream::iter(vec![
+            Ok(Bytes::from(
+                b"One morning, when Gregor Samsa woke from troubled dreams, ".to_vec(),
             )),
-            Ok(Bytes::from(b"This is a very very important test".to_vec())),
+            Ok(Bytes::from(
+                b"he found himself transformed in his bed into a horrible vermin.".to_vec(),
+            )),
         ]);
 
         // Create a new GenericStreamReadWriter
-        GenericStreamReadWriter::new_with_writer(stream, &mut file2)
+        let mut output = Vec::new();
+        GenericStreamReadWriter::new_with_writer(bytes_stream, &mut output)
             .add_transformer(ZstdEnc::new())
-            .add_transformer(ZstdEnc::new()) // Double compression because we can
             .add_transformer(
                 ChaCha20Enc::new_with_fixed(
                     b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea"
-                        .to_vec()
-                        .to_vec()
-                        .try_into()
-                        .unwrap(),
-                )
-                .unwrap(),
-            )
-            .add_transformer(
-                ChaCha20Enc::new_with_fixed(
-                    b"99wj3485nxgyq5ub9zd3e7jsrq7a92ea"
-                        .to_vec()
-                        .to_vec()
-                        .try_into()
-                        .unwrap(),
-                )
-                .unwrap(),
-            )
-            .add_transformer(
-                ChaCha20Dec::new_with_fixed(
-                    b"99wj3485nxgyq5ub9zd3e7jsrq7a92ea"
                         .to_vec()
                         .to_vec()
                         .try_into()
@@ -566,24 +562,29 @@ mod tests {
                 .unwrap(),
             )
             .add_transformer(ZstdDec::new())
-            .add_transformer(ZstdDec::new())
-            .add_transformer(Filter::new_with_range(Range { from: 0, to: 3 }))
             .process()
             .await
             .unwrap();
 
-        dbg!(format!("{:?}", std::str::from_utf8(&file2)));
-        assert_eq!(file2, b"Thi".to_vec());
+        assert_eq!(
+            output,
+            b"One morning, when Gregor Samsa woke from troubled dreams, he found himself transformed in his bed into a horrible vermin.".to_vec()
+        );
     }
 
     #[tokio::test]
     async fn e2e_test_read_write_multifile_tar_small() {
-        let file1 = b"This is a very very important test".to_vec();
-        let file2 = b"Another brilliant This is a very very important test1337".to_vec();
-        let mut file3 = File::create("test.txt.out.8.tar").await.unwrap();
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.out");
+        let mut file_out = File::create(&out_path).await.unwrap();
 
+        let file1 = b"The quick, brown fox jumps over a lazy dog.".to_vec();
+        let file2 =
+            b"Junk MTV quiz graced by fox whelps. Bawds jog, flick quartz, vex nymphs.".to_vec();
         let combined = Vec::from_iter(file1.clone().into_iter().chain(file2.clone()));
 
+        // File context input
         let (sx, rx) = async_channel::bounded(10);
         sx.send(Message::FileContext(FileContext {
             file_path: "file1.txt".to_string(),
@@ -620,7 +621,7 @@ mod tests {
         .unwrap();
 
         // Create a new GenericReadWriter
-        let mut aswr = GenericReadWriter::new_with_writer(combined.as_ref(), &mut file3)
+        let mut aswr = GenericReadWriter::new_with_writer(combined.as_ref(), &mut file_out)
             .add_transformer(TarEnc::new());
         aswr.add_message_receiver(rx).await.unwrap();
         aswr.process().await.unwrap();
@@ -628,14 +629,18 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_test_read_write_multifile_tar_real() {
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.out");
+        let mut file_out = File::create(&out_path).await.unwrap();
+
         let mut file1 = File::open("test.txt").await.unwrap();
         let mut file2 = File::open("test.txt").await.unwrap();
-        let mut file3 = File::create("test.txt.out.9.tar").await.unwrap();
-
         let mut combined = Vec::new();
         file1.read_to_end(&mut combined).await.unwrap();
         file2.read_to_end(&mut combined).await.unwrap();
 
+        // File context input
         let (sx, rx) = async_channel::bounded(10);
         sx.send(Message::FileContext(FileContext {
             file_path: "file1.txt".to_string(),
@@ -672,7 +677,7 @@ mod tests {
         .unwrap();
 
         // Create a new GenericReadWriter
-        let mut aswr = GenericReadWriter::new_with_writer(combined.as_ref(), &mut file3)
+        let mut aswr = GenericReadWriter::new_with_writer(combined.as_ref(), &mut file_out)
             .add_transformer(TarEnc::new());
         aswr.add_message_receiver(rx).await.unwrap();
         aswr.process().await.unwrap();
@@ -680,21 +685,23 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_test_stream_write_multifile_tar_real() {
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.out");
+        let mut file_out = File::create(&out_path).await.unwrap();
+
         let file1 = File::open("test.txt").await.unwrap();
         let file2 = File::open("test.txt").await.unwrap();
-
         let file1_size = file1.metadata().await.unwrap().len();
         let file2_size = file2.metadata().await.unwrap().len();
-
         let stream1 = tokio_util::io::ReaderStream::new(file1);
         let stream2 = tokio_util::io::ReaderStream::new(file2);
-
         let chained = stream1.chain(stream2);
         let mapped = chained.map_err(|_| {
             Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
         });
-        let mut file3 = File::create("test.txt.out.10").await.unwrap();
 
+        // File context input
         let (sx, rx) = async_channel::bounded(10);
         sx.send(Message::FileContext(FileContext {
             file_path: "file1.txt".to_string(),
@@ -715,7 +722,7 @@ mod tests {
         .unwrap();
 
         // Create a new GenericStreamReadWriter
-        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut file3)
+        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut file_out)
             .add_transformer(TarEnc::new());
         aswr.add_message_receiver(rx).await.unwrap();
         aswr.process().await.unwrap();
@@ -723,20 +730,21 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_test_stream_tar_gz() {
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.out");
+        let mut file_out = File::create(&out_path).await.unwrap();
+
         let file1 = File::open("test.txt").await.unwrap();
         let file2 = File::open("test.txt").await.unwrap();
-
         let file1_size = file1.metadata().await.unwrap().len();
         let file2_size = file2.metadata().await.unwrap().len();
-
         let stream1 = tokio_util::io::ReaderStream::new(file1);
         let stream2 = tokio_util::io::ReaderStream::new(file2);
-
         let chained = stream1.chain(stream2);
         let mapped = chained.map_err(|_| {
             Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
         });
-        let mut file3 = File::create("test.txt.out.11").await.unwrap();
 
         let (sx, rx) = async_channel::bounded(10);
         sx.send(Message::FileContext(FileContext {
@@ -758,7 +766,7 @@ mod tests {
         .unwrap();
 
         // Create a new GenericStreamReadWriter
-        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut file3)
+        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut file_out)
             .add_transformer(TarEnc::new())
             .add_transformer(GzipEnc::new());
         aswr.add_message_receiver(rx).await.unwrap();
@@ -767,51 +775,57 @@ mod tests {
 
     #[tokio::test]
     async fn hashing_transformer_test() {
-        let file = b"This is a very very important test".to_vec();
-        let mut file2 = Vec::new();
+        let input = b"Lorem ipsum dolor sit amet, consectetuer adipiscing elit.".to_vec();
+        let mut output = Vec::new();
 
-        let (probe, rx) = SizeProbe::new();
-        let md5_trans = crate::transformers::hashing_transformer::HashingTransformer::new(
-            Md5::new(),
-            "md5".to_string(),
-            false,
-        );
+        let (size_probe, rx) = SizeProbe::new();
+        let (md5_transformer, md5_rcv) =
+            HashingTransformer::new_with_backchannel(Md5::new(), "md5".to_string());
+        let (sha256_transformer, sha256_rcv) =
+            HashingTransformer::new_with_backchannel(Sha256::new(), "sha256".to_string());
 
         // Create a new GenericReadWriter
-        GenericReadWriter::new_with_writer(file.as_ref(), &mut file2)
-            .add_transformer(md5_trans)
-            .add_transformer(probe)
+        GenericReadWriter::new_with_writer(input.as_ref(), &mut output)
+            .add_transformer(size_probe)
+            .add_transformer(md5_transformer)
+            .add_transformer(sha256_transformer)
             .process()
             .await
             .unwrap();
 
         let size = rx.try_recv().unwrap();
-        //let md5 = rx2.try_recv().unwrap();
-        // Todo: Receive MD5
+        assert_eq!(size, 57);
 
-        assert_eq!(size, 34);
-        //assert_eq!(md5, "4f276870b4b5f84c0b2bbfce30757176".to_string());
+        let md5 = md5_rcv.try_recv().unwrap();
+        assert_eq!(md5, "a84e9dae73341f1e9764f349701a5adf".to_string());
+
+        let sha256 = sha256_rcv.try_recv().unwrap();
+        assert_eq!(
+            sha256,
+            "1d32dc481e105799b079b5a1b18c2e302bc43bc5feac01450c7ffa50a1c65b92".to_string()
+        );
     }
 
     #[tokio::test]
     async fn e2e_test_stream_tar_folder() {
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let out_path = temp_dir.path().join("test.txt.out");
+        let mut file_out = File::create(&out_path).await.unwrap();
+
         let file1 = File::open("test.txt").await.unwrap();
         let file2 = File::open("test.txt").await.unwrap();
-
         let file1_size = file1.metadata().await.unwrap().len();
         let file2_size = file2.metadata().await.unwrap().len();
-
         let stream1 = tokio_util::io::ReaderStream::new(file1);
         let stream2 = tokio_util::io::ReaderStream::new(file2);
-
         let chained = stream1.chain(stream2);
         let mapped = chained.map_err(|_| {
             Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
         });
-        let mut file3 = File::create("test.txt.out.tar").await.unwrap();
 
+        // File context input
         let (sx, rx) = async_channel::bounded(10);
-
         sx.send(Message::FileContext(FileContext {
             file_path: "blup/".to_string(),
             compressed_size: 0,
@@ -851,32 +865,33 @@ mod tests {
         .unwrap();
 
         // Create a new GenericStreamReadWriter
-        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut file3)
+        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut file_out)
             .add_transformer(TarEnc::new());
         aswr.add_message_receiver(rx).await.unwrap();
-        //.add_transformer(GzipEnc::new());
         aswr.process().await.unwrap();
     }
 
     #[tokio::test]
     async fn e2e_pithos_tar_gz() {
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let pithos_out_path = temp_dir.path().join("test.txt.out.pto");
+        let tar_gz_out_path = temp_dir.path().join("test.txt.out.tar.gz");
+        let mut pithos_out = File::create(&pithos_out_path).await.unwrap();
+
         let file1 = File::open("test.txt").await.unwrap();
         let file2 = File::open("test.txt").await.unwrap();
-
         let file1_size = file1.metadata().await.unwrap().len();
         let file2_size = file2.metadata().await.unwrap().len();
-
         let stream1 = tokio_util::io::ReaderStream::new(file1);
         let stream2 = tokio_util::io::ReaderStream::new(file2);
-
         let chained = stream1.chain(stream2);
         let mapped = chained.map_err(|_| {
             Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
         });
-        let mut file3 = File::create("test.txt.out.pto").await.unwrap();
 
+        // File context input
         let (sx, rx) = async_channel::bounded(10);
-
         let privkey_bytes = BASE64_STANDARD
             .decode("MC4CAQAwBQYDK2VuBCIEIFDnbf0aEpZxwEdy1qG4xpV8gVNq7zEREtMjLzCE6R5x")
             .unwrap();
@@ -928,17 +943,15 @@ mod tests {
         .unwrap();
 
         // Create a new GenericStreamReadWriter
-        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut file3)
+        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut pithos_out)
             .add_transformer(PithosTransformer::new())
             .add_transformer(FooterGenerator::new(None));
         aswr.add_message_receiver(rx).await.unwrap();
         aswr.process().await.unwrap();
 
-        let mut file3 = File::open("test.txt.out.pto").await.unwrap();
-
         // Parse Footer
-        let file_meta = file3.metadata().await.unwrap();
-
+        let mut pithos_in = File::open(&pithos_out_path).await.unwrap();
+        let file_meta = pithos_in.metadata().await.unwrap();
         let footer_prediction = if file_meta.len() < 65536 * 2 {
             file_meta.len() // 131072 always fits in i64 ...
         } else {
@@ -946,12 +959,12 @@ mod tests {
         };
 
         // Read footer bytes in FooterParser
-        file3
+        pithos_in
             .seek(SeekFrom::End(-(footer_prediction as i64)))
             .await
             .unwrap();
-        let buf = &mut vec![0; footer_prediction as usize]; // Has to be vec as length is defined by dynamic value
-        file3.read_exact(buf).await.unwrap();
+        let buf = &mut vec![0; footer_prediction as usize];
+        pithos_in.read_exact(buf).await.unwrap();
 
         let mut parser = FooterParser::new(buf).unwrap();
         parser = parser.add_recipient(&privkey);
@@ -961,12 +974,12 @@ mod tests {
         let mut missing_buf;
         if let FooterParserState::Missing(missing_bytes) = parser.state {
             let needed_bytes = footer_prediction + missing_bytes as u64;
-            file3
+            pithos_in
                 .seek(SeekFrom::End(-(needed_bytes as i64)))
                 .await
                 .unwrap();
-            missing_buf = vec![0; missing_bytes as usize]; // Has to be vec as length is defined by dynamic value
-            file3.read_exact(&mut missing_buf).await.unwrap();
+            missing_buf = vec![0; missing_bytes];
+            pithos_in.read_exact(&mut missing_buf).await.unwrap();
 
             parser = parser.add_bytes(&missing_buf).unwrap();
             parser = parser.parse().unwrap()
@@ -991,21 +1004,17 @@ mod tests {
             })
             .unwrap_or_default();
 
-        let (sx2, rx2) = async_channel::bounded(10);
-
-        let file3 = File::open("test.txt.out.pto").await.unwrap();
-
-        let mut out_file1 = File::create("test.txt.out.pto.tar.gz").await.unwrap();
-
-        let read_stream = tokio_util::io::ReaderStream::new(file3).map_err(|_| {
+        let mut tar_gz_file = File::create(&tar_gz_out_path).await.unwrap();
+        let read_stream = tokio_util::io::ReaderStream::new(pithos_in).map_err(|_| {
             Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
         });
 
-        let mut reader = GenericStreamReadWriter::new_with_writer(read_stream, &mut out_file1)
+        let (sx2, rx2) = async_channel::bounded(10);
+        let mut reader = GenericStreamReadWriter::new_with_writer(read_stream, &mut tar_gz_file)
             .add_transformer(ChaCha20Dec::new_with_fixed_list(keys).unwrap())
             .add_transformer(ZstdDec::new())
-            .add_transformer(TarEnc::new());
-        //.add_transformer(GzipEnc::new());
+            .add_transformer(TarEnc::new())
+            .add_transformer(GzipEnc::new());
         reader.add_message_receiver(rx2).await.unwrap();
 
         for (idx, file) in footer.table_of_contents.files.into_iter().enumerate() {
@@ -1022,19 +1031,19 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_pithos_rewrite_footer() {
-        let file1 = File::open("test.txt").await.unwrap();
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let pithos_out_path1 = temp_dir.path().join("test.txt.out.pto");
+        let pithos_out_path2 = temp_dir.path().join("test.txt.out.upd.pto");
+        let mut pithos_out = File::create(&pithos_out_path1).await.unwrap();
 
-        let file1_size = file1.metadata().await.unwrap().len();
-
-        let stream1 = tokio_util::io::ReaderStream::new(file1);
-
-        let mapped = stream1.map_err(|_| {
+        let input_file = File::open("test.txt").await.unwrap();
+        let input_size = input_file.metadata().await.unwrap().len();
+        let input_stream = tokio_util::io::ReaderStream::new(input_file).map_err(|_| {
             Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
         });
-        let mut file3 = File::create("test.txt.out.2.pto").await.unwrap();
 
-        let (sx, rx) = async_channel::bounded(10);
-
+        // File context input
         let privkey_bytes = BASE64_STANDARD
             .decode("MC4CAQAwBQYDK2VuBCIEIFDnbf0aEpZxwEdy1qG4xpV8gVNq7zEREtMjLzCE6R5x")
             .unwrap();
@@ -1051,10 +1060,11 @@ mod tests {
             .try_into()
             .unwrap();
 
+        let (sx, rx) = async_channel::bounded(10);
         sx.send(Message::FileContext(FileContext {
             file_path: "file1.txt".to_string(),
-            compressed_size: file1_size,
-            decompressed_size: file1_size,
+            compressed_size: input_size,
+            decompressed_size: input_size,
             recipients_pubkeys: vec![pubkey],
             encryption_key: EncryptionKey::Same(
                 b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea"
@@ -1069,16 +1079,15 @@ mod tests {
         .unwrap();
 
         // Create a new GenericStreamReadWriter
-        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut file3)
+        let mut aswr = GenericStreamReadWriter::new_with_writer(input_stream, &mut pithos_out)
             .add_transformer(PithosTransformer::new())
             .add_transformer(FooterGenerator::new(None));
         aswr.add_message_receiver(rx).await.unwrap();
         aswr.process().await.unwrap();
 
-        let mut file3 = File::open("test.txt.out.2.pto").await.unwrap();
-
         // Parse Footer
-        let file_meta = file3.metadata().await.unwrap();
+        let mut pithos_input = File::open(&pithos_out_path1).await.unwrap();
+        let file_meta = pithos_input.metadata().await.unwrap();
 
         let footer_prediction = if file_meta.len() < 65536 * 2 {
             file_meta.len() // 131072 always fits in i64 ...
@@ -1087,12 +1096,12 @@ mod tests {
         };
 
         // Read footer bytes in FooterParser
-        file3
+        pithos_input
             .seek(SeekFrom::End(-(footer_prediction as i64)))
             .await
             .unwrap();
-        let buf = &mut vec![0; footer_prediction as usize]; // Has to be vec as length is defined by dynamic value
-        file3.read_exact(buf).await.unwrap();
+        let buf = &mut vec![0; footer_prediction as usize];
+        pithos_input.read_exact(buf).await.unwrap();
 
         let mut parser = FooterParser::new(buf).unwrap();
         parser = parser.add_recipient(&privkey);
@@ -1102,27 +1111,23 @@ mod tests {
         let mut missing_buf;
         if let FooterParserState::Missing(missing_bytes) = parser.state {
             let needed_bytes = footer_prediction + missing_bytes as u64;
-            file3
+            pithos_input
                 .seek(SeekFrom::End(-(needed_bytes as i64)))
                 .await
                 .unwrap();
-            missing_buf = vec![0; missing_bytes as usize]; // Has to be vec as length is defined by dynamic value
-            file3.read_exact(&mut missing_buf).await.unwrap();
+            missing_buf = vec![0; missing_bytes];
+            pithos_input.read_exact(&mut missing_buf).await.unwrap();
 
             parser = parser.add_bytes(&missing_buf).unwrap();
             parser = parser.parse().unwrap()
         }
 
-        // Parse the footer bytes and display Table of Contents
+        // Parse the footer bytes and display Table of Contents ...
         let footer: Footer = parser.try_into().unwrap();
 
-        let (_sx2, rx2) = async_channel::bounded(10);
-
-        let file3 = File::open("test.txt.out.2.pto").await.unwrap();
-
-        let mut out_file1 = File::create("test.txt.out.3.pto").await.unwrap();
-
-        let read_stream = tokio_util::io::ReaderStream::new(file3).map_err(|_| {
+        // Create reader stream for Pithos file
+        pithos_input.seek(SeekFrom::Start(0)).await.unwrap();
+        let read_stream = tokio_util::io::ReaderStream::new(pithos_input).map_err(|_| {
             Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
         });
 
@@ -1142,15 +1147,16 @@ mod tests {
             .try_into()
             .unwrap();
 
-        let mut reader = GenericStreamReadWriter::new_with_writer(read_stream, &mut out_file1)
+        let (_, rx2) = async_channel::bounded(10);
+        let mut pithos_out_2 = File::create(&pithos_out_path2).await.unwrap();
+        let mut reader = GenericStreamReadWriter::new_with_writer(read_stream, &mut pithos_out_2)
             .add_transformer(FooterUpdater::new(vec![pubkey_2], footer));
         reader.add_message_receiver(rx2).await.unwrap();
         reader.process().await.unwrap();
 
-        let mut file3 = File::open("test.txt.out.3.pto").await.unwrap();
-
         // Parse Footer
-        let file_meta = file3.metadata().await.unwrap();
+        let mut pithos_input = File::open(pithos_out_path2).await.unwrap();
+        let file_meta = pithos_input.metadata().await.unwrap();
 
         let footer_prediction = if file_meta.len() < 65536 * 2 {
             file_meta.len() // 131072 always fits in i64 ...
@@ -1159,37 +1165,35 @@ mod tests {
         };
 
         // Read footer bytes in FooterParser
-        file3
+        pithos_input
             .seek(SeekFrom::End(-(footer_prediction as i64)))
             .await
             .unwrap();
         let buf = &mut vec![0; footer_prediction as usize]; // Has to be vec as length is defined by dynamic value
-        file3.read_exact(buf).await.unwrap();
+        pithos_input.read_exact(buf).await.unwrap();
 
         let mut parser = FooterParser::new(buf).unwrap();
         parser = parser.add_recipient(&privkey_2);
         parser = parser.parse().unwrap();
 
         let footer: Footer = parser.try_into().unwrap();
-
         assert!(footer.encryption_keys.unwrap().keys.len() > 0)
     }
 
     #[tokio::test]
     async fn e2e_pithos_extractor() {
-        let file1 = File::open("test.txt").await.unwrap();
+        // File handling
+        let temp_dir = TempDir::new().unwrap();
+        let pithos_out_path = temp_dir.path().join("test.txt.pto");
+        let mut pithos_out = File::create(&pithos_out_path).await.unwrap();
 
-        let file1_size = file1.metadata().await.unwrap().len();
-
-        let stream1 = tokio_util::io::ReaderStream::new(file1);
-
-        let mapped = stream1.map_err(|_| {
+        let input_file = File::open("test.txt").await.unwrap();
+        let input_size = input_file.metadata().await.unwrap().len();
+        let input_stream = tokio_util::io::ReaderStream::new(input_file).map_err(|_| {
             Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
         });
-        let mut file3 = File::create("test.txt.out.4.pto").await.unwrap();
 
-        let (sx, rx) = async_channel::bounded(10);
-
+        // File context input
         let privkey_bytes = BASE64_STANDARD
             .decode("MC4CAQAwBQYDK2VuBCIEIFDnbf0aEpZxwEdy1qG4xpV8gVNq7zEREtMjLzCE6R5x")
             .unwrap();
@@ -1206,10 +1210,11 @@ mod tests {
             .try_into()
             .unwrap();
 
+        let (sx, rx) = async_channel::bounded(10);
         sx.send(Message::FileContext(FileContext {
             file_path: "file1.txt".to_string(),
-            compressed_size: file1_size,
-            decompressed_size: file1_size,
+            compressed_size: input_size,
+            decompressed_size: input_size,
             recipients_pubkeys: vec![pubkey],
             encryption_key: EncryptionKey::Same(
                 b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea"
@@ -1224,16 +1229,15 @@ mod tests {
         .unwrap();
 
         // Create a new GenericStreamReadWriter
-        let mut aswr = GenericStreamReadWriter::new_with_writer(mapped, &mut file3)
+        let mut aswr = GenericStreamReadWriter::new_with_writer(input_stream, &mut pithos_out)
             .add_transformer(PithosTransformer::new())
             .add_transformer(FooterGenerator::new(None));
         aswr.add_message_receiver(rx).await.unwrap();
         aswr.process().await.unwrap();
 
-        let mut file3 = File::open("test.txt.out.4.pto").await.unwrap();
-
         // Parse Footer
-        let file_meta = file3.metadata().await.unwrap();
+        let mut pithos_input = File::open(pithos_out_path).await.unwrap();
+        let file_meta = pithos_input.metadata().await.unwrap();
 
         let footer_prediction = if file_meta.len() < 65536 * 2 {
             file_meta.len() // 131072 always fits in i64 ...
@@ -1242,12 +1246,12 @@ mod tests {
         };
 
         // Read footer bytes in FooterParser
-        file3
+        pithos_input
             .seek(SeekFrom::End(-(footer_prediction as i64)))
             .await
             .unwrap();
-        let buf = &mut vec![0; footer_prediction as usize]; // Has to be vec as length is defined by dynamic value
-        file3.read_exact(buf).await.unwrap();
+        let buf = &mut vec![0; footer_prediction as usize];
+        pithos_input.read_exact(buf).await.unwrap();
 
         let mut parser = FooterParser::new(buf).unwrap();
         parser = parser.add_recipient(&privkey);
@@ -1256,19 +1260,15 @@ mod tests {
         // Parse the footer bytes and display Table of Contents
         let footer: Footer = parser.try_into().unwrap();
 
-        let file3 = File::open("test.txt.out.4.pto").await.unwrap();
-
+        // Read footer with FooterExtractor
         let mut vec = Vec::new();
-
-        let stream1 = tokio_util::io::ReaderStream::new(file3);
-
-        let mapped = stream1.map_err(|_| {
+        pithos_input.seek(SeekFrom::Start(0)).await.unwrap();
+        let input_stream = tokio_util::io::ReaderStream::new(pithos_input).map_err(|_| {
             Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
         });
 
         let (extractor, rcv) = FooterExtractor::new(Some(privkey));
-
-        GenericStreamReadWriter::new_with_writer(mapped, &mut vec)
+        GenericStreamReadWriter::new_with_writer(input_stream, &mut vec)
             .add_transformer(extractor)
             .process()
             .await
@@ -1374,18 +1374,14 @@ mod tests {
     async fn e2e_test_resilient_decryptor_single() {
         // Encrypt single part
         let temp_dir = TempDir::new().unwrap();
-
         let part_1_path = temp_dir.path().join("test.1.txt.enc");
-        let part_1_in = File::open("test.1.txt").await.unwrap();
-        let mut part_1_out = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&part_1_path)
-            .await
-            .unwrap();
+        let mut part_1_out = File::create(&part_1_path).await.unwrap();
 
-        GenericReadWriter::new_with_writer(part_1_in, &mut part_1_out)
+        let mut input = File::open("test.txt").await.unwrap();
+        let mut part_1_bytes = vec![0; 70113];
+        input.read_exact(&mut part_1_bytes).await.unwrap();
+
+        GenericReadWriter::new_with_writer(part_1_bytes.as_ref(), &mut part_1_out)
             .add_transformer(
                 ChaCha20Enc::new_with_fixed(
                     b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea"
@@ -1405,7 +1401,7 @@ mod tests {
         file_part_1.read_to_end(&mut input).await.unwrap();
 
         let mut output = vec![];
-        let part_lengths: Vec<u64> = vec![4605];
+        let part_lengths: Vec<u64> = vec![part_1_bytes.len() as u64];
 
         // Create a new GenericReadWriter that decrypts the part
         GenericReadWriter::new_with_writer(input.as_slice(), &mut output)
@@ -1420,17 +1416,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Assert output is same as original file
-        let mut original_file = File::open("test.1.txt").await.unwrap();
-        let file_size = original_file.metadata().await.unwrap().len();
-        assert_eq!(output.len() as u64, file_size);
-
-        let mut original_bytes = Vec::new();
-        original_file
-            .read_to_end(&mut original_bytes)
-            .await
-            .unwrap();
-        assert_eq!(output, original_bytes);
+        assert_eq!(output, part_1_bytes);
     }
 
     #[tokio::test]
@@ -1439,27 +1425,21 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let part_1_path = temp_dir.path().join("test.1.txt.enc");
         let part_2_path = temp_dir.path().join("test.2.txt.enc");
+        let mut input = File::open("test.txt").await.unwrap();
 
         // Encrypt parts individually
-        let part_1_in = File::open("test.1.txt").await.unwrap();
-        let part_1_out = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&part_1_path)
-            .await
-            .unwrap();
+        let mut part_1_bytes = vec![0; 70113];
+        input.read_exact(&mut part_1_bytes).await.unwrap();
+        let part_1_out = File::create(&part_1_path).await.unwrap();
 
-        let part_2_in = File::open("test.2.txt").await.unwrap();
-        let part_2_out = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&part_2_path)
-            .await
-            .unwrap();
+        let mut part_2_bytes = Vec::new();
+        input.read_to_end(&mut part_2_bytes).await.unwrap();
+        let part_2_out = File::create(&part_2_path).await.unwrap();
 
-        for (input, mut output) in vec![(part_1_in, part_1_out), (part_2_in, part_2_out)] {
+        for (input, mut output) in vec![
+            (part_1_bytes.as_ref(), part_1_out),
+            (part_2_bytes.as_ref(), part_2_out),
+        ] {
             GenericReadWriter::new_with_writer(input, &mut output)
                 .add_transformer(
                     ChaCha20Enc::new_with_fixed(
@@ -1513,32 +1493,25 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_test_resilient_decryptor_multi_with_compression() {
-        println!("Moin.");
         // Create temp paths for encrypted parts
         let temp_dir = TempDir::new().unwrap();
         let part_1_path = temp_dir.path().join("test.1.txt.enc");
         let part_2_path = temp_dir.path().join("test.2.txt.enc");
+        let mut input = File::open("test.txt").await.unwrap();
 
         // Encrypt parts individually
-        let part_1_in = File::open("test.1.txt").await.unwrap();
-        let part_1_out = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&part_1_path)
-            .await
-            .unwrap();
+        let mut part_1_bytes = vec![0; 70113];
+        input.read_exact(&mut part_1_bytes).await.unwrap();
+        let part_1_out = File::create(&part_1_path).await.unwrap();
 
-        let part_2_in = File::open("test.2.txt").await.unwrap();
-        let part_2_out = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&part_2_path)
-            .await
-            .unwrap();
+        let mut part_2_bytes = Vec::new();
+        input.read_to_end(&mut part_2_bytes).await.unwrap();
+        let part_2_out = File::create(&part_2_path).await.unwrap();
 
-        for (input, mut output) in vec![(part_1_in, part_1_out), (part_2_in, part_2_out)] {
+        for (input, mut output) in vec![
+            (part_1_bytes.as_ref(), part_1_out),
+            (part_2_bytes.as_ref(), part_2_out),
+        ] {
             GenericReadWriter::new_with_writer(input, &mut output)
                 .add_transformer(ZstdEnc::new())
                 .add_transformer(
