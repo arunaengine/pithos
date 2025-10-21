@@ -62,25 +62,13 @@ impl FooterGenerator {
                 EncryptionKey::Same(enc_key) => {
                     map.insert(
                         *pubkey,
-                        HashMap::from([(
-                            enc_key
-                                .clone()
-                                .try_into()
-                                .map_err(|_| anyhow!("Vec<u8> to [u8;32] conversion failed"))?,
-                            DirOrFileIdx::from(&ctx),
-                        )]),
+                        HashMap::from([(*enc_key, DirOrFileIdx::from(&ctx))]),
                     );
                 }
                 EncryptionKey::DataOnly(enc_key) => {
                     map.insert(
                         *pubkey,
-                        HashMap::from([(
-                            enc_key
-                                .clone()
-                                .try_into()
-                                .map_err(|_| anyhow!("Vec<u8> to [u8;32] conversion failed"))?,
-                            DirOrFileIdx::from(&ctx),
-                        )]),
+                        HashMap::from([(*enc_key, DirOrFileIdx::from(&ctx))]),
                     );
                 }
                 // Data key necessary if is_dir?
@@ -88,18 +76,8 @@ impl FooterGenerator {
                     map.insert(
                         *pubkey,
                         HashMap::from([
-                            (
-                                data.clone()
-                                    .try_into()
-                                    .map_err(|_| anyhow!("Vec<u8> to [u8;32] conversion failed"))?,
-                                DirOrFileIdx::from(&ctx),
-                            ),
-                            (
-                                meta.clone()
-                                    .try_into()
-                                    .map_err(|_| anyhow!("Vec<u8> to [u8;32] conversion failed"))?,
-                                DirOrFileIdx::from(&ctx),
-                            ),
+                            (*data, DirOrFileIdx::from(&ctx)),
+                            (*meta, DirOrFileIdx::from(&ctx)),
                         ]),
                     );
                 }

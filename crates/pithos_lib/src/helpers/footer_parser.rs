@@ -58,7 +58,7 @@ pub struct Footer {
 
 impl<'a> FooterParser<'a> {
     #[tracing::instrument(level = "trace", skip(bytes))]
-    pub fn new(bytes: &[u8]) -> Result<FooterParser> {
+    pub fn new(bytes: &'_ [u8]) -> Result<FooterParser<'_>> {
         if bytes.len() < EOF_META_LEN {
             return Err(anyhow!("Invalid format, not enough bytes"));
         }

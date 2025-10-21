@@ -163,30 +163,28 @@ where
             if let Some(notifier) = self.notifier.clone() {
                 if self.file_queue.is_some() && self.back_channel.is_none() {
                     self.next_file(&[]).await?;
-                } else {
-                    if finished {
-                        if !self.finished {
-                            let finished_hash = self.hasher.finalize_reset().to_vec();
-                            let hashertype = match self.hasher_type.as_str() {
-                                "sha256" => HashType::Sha256,
-                                "md5" => HashType::Md5,
-                                a => HashType::Other(a.to_string()),
-                            };
-                            notifier.send_all_type(
-                                TransformerType::FooterGenerator,
-                                Message::Hash((hashertype.clone(), finished_hash.clone(), None)),
-                            )?;
-
-                            if let Some(sx) = &self.back_channel {
-                                sx.try_send(hex::encode(finished_hash))?;
-                            }
-                            self.finished = true;
-                        }
-                        notifier.send_next(
-                            self.idx.ok_or_else(|| anyhow!("Missing idx"))?,
-                            Message::Finished,
+                } else if finished {
+                    if !self.finished {
+                        let finished_hash = self.hasher.finalize_reset().to_vec();
+                        let hashertype = match self.hasher_type.as_str() {
+                            "sha256" => HashType::Sha256,
+                            "md5" => HashType::Md5,
+                            a => HashType::Other(a.to_string()),
+                        };
+                        notifier.send_all_type(
+                            TransformerType::FooterGenerator,
+                            Message::Hash((hashertype.clone(), finished_hash.clone(), None)),
                         )?;
+
+                        if let Some(sx) = &self.back_channel {
+                            sx.try_send(hex::encode(finished_hash))?;
+                        }
+                        self.finished = true;
                     }
+                    notifier.send_next(
+                        self.idx.ok_or_else(|| anyhow!("Missing idx"))?,
+                        Message::Finished,
+                    )?;
                 }
                 //notifier.send_read_writer(Message::Hash((hashertype, finished_hash)))?; // No need to send out anymore?
             }

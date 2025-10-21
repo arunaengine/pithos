@@ -55,7 +55,18 @@ pub const EOF_META_LEN: usize = 73;
 
 // -------------- EndOfFileMetadata --------------
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Debug,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+)]
 pub struct EndOfFileMetadata {
     // 73 Bytes
     pub magic_bytes: [u8; 4], // Should be 0x50, 0x2A, 0x4D, 0x18
@@ -105,7 +116,18 @@ impl EndOfFileMetadata {
 
 // -------------- EncryptionMetadata --------------
 
-#[derive(Debug, BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub struct EncryptionMetadata {
     pub magic_bytes: [u8; 4], // Should be 0x51, 0x2A, 0x4D, 0x18
     pub len: u32,             // Required for zstd skippable frame
@@ -170,12 +192,34 @@ impl
 // F0, F1, F2, F3
 // K0 -> F0, F1 -> DirOrFileIdx::File(1)
 // K2 -> F2, F3 -> DirOrFileIdx::File(3)
-#[derive(Debug, BorshSerialize, BorshDeserialize, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(
+    Debug,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Clone,
+)]
 pub struct DecryptedKeys {
     pub keys: Vec<([u8; 32], DirOrFileIdx)>,
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub struct EncryptionPacket {
     pub pubkey: [u8; 32],
     pub nonce: [u8; 12],
@@ -249,7 +293,18 @@ impl DecryptedKeys {
 
 // -------------- FileContextHeader --------------
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize,  PartialEq, Debug, Clone, Eq, PartialOrd, Ord)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Debug,
+    Clone,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub struct FileInfo {
     pub uid: Option<u64>,   // UserId
     pub gid: Option<u64>,   // GroupId
@@ -257,19 +312,52 @@ pub struct FileInfo {
     pub mtime: Option<u64>, // Created at
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, PartialEq, Debug, Clone, Eq, PartialOrd, Ord)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Debug,
+    Clone,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub struct Hashes {
     pub sha256: Option<[u8; 32]>,
     pub md5: Option<[u8; 16]>,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, PartialEq, Debug, Clone, Eq, PartialOrd, Ord)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Debug,
+    Clone,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub struct SymlinkContextHeader {
     pub file_path: String, // FileName /foo/bar/
     pub file_info: Option<FileInfo>,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Eq, PartialOrd, Ord, PartialEq, Debug)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Clone,
+    Eq,
+    PartialOrd,
+    Ord,
+    PartialEq,
+    Debug,
+)]
 pub struct CustomRange {
     pub tag: String,
     pub start: u64,
@@ -277,7 +365,17 @@ pub struct CustomRange {
 }
 
 #[derive(
-    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
 )]
 pub struct FileContextHeader {
     pub file_path: String, // FilePath empty = SKIP
@@ -315,11 +413,11 @@ impl FileContextHeader {
             expected_sha256: self
                 .hashes
                 .as_ref()
-                .and_then(|x| x.sha256.and_then(|x| Some(hex::encode(x.as_slice())))),
+                .and_then(|x| x.sha256.map(|x| hex::encode(x.as_slice()))),
             expected_md5: self
                 .hashes
                 .as_ref()
-                .and_then(|x| x.md5.and_then(|x| Some(hex::encode(x.as_slice())))),
+                .and_then(|x| x.md5.map(|x| hex::encode(x.as_slice()))),
             semantic_metadata: self.metadata,
             custom_ranges: self.custom_ranges,
         })
@@ -342,11 +440,9 @@ impl FileContextHeader {
                 let mut sum = 0;
                 for (i, r) in idx_list.iter().enumerate() {
                     sum += *r as u64;
-                    if sum >= range.from {
-                        if edit_list.is_empty() {
-                            start_block = i as u64;
-                            edit_list.push(range.from.saturating_sub(sum - *r as u64));
-                        }
+                    if sum >= range.from && edit_list.is_empty() {
+                        start_block = i as u64;
+                        edit_list.push(range.from.saturating_sub(sum - *r as u64));
                     }
                     if sum >= range.to {
                         end_block = (i as u64) + 1;
@@ -400,7 +496,18 @@ impl FileContextHeader {
     }
 }
 
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub struct DirContextHeader {
     pub file_path: String, // FileName /foo/bar/
     pub file_info: Option<FileInfo>,
@@ -419,7 +526,18 @@ impl From<FileContext> for DirContextHeader {
     }
 }
 
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize,  Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub enum FileContextVariants {
     FileDecrypted(FileContextHeader),
     FileEncrypted(Vec<u8>),
@@ -434,9 +552,7 @@ impl FileContextVariants {
                 .map_err(|_| anyhow!("Invalid key length"))?
                 .encrypt(&nonce, as_bytes.as_slice())
                 .map_err(|_| anyhow!("Error while encrypting keys"))?;
-            *self = FileContextVariants::FileEncrypted(
-                nonce.to_vec().into_iter().chain(data).collect(),
-            );
+            *self = FileContextVariants::FileEncrypted(nonce.iter().copied().chain(data).collect());
         }
         Ok(())
     }
@@ -459,7 +575,18 @@ impl FileContextVariants {
     }
 }
 
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub enum DirContextVariants {
     DirDecrypted(DirContextHeader),
     DirEncrypted(Vec<u8>),
@@ -497,7 +624,18 @@ impl DirContextVariants {
     }
 }
 
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub struct TableOfContents {
     pub magic_bytes: [u8; 4], // Should be 0x53, 0x2A, 0x4D, 0x18
     pub len: u32,

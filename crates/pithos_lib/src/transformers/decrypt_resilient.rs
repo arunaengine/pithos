@@ -116,7 +116,6 @@ impl Transformer for ChaChaResilient {
             return Ok(());
         }
 
-        let Ok(finished) = self.process_messages() else {
         let Ok((finished, flush)) = self.process_messages() else {
             return Err(anyhow!("Error processing messages"));
         };
@@ -124,15 +123,18 @@ impl Transformer for ChaChaResilient {
         if !buf.is_empty() {
             self.input_buffer.put(buf.split());
         }
+
         let mut counter = 0;
         let mut current = CIPHER_SEGMENT_SIZE as u64;
         loop {
             if self.input_buffer.is_empty() {
                 break;
             }
+
             let next_chunksize = if let Some(len) = self.chunk_lengths.get(counter) {
-                len.clone()
+                *len
             } else {
+                // If provided lengths are exhausted decrease cipher segment size by one until too small
                 if current < 15 + 1 {
                     return Err(anyhow!("Unable to process any more chunks abort!"));
                 }
@@ -151,10 +153,6 @@ impl Transformer for ChaChaResilient {
                 }
             }
 
-            match decrypt_chunk(
-                &self.input_buffer.split_to(next_chunksize as usize),
-                &self.decryption_key,
-            ) {
             let chunk = &self.input_buffer[0..next_chunksize as usize];
             match decrypt_chunk(chunk, &self.decryption_key) {
                 Ok(bytes) => {
@@ -172,11 +170,10 @@ impl Transformer for ChaChaResilient {
                     {
                         // Reset and continue
                         counter = 0;
-                        current = self
+                        current = *self
                             .chunk_lengths
                             .first()
-                            .unwrap_or(&(CIPHER_SEGMENT_SIZE as u64))
-                            .clone();
+                            .unwrap_or(&(CIPHER_SEGMENT_SIZE as u64));
                         continue;
                     } else {
                         break;

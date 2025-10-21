@@ -118,15 +118,13 @@ impl ChaCha20Dec {
                 if let Ok(chunk) = maybe_chunk {
                     self.output_buffer.put(chunk);
                     return Ok(());
-                } else {
-                    if let Some(k) = &self.available_keys {
-                        for (key, _) in k {
-                            maybe_chunk = decrypt_chunk(&buffer_bytes, &key);
-                            if let Ok(chunk) = maybe_chunk {
-                                self.decryption_key = Some(key.clone());
-                                self.output_buffer.put(chunk);
-                                return Ok(());
-                            }
+                } else if let Some(k) = &self.available_keys {
+                    for (key, _) in k {
+                        maybe_chunk = decrypt_chunk(&buffer_bytes, key);
+                        if let Ok(chunk) = maybe_chunk {
+                            self.decryption_key = Some(*key);
+                            self.output_buffer.put(chunk);
+                            return Ok(());
                         }
                     }
                 }

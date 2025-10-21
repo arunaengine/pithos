@@ -7,7 +7,6 @@ use hyper::body::Body;
 use std::sync::Arc;
 use tracing::{debug, error};
 
-
 pub struct PithosBody {
     receiver: Receiver<Bytes>,
 }
@@ -22,20 +21,19 @@ impl PithosBody {
 impl Body for PithosBody {
     type Data = Bytes;
     type Error = anyhow::Error;
-    
+
     fn poll_frame(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
         match self.receiver.try_recv() {
             Ok(data) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(data)))),
             Err(TryRecvError::Empty) => std::task::Poll::Pending,
             Err(TryRecvError::Closed) => std::task::Poll::Ready(None),
         }
     }
-
 }
-
 
 pub struct HyperSink {
     sender: Sender<Bytes>,

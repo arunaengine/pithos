@@ -23,7 +23,18 @@ pub struct CompressionInfo {
 }
 
 #[derive(
-    Clone, Copy, Debug, Eq, PartialEq, Hash, BorshDeserialize, BorshSerialize, Serialize, Deserialize, PartialOrd, Ord,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    BorshDeserialize,
+    BorshSerialize,
+    Serialize,
+    Deserialize,
+    PartialOrd,
+    Ord,
 )]
 pub enum DirOrFileIdx {
     Dir(usize),

@@ -54,19 +54,19 @@ impl EncryptionKey {
     pub fn get_data_key(&self) -> Option<[u8; 32]> {
         match self {
             EncryptionKey::None => None,
-            EncryptionKey::Same(key) => Some(key.clone()),
-            EncryptionKey::DataOnly(key) => Some(key.clone()),
-            EncryptionKey::Individual((key, _)) => Some(key.clone()),
+            EncryptionKey::Same(key) => Some(*key),
+            EncryptionKey::DataOnly(key) => Some(*key),
+            EncryptionKey::Individual((key, _)) => Some(*key),
         }
     }
 
     pub fn into_keys(&self) -> Vec<[u8; 32]> {
         let result: Vec<[u8; 32]> = match &self {
             EncryptionKey::None => vec![],
-            EncryptionKey::Same(key) => vec![key.clone()],
-            EncryptionKey::DataOnly(key) => vec![key.clone()],
+            EncryptionKey::Same(key) => vec![*key],
+            EncryptionKey::DataOnly(key) => vec![*key],
             EncryptionKey::Individual((key, key2)) => {
-                vec![key.clone(), key2.clone()]
+                vec![*key, *key2]
             }
         };
 

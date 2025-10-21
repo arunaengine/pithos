@@ -324,7 +324,7 @@ impl Transformer for PithosTransformer {
         if let Some(encryption_key) = self
             .file_queue
             .front()
-            .map(|f| f.encryption_key.clone())
+            .map(|f| f.encryption_key)
             .unwrap_or_default()
         {
             // Encrypt in chunks

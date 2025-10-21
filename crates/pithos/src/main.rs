@@ -204,12 +204,8 @@ async fn main() -> Result<()> {
     // Load private key if provided
     let private_key = if let Some(key_path) = cli.private_key {
         Some(load_key_from_pem(&key_path, true)?)
-    } else if let Ok(key_bytes) =
-        load_key_from_pem(&PathBuf::from("~/.pithos/private_key.pem"), true)
-    {
-        Some(key_bytes)
     } else {
-        None
+        load_key_from_pem(&PathBuf::from("~/.pithos/private_key.pem"), true).ok()
     };
 
     // Evaluate subcommand
@@ -270,7 +266,7 @@ async fn main() -> Result<()> {
                     input_file
                         .seek(SeekFrom::End(-(needed_bytes as i64)))
                         .await?;
-                    missing_buf = vec![0; missing_bytes as usize]; // Has to be vec as length is defined by dynamic value
+                    missing_buf = vec![0; missing_bytes]; // Has to be vec as length is defined by dynamic value
                     input_file.read_exact(&mut missing_buf).await?;
 
                     parser = parser.add_bytes(&missing_buf)?;
@@ -281,10 +277,10 @@ async fn main() -> Result<()> {
                 let footer: Footer = parser.try_into()?;
 
                 // Output target ... ?
-                let base_path = Arc::new(PathBuf::from(
+                let base_path = Arc::new(
                     cli.output
                         .ok_or_else(|| anyhow!("No output target provided"))?,
-                ));
+                );
 
                 // Create directory structure
                 for dir in footer.table_of_contents.directories {
@@ -305,7 +301,7 @@ async fn main() -> Result<()> {
                             .iter()
                             .filter_map(|(k, idx)| {
                                 if let DirOrFileIdx::File(i) = idx {
-                                    Some((k.clone(), *i))
+                                    Some((*k, *i))
                                 } else {
                                     None
                                 }
@@ -364,9 +360,7 @@ async fn main() -> Result<()> {
                                         remaining = remaining.saturating_sub(bytes.len());
                                         data_sender.send(Ok(bytes)).await?;
                                     } else {
-                                        data_sender
-                                            .send(Ok(bytes.split_to(remaining as usize)))
-                                            .await?;
+                                        data_sender.send(Ok(bytes.split_to(remaining))).await?;
                                         break;
                                     }
                                 }
@@ -429,7 +423,7 @@ async fn main() -> Result<()> {
                     input_file
                         .seek(SeekFrom::End(-(needed_bytes as i64)))
                         .await?;
-                    missing_buf = vec![0; missing_bytes as usize]; // Has to be vec as length is defined by dynamic value
+                    missing_buf = vec![0; missing_bytes]; // Has to be vec as length is defined by dynamic value
                     input_file.read_exact(&mut missing_buf).await?;
 
                     parser = parser.add_bytes(&missing_buf)?;
