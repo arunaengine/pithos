@@ -459,7 +459,6 @@ mod tests {
             .await
             .unwrap();
 
-        println!("{:?}", output);
         assert_eq!(output, b"Thi".to_vec());
     }
 
@@ -1664,8 +1663,6 @@ mod tests {
 
         let encrypted_bytes =
             encrypt_chunk(&file_bytes, b"", b"wvwj3485nxgyq5ub9zd3e7jsrq7a92ea", false).unwrap();
-
-        println!("{}", encrypted_bytes.len());
 
         // Create a new GenericReadWriter that decrypts the parts
         let mut output = vec![];
