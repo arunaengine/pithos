@@ -32,7 +32,10 @@ impl Filter {
     pub fn new_with_range(filter: Range) -> Self {
         Filter {
             param: FilterParam::Discard(filter.from),
-            filter: vec![FilterParam::DiscardAll, FilterParam::Keep(filter.to)],
+            filter: vec![
+                FilterParam::DiscardAll,
+                FilterParam::Keep(filter.to - filter.from),
+            ],
             captured_buf_len: 0,
             advanced_by: 0,
             notifier: None,
@@ -125,7 +128,7 @@ impl Transformer for Filter {
     }
 
     #[tracing::instrument(level = "trace", skip(self, buf))]
-    async fn process_bytes(&mut self, buf: &mut bytes::BytesMut) -> Result<()> {
+    async fn process_bytes(&mut self, buf: &mut BytesMut) -> Result<()> {
         self.captured_buf_len = buf.len();
         self.advanced_by = 0;
 
