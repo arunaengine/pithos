@@ -696,9 +696,8 @@ mod tests {
         let stream1 = tokio_util::io::ReaderStream::new(file1);
         let stream2 = tokio_util::io::ReaderStream::new(file2);
         let chained = stream1.chain(stream2);
-        let mapped = chained.map_err(|_| {
-            Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
-        });
+        let mapped = chained
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync + 'static>::from("a_str_error"));
 
         // File context input
         let (sx, rx) = async_channel::bounded(10);
@@ -741,9 +740,8 @@ mod tests {
         let stream1 = tokio_util::io::ReaderStream::new(file1);
         let stream2 = tokio_util::io::ReaderStream::new(file2);
         let chained = stream1.chain(stream2);
-        let mapped = chained.map_err(|_| {
-            Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
-        });
+        let mapped = chained
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync + 'static>::from("a_str_error"));
 
         let (sx, rx) = async_channel::bounded(10);
         sx.send(Message::FileContext(FileContext {
@@ -819,9 +817,8 @@ mod tests {
         let stream1 = tokio_util::io::ReaderStream::new(file1);
         let stream2 = tokio_util::io::ReaderStream::new(file2);
         let chained = stream1.chain(stream2);
-        let mapped = chained.map_err(|_| {
-            Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
-        });
+        let mapped = chained
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync + 'static>::from("a_str_error"));
 
         // File context input
         let (sx, rx) = async_channel::bounded(10);
@@ -885,9 +882,8 @@ mod tests {
         let stream1 = tokio_util::io::ReaderStream::new(file1);
         let stream2 = tokio_util::io::ReaderStream::new(file2);
         let chained = stream1.chain(stream2);
-        let mapped = chained.map_err(|_| {
-            Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
-        });
+        let mapped = chained
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync + 'static>::from("a_str_error"));
 
         // File context input
         let (sx, rx) = async_channel::bounded(10);
@@ -1004,9 +1000,8 @@ mod tests {
             .unwrap_or_default();
 
         let mut tar_gz_file = File::create(&tar_gz_out_path).await.unwrap();
-        let read_stream = tokio_util::io::ReaderStream::new(pithos_in).map_err(|_| {
-            Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
-        });
+        let read_stream = tokio_util::io::ReaderStream::new(pithos_in)
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync + 'static>::from("a_str_error"));
 
         let (sx2, rx2) = async_channel::bounded(10);
         let mut reader = GenericStreamReadWriter::new_with_writer(read_stream, &mut tar_gz_file)
@@ -1038,9 +1033,8 @@ mod tests {
 
         let input_file = File::open("test.txt").await.unwrap();
         let input_size = input_file.metadata().await.unwrap().len();
-        let input_stream = tokio_util::io::ReaderStream::new(input_file).map_err(|_| {
-            Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
-        });
+        let input_stream = tokio_util::io::ReaderStream::new(input_file)
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync + 'static>::from("a_str_error"));
 
         // File context input
         let privkey_bytes = BASE64_STANDARD
@@ -1126,9 +1120,8 @@ mod tests {
 
         // Create reader stream for Pithos file
         pithos_input.seek(SeekFrom::Start(0)).await.unwrap();
-        let read_stream = tokio_util::io::ReaderStream::new(pithos_input).map_err(|_| {
-            Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
-        });
+        let read_stream = tokio_util::io::ReaderStream::new(pithos_input)
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync + 'static>::from("a_str_error"));
 
         let privkey_bytes_2 = BASE64_STANDARD
             .decode("MC4CAQAwBQYDK2VuBCIEIMhHHRAu72qdkx9I4D08RD3OQniJxGUI420aPlZwAJtX")
@@ -1188,9 +1181,8 @@ mod tests {
 
         let input_file = File::open("test.txt").await.unwrap();
         let input_size = input_file.metadata().await.unwrap().len();
-        let input_stream = tokio_util::io::ReaderStream::new(input_file).map_err(|_| {
-            Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
-        });
+        let input_stream = tokio_util::io::ReaderStream::new(input_file)
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync + 'static>::from("a_str_error"));
 
         // File context input
         let privkey_bytes = BASE64_STANDARD
@@ -1262,9 +1254,8 @@ mod tests {
         // Read footer with FooterExtractor
         let mut vec = Vec::new();
         pithos_input.seek(SeekFrom::Start(0)).await.unwrap();
-        let input_stream = tokio_util::io::ReaderStream::new(pithos_input).map_err(|_| {
-            Box::<(dyn std::error::Error + Send + Sync + 'static)>::from("a_str_error")
-        });
+        let input_stream = tokio_util::io::ReaderStream::new(pithos_input)
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync + 'static>::from("a_str_error"));
 
         let (extractor, rcv) = FooterExtractor::new(Some(privkey));
         GenericStreamReadWriter::new_with_writer(input_stream, &mut vec)
