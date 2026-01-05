@@ -212,7 +212,7 @@ impl<'a, R: AsyncRead + Unpin + Send + Sync> ReadWriter for GenericReadWriter<'a
             if let Some(context) = &file_ctx {
                 self.size_counter += read_bytes;
                 if self.size_counter > context.compressed_size as usize {
-                    let mut diff = read_bytes
+                    let mut diff = read_buf.len()
                         .saturating_sub(self.size_counter - context.compressed_size as usize);
                     if diff >= context.compressed_size as usize {
                         diff = context.compressed_size as usize
