@@ -1404,7 +1404,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pithos"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "pithos_lib"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1471,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "pithos_pyo3"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "pithos_lib",
 ]
