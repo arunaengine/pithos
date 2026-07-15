@@ -19,7 +19,6 @@ use crate::{
 };
 use fastcdc::v2020::ChunkData;
 use indexmap::IndexMap;
-use rand_core::OsRng;
 use rocrate::ROCrate;
 use std::cmp::Ordering;
 use std::fs;
@@ -81,7 +80,7 @@ impl TryFrom<&PathBuf> for InputFile {
 pub struct PithosWriter {
     // Input
     writer_key: StaticSecret, //TODO: Multiple sender keys for individual EncryptionSections
-    cdc: Option<(u32, u32, u32)>,
+    cdc: Option<(usize, usize, usize)>,
     sink: Box<dyn Write>,
 
     // Processing
@@ -94,7 +93,7 @@ impl PithosWriter {
     pub fn new(
         writer_key: StaticSecret,
         reader_keys: Vec<PublicKey>,
-        cdc: Option<(u32, u32, u32)>,
+        cdc: Option<(usize, usize, usize)>,
         sink: Box<dyn Write>,
     ) -> Result<Self, PithosError> {
         // Init encryption section
@@ -118,14 +117,14 @@ impl PithosWriter {
     pub fn new_from_file<P: AsRef<Path>>(
         writer_key: StaticSecret,
         reader_keys: Vec<PublicKey>,
-        cdc: Option<(u32, u32, u32)>,
+        cdc: Option<(usize, usize, usize)>,
         pithos_file: P,
     ) -> Result<Self, PithosError> {
         // Read existing directories
         let mut reader = PithosReaderSimple::new_with_key(&pithos_file, writer_key.clone())?;
         let (directory, offset) = reader.read_directory()?;
 
-        // Open Pithos file in append mode
+        // Open Pithos file in append write mode
         let file = fs::OpenOptions::new()
             //.read(true) //?
             .append(true)
@@ -276,7 +275,7 @@ impl PithosWriter {
         }
 
         // Create random key and encrypt file block index
-        let enc_key = StaticSecret::random_from_rng(OsRng).to_bytes();
+        let enc_key = StaticSecret::random().to_bytes();
         file_entry.block_data.encrypt(enc_key)?;
 
         // Add file entry to directory

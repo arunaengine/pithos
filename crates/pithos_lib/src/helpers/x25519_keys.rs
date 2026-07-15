@@ -23,12 +23,10 @@
 
 use pkcs8::der::EncodePem;
 use pkcs8::der::pem::PemLabel;
-use pkcs8::spki::AlgorithmIdentifier;
 use pkcs8::{
-    Document, LineEnding, ObjectIdentifier, PrivateKeyInfo, SecretDocument,
+    Document, LineEnding, ObjectIdentifier, PrivateKeyInfoRef, SecretDocument,
     SubjectPublicKeyInfoRef, der,
 };
-use rand::rngs::OsRng;
 use std::str::FromStr;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -85,7 +83,7 @@ pub enum CryptError {
 /// ```
 #[tracing::instrument(level = "trace", skip())]
 pub fn generate_private_key() -> Result<StaticSecret, CryptError> {
-    let secret = StaticSecret::random_from_rng(OsRng);
+    let secret = StaticSecret::random();
     Ok(secret)
 }
 
@@ -147,12 +145,14 @@ pub fn private_key_to_pem_bytes(key: &StaticSecret) -> Result<Vec<u8>, CryptErro
     private_key[1] = 0x20;
     private_key[2..].copy_from_slice(key.as_bytes());
 
-    let private_key_info = PrivateKeyInfo {
-        algorithm: AlgorithmIdentifier {
+    let private_key_octets = der::asn1::OctetStringRef::new(&private_key)
+        .map_err(|e| CryptError::Pkcs8Error(e.to_string()))?;
+    let private_key_info = PrivateKeyInfoRef {
+        algorithm: pkcs8::AlgorithmIdentifierRef {
             oid: ObjectIdentifier::from_str("1.3.101.110").unwrap(),
             parameters: None, // X25519 has no parameters
         },
-        private_key: &private_key,
+        private_key: private_key_octets,
         public_key: None,
     };
 
@@ -160,7 +160,7 @@ pub fn private_key_to_pem_bytes(key: &StaticSecret) -> Result<Vec<u8>, CryptErro
         .map_err(|e| CryptError::Pkcs8Error(e.to_string()))?;
 
     let pem = secret_document
-        .to_pem(PrivateKeyInfo::PEM_LABEL, LineEnding::LF)
+        .to_pem(PrivateKeyInfoRef::PEM_LABEL, LineEnding::LF)
         .map_err(|e| CryptError::Pkcs8Error(e.to_string()))?;
     Ok(pem.as_bytes().to_vec())
 }
@@ -190,7 +190,7 @@ pub fn private_key_from_pem_bytes(pem_data: &[u8]) -> Result<StaticSecret, Crypt
 
     let (label, doc) = SecretDocument::from_pem(pem_str)
         .map_err(|e| CryptError::InvalidPemFormat(e.to_string()))?;
-    PrivateKeyInfo::validate_pem_label(label)
+    PrivateKeyInfoRef::validate_pem_label(label)
         .map_err(|e| CryptError::InvalidPemFormat(e.to_string()))?;
 
     let key_bytes = match doc.as_bytes() {

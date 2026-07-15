@@ -58,7 +58,7 @@ pub fn create_symlink(
 #[tracing::instrument(level = "trace", skip(content, cdc))]
 pub fn create_stream_cdc(
     content: Box<dyn Read>,
-    cdc: Option<(u32, u32, u32)>,
+    cdc: Option<(usize, usize, usize)>,
 ) -> StreamCDC<Box<dyn Read>> {
     match cdc {
         Some((min, avg, max)) => {

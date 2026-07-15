@@ -90,7 +90,7 @@ enum PithosCommands {
         */
         /// Set values for content-defined chunking
         #[arg(long="cdc", value_parser=parse_cdc_input, value_name = "MIN,AVG,MAX")]
-        cdc: Option<(u32, u32, u32)>,
+        cdc: Option<(usize, usize, usize)>,
         /// Input files
         #[arg(value_name = "FILES")]
         files: Vec<PathBuf>,

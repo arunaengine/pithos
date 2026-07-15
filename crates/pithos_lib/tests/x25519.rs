@@ -1,4 +1,5 @@
 use pithos_lib::helpers::x25519_keys::*;
+use std::fs;
 use x25519_dalek::PublicKey;
 
 #[test]
@@ -54,6 +55,17 @@ fn test_public_key_round_trip() {
     let parsed_public = public_key_from_pem_bytes(&pem_bytes).expect("Failed to parse from PEM");
 
     assert_eq!(original_public.as_bytes(), parsed_public.as_bytes());
+}
+
+#[test]
+fn test_fixture_pem_bytes_stable() {
+    let private_pem = fs::read("tests/data/keys/sender_private.pem").unwrap();
+    let private_key = private_key_from_pem_bytes(&private_pem).unwrap();
+    assert_eq!(private_key_to_pem_bytes(&private_key).unwrap(), private_pem);
+
+    let public_pem = fs::read("tests/data/keys/sender_public.pem").unwrap();
+    let public_key = public_key_from_pem_bytes(&public_pem).unwrap();
+    assert_eq!(public_key_to_pem_bytes(&public_key).unwrap(), public_pem);
 }
 
 #[test]

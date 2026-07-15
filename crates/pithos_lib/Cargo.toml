@@ -12,18 +12,16 @@ license.workspace = true
 [dependencies]
 blake3 = "1.8.2"
 byteorder = "1.5.0"
-chacha20poly1305 = "0.10.1"
+chacha20poly1305 = "0.11.0"
 crc32fast = "1.5.0"
-digest = "0.10.7"
-fastcdc = "3.2.1"
+digest = "0.11.3"
+fastcdc = "4.0.1"
 indexmap = "2.11.0"
 integer-encoding = "4.0.2"
-pkcs8 = { version = "0.10.2", features = ["pem", "alloc"] }
-rand = "0.8.5"
-rand_core = "0.6.4"
-reqwest = {  version = "0.12.23", features = ["blocking"] }
+pkcs8 = { version = "0.11.0", features = ["pem", "alloc"] }
+reqwest = {  version = "0.13.4", features = ["blocking"] }
 rocrate = { version = "0.1.0", path = "../rocrate" }
-sha3 = "0.10.8"
+shake = "0.1.0"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 walkdir = "2.5.0"

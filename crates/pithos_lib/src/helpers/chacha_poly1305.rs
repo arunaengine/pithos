@@ -1,9 +1,7 @@
 use chacha20poly1305::{
-    AeadCore, ChaCha20Poly1305,
-    aead::{Aead, Payload},
+    ChaCha20Poly1305, KeyInit, Nonce,
+    aead::{Aead, Generate, Payload},
 };
-use digest::KeyInit;
-use rand_core::OsRng;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -24,7 +22,7 @@ pub enum ChaChaPoly1305Error {
 
 #[tracing::instrument(level = "trace", skip(msg, aad, enc))]
 pub fn encrypt_chunk(msg: &[u8], aad: &[u8], enc: &[u8]) -> Result<Vec<u8>, ChaChaPoly1305Error> {
-    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let nonce = Nonce::generate();
     let payload = Payload { msg, aad };
     let cipher = ChaCha20Poly1305::new_from_slice(enc)
         .map_err(|e| ChaChaPoly1305Error::CipherInitError(e.to_string()))?;
@@ -54,9 +52,8 @@ pub fn decrypt_chunk(
 
     let (nonce_slice, data) = chunk.split_at(12);
 
-    if nonce_slice.len() != 12 {
-        return Err(ChaChaPoly1305Error::InvalidNonce(nonce_slice.len()));
-    }
+    let nonce = <&Nonce>::try_from(nonce_slice)
+        .map_err(|_| ChaChaPoly1305Error::InvalidNonce(nonce_slice.len()))?;
 
     let cipher = ChaCha20Poly1305::new_from_slice(decryption_key)
         .map_err(|e| ChaChaPoly1305Error::CipherInitError(e.to_string()))?;
@@ -67,6 +64,6 @@ pub fn decrypt_chunk(
     };
 
     cipher
-        .decrypt(nonce_slice.into(), payload)
+        .decrypt(nonce, payload)
         .map_err(|e| ChaChaPoly1305Error::DecryptionError(e.to_string()))
 }

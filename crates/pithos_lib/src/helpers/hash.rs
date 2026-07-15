@@ -1,5 +1,5 @@
 use digest::{ExtendableOutput, Update, XofReader};
-use sha3::Shake256;
+use shake::Shake256;
 
 pub struct Hasher {
     blake3: blake3::Hasher,
