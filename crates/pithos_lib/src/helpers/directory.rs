@@ -102,39 +102,7 @@ impl DirectoryBuilder {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn build(self) -> Result<Directory, SerializationError> {
-        // Calculate CRC32 of all fields using bincode serialization
-        let mut buf = Vec::new();
-        if let Some((start, len)) = self.parent_directory_offset {
-            buf.extend(&[1u8]);
-            buf.write_varint(start)?;
-            buf.write_varint(len)?;
-        }
-        for (hash, block) in &self.blocks {
-            buf.write_all(hash)?;
-            block.serialize(&mut buf)?
-        }
-        for (id, path, file) in &self.files {
-            buf.write_varint::<u64>(id)?;
-            encode_string(&mut buf, path)?;
-            file.serialize(&mut buf)?
-        }
-        buf.write_varint(self.relations.len() as u64)?;
-        for (idx, name) in &self.relations {
-            buf.write_varint(*idx)?;
-            encode_string(&mut buf, name)?;
-        }
-        for (key, enc) in &self.encryption {
-            buf.write_all(key)?;
-            enc.serialize(&mut buf)?
-        }
-        buf.write_varint(self.dir_len)?;
-
-        // Calculate CRC32 checksum
-        let mut hasher = Hasher::new();
-        hasher.update(&buf);
-        let checksum = hasher.finalize();
-
-        Ok(Directory {
+        let mut directory = Directory {
             identifier: self.identifier,
             parent_directory_offset: self.parent_directory_offset,
             files: self.files,
@@ -142,8 +110,10 @@ impl DirectoryBuilder {
             relations: self.relations,
             encryption: self.encryption,
             dir_len: self.dir_len,
-            crc32: checksum,
-        })
+            crc32: 0,
+        };
+        directory.update_crc32()?;
+        Ok(directory)
     }
 }
 

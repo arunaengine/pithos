@@ -431,7 +431,7 @@ fn main() -> Result<(), PithosCliError> {
                     )?;
 
                     let directory = writer.get_directory_mut();
-                    for (id, fe) in fes {
+                    for (id, _) in fes {
                         let enc_key =
                             directory
                                 .get_file_encryption_key(id)
