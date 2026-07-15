@@ -9,7 +9,6 @@ use pithos_lib::helpers::x25519_keys::{
 };
 use pithos_lib::io::pithosreader::PithosReaderSimple;
 use pithos_lib::io::pithoswriter::{InputFile, PithosWriter};
-use pithos_lib::model::structs::FileEntry;
 use std::fs::File;
 use std::io::Write;
 use std::ops::Range;
@@ -267,7 +266,7 @@ fn main() -> Result<(), PithosCliError> {
                 directory
                     .files
                     .iter()
-                    .for_each(|f| println!("{} {:?} {}", f.file_id, f.file_type, f.path))
+                    .for_each(|(id, path, fe)| println!("{} {:?} {}", id, fe.file_type, path))
             }
             ReadCommands::All { file } => {
                 let key = load_private_key_from_pem(
@@ -278,8 +277,8 @@ fn main() -> Result<(), PithosCliError> {
                 let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
                 let (directory, _) = reader.read_directory()?;
 
-                for fe in directory.files.iter() {
-                    reader.read_file(&fe.path, &directory, cli.output.as_ref(), None)?;
+                for path in directory.files.get_paths_ref() {
+                    reader.read_file(path, &directory, cli.output.as_ref(), None)?;
                 }
             }
             ReadCommands::Data {
@@ -408,11 +407,14 @@ fn main() -> Result<(), PithosCliError> {
                     let mut fes = vec![];
                     if let Some(ids) = ids {
                         for id in ids {
-                            fes.push(directory.get_file_by_id(id).ok_or(
-                                PithosError::FileNotFound(format!(
-                                    "File with id {id} not available."
-                                )),
-                            )?);
+                            fes.push((
+                                id,
+                                directory
+                                    .get_file_by_id(id)
+                                    .ok_or(PithosError::FileNotFound(format!(
+                                        "File with id {id} not available."
+                                    )))?,
+                            ));
                         }
                     }
                     if fes.is_empty() {
@@ -429,20 +431,16 @@ fn main() -> Result<(), PithosCliError> {
                     )?;
 
                     let directory = writer.get_directory_mut();
-                    for fe in fes {
-                        let enc_key = directory.get_file_encryption_key(fe.file_id).ok_or(
-                            PithosError::Other(format!(
-                                "Could not extract encryption key for file {}",
-                                fe.file_id
-                            )),
-                        )?;
+                    for (id, fe) in fes {
+                        let enc_key =
+                            directory
+                                .get_file_encryption_key(id)
+                                .ok_or(PithosError::Other(format!(
+                                    "Could not extract encryption key for file {id}"
+                                )))?;
 
                         for reader in &reader_keys {
-                            directory.add_file_to_recipient(
-                                &sender_key,
-                                reader,
-                                (fe.file_id, enc_key),
-                            )?;
+                            directory.add_file_to_recipient(&sender_key, reader, (id, enc_key))?;
                         }
                     }
 

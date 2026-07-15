@@ -1,6 +1,6 @@
 [package]
 name = "pithos_lib"
-description = "Library and components for encrypting / compressing pithos (.pto) files, including specification"
+description = "Library and components for encrypting / compressing pithos (.pith) files, including specification"
 version = "0.7.0"
 authors.workspace = true
 edition.workspace = true
@@ -22,7 +22,7 @@ pkcs8 = { version = "0.10.2", features = ["pem", "alloc"] }
 rand = "0.8.5"
 rand_core = "0.6.4"
 reqwest = {  version = "0.12.23", features = ["blocking"] }
-rocrate = { path = "../rocrate" }
+rocrate = { version = "0.1.0", path = "../rocrate" }
 sha3 = "0.10.8"
 thiserror = { workspace = true }
 tracing = { workspace = true }

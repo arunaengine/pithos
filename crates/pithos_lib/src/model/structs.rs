@@ -4,6 +4,7 @@ use crate::io::util::{current_timestamp, get_symlink_target};
 use std::fmt::{Display, Formatter};
 
 use crate::error::PithosError;
+use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use indexmap::IndexMap;
 use integer_encoding::VarIntWriter;
 use rocrate::DataEntity;
@@ -118,6 +119,12 @@ impl Default for ProcessingFlags {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Credentials {
+    UserPass((String, String)), // (Username, Password) -> Basic Auth
+    Token(String),              // Token                -> Bearer Auth
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockLocation {
     Local,                    // Block data at specified offset in this file
     External { url: String }, // URL to external storage
@@ -125,8 +132,6 @@ pub enum BlockLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockIndexEntry {
-    //pub index: u64,              // varint
-    //pub hash: [u8; 32],          // Blake3 hash
     pub offset: u64,             // varint
     pub stored_size: u64,        // varint
     pub original_size: u64,      // varint
@@ -139,7 +144,7 @@ pub struct Directory {
     pub identifier: [u8; 8],                               // MUST be b"PITHOSDR"
     pub parent_directory_offset: Option<(u64, u64)>,       // (start, len) varint
     pub blocks: IndexMap<[u8; 32], BlockIndexEntry>,       // Blocks in this segment
-    pub files: Vec<FileEntry>,                             // Files in this segment
+    pub files: FileEntryMap,                               // Files in this segment
     pub relations: Vec<(u64, String)>,                     // Relation idx, relationname/id
     pub encryption: IndexMap<[u8; 32], EncryptionSection>, // (Sender's X25519 public key, section with recipients)
     pub dir_len: u64,
@@ -244,8 +249,6 @@ impl BlockDataState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
-    pub file_id: u64,
-    pub path: String,
     pub file_type: FileType,
     pub block_data: BlockDataState,
     pub created: u64,
@@ -258,8 +261,6 @@ pub struct FileEntry {
 
 impl Display for FileEntry {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&format!("{:<12} {}\n", "File Id:", self.file_id))?;
-        f.write_str(&format!("{:<12} {}\n", "Path:", self.path))?;
         f.write_str(&format!("{:<12} {:?}\n", "Type:", self.file_type))?;
         match &self.block_data {
             BlockDataState::Encrypted(_) => f.write_str("Blocks:      Encrypted\n")?,
@@ -279,20 +280,15 @@ impl Display for FileEntry {
 }
 
 impl FileEntry {
-    #[tracing::instrument(
-        level = "trace",
-        skip(file_id, file_type, disk_path, pithos_path, metadata)
-    )]
+    #[tracing::instrument(level = "trace", skip(file_type, disk_path, metadata))]
     pub fn new(
-        file_id: Option<u64>,
         file_type: FileType,
         disk_path: &str,
-        pithos_path: &str,
         metadata: &Metadata,
     ) -> Result<Self, PithosError> {
         Ok(FileEntry {
-            file_id: file_id.unwrap_or(0),
-            path: pithos_path.to_string(),
+            //file_id: file_id.unwrap_or(0),
+            //path: pithos_path.to_string(),
             file_type,
             block_data: BlockDataState::Decrypted(vec![]),
             created: metadata
@@ -319,10 +315,8 @@ impl FileEntry {
     #[tracing::instrument(
         level = "trace",
         skip(
-            file_id,
             file_type,
             disk_path,
-            pithos_path,
             created,
             modified,
             permissions,
@@ -331,10 +325,8 @@ impl FileEntry {
         )
     )]
     pub fn new_ext(
-        file_id: Option<u64>,
         file_type: FileType,
         disk_path: &str,
-        pithos_path: &str,
         created: Option<SystemTime>,
         modified: Option<SystemTime>,
         permissions: Option<u32>,
@@ -342,8 +334,6 @@ impl FileEntry {
         file_size: Option<u64>,
     ) -> Result<Self, PithosError> {
         Ok(FileEntry {
-            file_id: file_id.unwrap_or(0),
-            path: pithos_path.to_string(),
             file_type,
             block_data: BlockDataState::Decrypted(vec![]),
             created: created
@@ -365,23 +355,18 @@ impl FileEntry {
         })
     }
 
-    #[tracing::instrument(level = "trace", skip(file_id, file_type, pithos_path, content))]
-    pub fn new_from_content(
-        file_id: Option<u64>,
-        file_type: FileType,
-        pithos_path: &str,
-        content: &Content,
-    ) -> Result<Self, PithosError> {
+    #[tracing::instrument(level = "trace", skip(file_type, content))]
+    pub fn new_from_content(file_type: FileType, content: &Content) -> Result<Self, PithosError> {
         Ok(match content {
             Content::File(disk_path) => {
                 let file_metadata = symlink_metadata(disk_path)?;
-                FileEntry::new(file_id, file_type, disk_path, pithos_path, &file_metadata)?
+                FileEntry::new(file_type, disk_path, &file_metadata)?
             }
             Content::Raw(raw_content) => {
                 let current_timestamp = current_timestamp()?;
                 FileEntry {
-                    file_id: file_id.unwrap_or(0),
-                    path: pithos_path.to_string(),
+                    //file_id: file_id.unwrap_or(0),
+                    //path: pithos_path.to_string(),
                     file_type,
                     block_data: BlockDataState::Decrypted(vec![]),
                     created: current_timestamp,
@@ -398,18 +383,11 @@ impl FileEntry {
         })
     }
 
-    #[tracing::instrument(level = "trace", skip(file_id, path, file, metadata))]
-    pub fn new_from_file(
-        file_id: u64,
-        path: String,
-        file: &std::fs::File,
-        metadata: Metadata,
-    ) -> Result<Self, PithosError> {
+    #[tracing::instrument(level = "trace", skip(file, metadata))]
+    pub fn new_from_file(file: &std::fs::File, metadata: Metadata) -> Result<Self, PithosError> {
         // Evaluate file type and create file entry
         let file_type = FileType::try_from(&metadata)?;
         Ok(FileEntry {
-            file_id,
-            path: path.clone(),
             file_type,
             block_data: BlockDataState::Decrypted(Vec::new()),
             created: metadata
@@ -433,29 +411,35 @@ impl FileEntry {
         })
     }
 
-    #[tracing::instrument(level = "trace", skip(other_file, meta_length))]
-    pub fn meta_from(other_file: &FileEntry, meta_length: u64) -> Result<Self, PithosError> {
+    #[tracing::instrument(level = "trace", skip(other_file_id, other_file_entry, meta_length))]
+    pub fn meta_from(
+        other_file_id: u64,
+        other_file_entry: &FileEntry,
+        meta_length: u64,
+    ) -> Result<Self, PithosError> {
         Ok(FileEntry {
-            file_id: other_file.file_id - 1,
-            path: format!("{}.meta", other_file.path),
+            //file_id: other_file.file_id - 1,
+            //path: format!("{}.meta", other_file.path),
             file_type: FileType::Metadata,
             block_data: BlockDataState::Decrypted(Vec::new()),
             created: current_timestamp()?, // Just inherit from other file?
             modified: current_timestamp()?, // Just inherit from other file?
             file_size: meta_length,
-            permissions: other_file.permissions,
+            permissions: other_file_entry.permissions,
             references: vec![Reference {
-                target_file_id: other_file.file_id,
+                target_file_id: other_file_id,
                 relationship: 0,
             }],
             symlink_target: None,
         })
     }
 
+    /*
     #[tracing::instrument(level = "trace", skip(self, file_id))]
     pub fn set_file_id(&mut self, file_id: u64) {
         self.file_id = file_id;
     }
+    */
 
     #[tracing::instrument(level = "trace", skip(self, entry))]
     pub fn add_block_data(&mut self, entry: ([u8; 32], [u8; 32])) -> Result<(), PithosError> {
@@ -479,13 +463,31 @@ pub struct Reference {
     pub relationship: u64,   // varint
 }
 
-impl TryFrom<&mut FileEntry> for Reference {
+impl TryFrom<(u64, &mut FileEntry)> for Reference {
     type Error = PithosError;
 
-    fn try_from(value: &mut FileEntry) -> Result<Self, Self::Error> {
+    fn try_from(value: (u64, &mut FileEntry)) -> Result<Self, Self::Error> {
+        let (target_file_id, file_entry) = value;
         Ok(Reference {
-            target_file_id: value.file_id,
-            relationship: match value.file_type {
+            target_file_id,
+            relationship: match file_entry.file_type {
+                FileType::Directory => 6, // PART_OF
+                FileType::Data => 7,      // DERIVED_FROM
+                FileType::Metadata => 0,  // DESCRIBES
+                FileType::Symlink => 3,   // SOURCE
+            },
+        })
+    }
+}
+
+impl TryFrom<(&Key, &mut FileEntry)> for Reference {
+    type Error = PithosError;
+
+    fn try_from(value: (&Key, &mut FileEntry)) -> Result<Self, Self::Error> {
+        let (file_entry_key, file_entry) = value;
+        Ok(Reference {
+            target_file_id: file_entry_key.id(),
+            relationship: match file_entry.file_type {
                 FileType::Directory => 6, // PART_OF
                 FileType::Data => 7,      // DERIVED_FROM
                 FileType::Metadata => 0,  // DESCRIBES

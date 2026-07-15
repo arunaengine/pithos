@@ -1,4 +1,5 @@
 use crate::error::PithosError;
+use crate::helpers::file_entry_map::{FileEntryMap, Key, KeyQuery};
 use crate::model::serialization::encode_string;
 use crate::model::structs::{RecipientData, RecipientSection};
 use crate::model::{
@@ -15,7 +16,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 pub struct DirectoryBuilder {
     identifier: [u8; 8],
     parent_directory_offset: Option<(u64, u64)>,
-    files: Vec<FileEntry>,
+    files: FileEntryMap,
     blocks: IndexMap<[u8; 32], BlockIndexEntry>,
     relations: Vec<(u64, String)>,
     encryption: IndexMap<[u8; 32], EncryptionSection>,
@@ -34,7 +35,7 @@ impl DirectoryBuilder {
         DirectoryBuilder {
             identifier: *b"PITHOSDR",
             parent_directory_offset: None,
-            files: vec![],
+            files: FileEntryMap::new(),
             blocks: IndexMap::new(),
             relations: Self::default_relations(),
             encryption: IndexMap::new(),
@@ -64,7 +65,7 @@ impl DirectoryBuilder {
     }
 
     #[tracing::instrument(level = "trace", skip(self, files))]
-    pub fn files(mut self, files: Vec<FileEntry>) -> Self {
+    pub fn files(mut self, files: FileEntryMap) -> Self {
         self.files = files;
         self
     }
@@ -108,12 +109,14 @@ impl DirectoryBuilder {
             buf.write_varint(start)?;
             buf.write_varint(len)?;
         }
-        for file in &self.files {
-            file.serialize(&mut buf)?
-        }
         for (hash, block) in &self.blocks {
             buf.write_all(hash)?;
             block.serialize(&mut buf)?
+        }
+        for (id, path, file) in &self.files {
+            buf.write_varint::<u64>(id)?;
+            encode_string(&mut buf, &path)?;
+            file.serialize(&mut buf)?
         }
         buf.write_varint(self.relations.len() as u64)?;
         for (idx, name) in &self.relations {
@@ -226,16 +229,38 @@ impl Directory {
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self, file_entry))]
-    pub fn add_file_to_index(&mut self, file_entry: &FileEntry) -> Result<(), PithosError> {
-        self.files.push(file_entry.clone());
+    #[tracing::instrument(level = "trace", skip(self, path, file_entry))]
+    pub fn add_file(&mut self, path: &str, file_entry: &FileEntry) -> Result<(), PithosError> {
+        let key = Key::new(
+            self.files
+                .next_free_id(self.parent_directory_offset.is_some()),
+            path.to_owned(),
+        );
+        self.files.insert(key, file_entry.clone())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, files))]
+    pub fn add_files(&mut self, files: Vec<(&str, &FileEntry)>) -> Result<(), PithosError> {
+        for (path, file_entry) in files {
+            self.add_file(path, file_entry)?
+        }
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, file_entry))]
+    pub fn add_file_to_index(
+        &mut self,
+        key: &Key,
+        file_entry: &FileEntry,
+    ) -> Result<(), PithosError> {
+        self.files.insert(key.clone(), file_entry.clone())
+    }
+
     #[tracing::instrument(level = "trace", skip(self, file_entries))]
-    pub fn add_files_to_index(&mut self, file_entries: Vec<FileEntry>) -> Result<(), PithosError> {
-        for entry in file_entries {
-            self.add_file_to_index(&entry)?;
+    pub fn add_files_to_index(&mut self, file_entries: FileEntryMap) -> Result<(), PithosError> {
+        for (id, path, file) in &file_entries {
+            let key = Key::new(id, path);
+            self.add_file_to_index(&key, file)?
         }
         Ok(())
     }
@@ -321,21 +346,26 @@ impl Directory {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn next_free_file_index(&self) -> u64 {
-        if let Some(idx) = self.files.iter().max_by_key(|file| file.file_id) {
-            idx.file_id + 1
-        } else {
+        self.files
+            .next_free_id(self.parent_directory_offset.is_some())
+        /*
+        let current_id = self.files.get_current_max_id();
+        if current_id == 0 {
             0
+        } else {
+            current_id + 1
         }
+        */
     }
 
     #[tracing::instrument(level = "trace", skip(self, path))]
     pub fn get_file_by_path(&self, path: &str) -> Option<&FileEntry> {
-        self.files.iter().find(|file| file.path == path)
+        self.files.get(&KeyQuery::Path(path.to_owned()))
     }
 
     #[tracing::instrument(level = "trace", skip(self, file_id))]
     pub fn get_file_by_id(&self, file_id: u64) -> Option<&FileEntry> {
-        self.files.iter().find(|file| file.file_id == file_id)
+        self.files.get(&KeyQuery::Id(file_id))
     }
 
     // Checks only decrypted recipient sections
@@ -440,7 +470,9 @@ impl Directory {
             buf.write_varint(start)?;
             buf.write_varint(len)?;
         }
-        for file in &self.files {
+        for (id, path, file) in &self.files {
+            buf.write_varint(id)?;
+            encode_string(&mut buf, &path)?;
             file.serialize(&mut buf)?
         }
         for (hash, block) in &self.blocks {

@@ -6,6 +6,8 @@
 // - Strings: UTF-8 with varint length prefix
 // - Error handling via DeserializationError
 
+use crate::error::PithosError;
+use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use crate::model::structs::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use indexmap::IndexMap;
@@ -137,7 +139,7 @@ impl BlockIndexEntry {
 // Directory
 impl Directory {
     #[tracing::instrument(level = "trace", skip(reader))]
-    pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
+    pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, PithosError> {
         // Read static directory identifier
         let mut identifier = [0u8; 8];
         reader.read_exact(&mut identifier)?;
@@ -152,14 +154,16 @@ impl Directory {
                 let len = reader.read_varint::<u64>()?;
                 Some((start, len))
             }
-            _ => return Err(DeserializationError::InvalidOption),
+            _ => return Err(PithosError::from(DeserializationError::InvalidOption)),
         };
 
         // Read file entries
-        let files_len = reader.read_varint()?;
-        let mut files = Vec::with_capacity(files_len);
+        let mut files = FileEntryMap::new();
+        let files_len = reader.read_varint::<u64>()?;
         for _ in 0..files_len {
-            files.push(FileEntry::deserialize(reader)?);
+            let id = reader.read_varint::<u64>()?;
+            let path = decode_string(reader)?;
+            files.insert(Key::new(id, path), FileEntry::deserialize(reader)?)?;
         }
 
         let blocks_len = reader.read_varint::<u64>()?;
@@ -270,8 +274,6 @@ impl BlockDataState {
 impl FileEntry {
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let file_id: u64 = reader.read_varint()?;
-        let path = decode_string(reader)?;
         let file_type = FileType::deserialize(reader)?;
         let block_data = BlockDataState::deserialize(reader)?;
         let created: u64 = reader.read_varint()?;
@@ -291,8 +293,6 @@ impl FileEntry {
             _ => return Err(DeserializationError::InvalidOption),
         };
         Ok(FileEntry {
-            file_id,
-            path,
             file_type,
             block_data,
             created,
