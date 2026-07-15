@@ -197,10 +197,13 @@ impl TryFrom<&DataEntity> for FileType {
     }
 }
 
+/// A block's content hash and the key used to encrypt its content.
+pub type BlockDataEntry = ([u8; 32], [u8; 32]);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockDataState {
-    Encrypted(Vec<u8>),                   // Chacha + nonce (Random key)
-    Decrypted(Vec<([u8; 32], [u8; 32])>), // BLAKE3 hash / Shake256 hash
+    Encrypted(Vec<u8>),             // Chacha + nonce (Random key)
+    Decrypted(Vec<BlockDataEntry>), // BLAKE3 hash / Shake256 hash
 }
 
 impl BlockDataState {
@@ -442,7 +445,7 @@ impl FileEntry {
     */
 
     #[tracing::instrument(level = "trace", skip(self, entry))]
-    pub fn add_block_data(&mut self, entry: ([u8; 32], [u8; 32])) -> Result<(), PithosError> {
+    pub fn add_block_data(&mut self, entry: BlockDataEntry) -> Result<(), PithosError> {
         match self.block_data {
             BlockDataState::Encrypted(_) => {
                 return Err(PithosError::InvalidBlockDataState(

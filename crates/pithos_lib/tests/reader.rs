@@ -56,7 +56,7 @@ fn test_reader_file_ranges() {
     let temp_dir = TempDir::new().unwrap();
     let outfile_single = temp_dir.path().join("range.txt");
     let outfile_multi = temp_dir.path().join("ranges.txt");
-    if let Some(entry) = directory.get_file_by_path("t8.shakespeare.txt") {
+    if let Some(_) = directory.get_file_by_path("t8.shakespeare.txt") {
         reader
             .read_file(
                 "t8.shakespeare.txt",

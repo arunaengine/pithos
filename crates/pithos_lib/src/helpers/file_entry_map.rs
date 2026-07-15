@@ -252,14 +252,14 @@ impl FileEntryMap {
             KeyQuery::Id(id) => {
                 if let Some(path) = self.get_path_by_id(id) {
                     let key = Key::new(*id, path);
-                    Some((key, &entry))
+                    Some((key, entry))
                 } else {
                     None
                 }
             }
             KeyQuery::Path(path) => {
                 if let Some(id) = self.get_id_by_path(path) {
-                    Some((Key::new(id, path.clone()), &entry))
+                    Some((Key::new(id, path.clone()), entry))
                 } else {
                     None
                 }

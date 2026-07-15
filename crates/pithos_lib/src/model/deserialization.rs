@@ -256,7 +256,7 @@ impl BlockDataState {
     pub fn deserialize_block_index<R: Read>(
         &self,
         reader: &mut R,
-    ) -> Result<Vec<([u8; 32], [u8; 32])>, DeserializationError> {
+    ) -> Result<Vec<BlockDataEntry>, DeserializationError> {
         let list_len = reader.read_varint()?;
         let mut list = Vec::with_capacity(list_len);
         for _ in 0..list_len {

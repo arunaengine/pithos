@@ -174,20 +174,15 @@ impl Default for ROCrate {
 }
 
 /// Loading mode for RO-Crate operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LoadingMode {
     /// Load the entire crate into memory
+    #[default]
     InMemory,
     /// Stream large files on demand
     Streaming,
     /// Load entities lazily as requested
     Lazy,
-}
-
-impl Default for LoadingMode {
-    fn default() -> Self {
-        Self::InMemory
-    }
 }
 
 /// File reference within an RO-Crate.

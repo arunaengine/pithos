@@ -115,7 +115,7 @@ impl DirectoryBuilder {
         }
         for (id, path, file) in &self.files {
             buf.write_varint::<u64>(id)?;
-            encode_string(&mut buf, &path)?;
+            encode_string(&mut buf, path)?;
             file.serialize(&mut buf)?
         }
         buf.write_varint(self.relations.len() as u64)?;
@@ -472,7 +472,7 @@ impl Directory {
         }
         for (id, path, file) in &self.files {
             buf.write_varint(id)?;
-            encode_string(&mut buf, &path)?;
+            encode_string(&mut buf, path)?;
             file.serialize(&mut buf)?
         }
         for (hash, block) in &self.blocks {

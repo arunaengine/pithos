@@ -304,7 +304,7 @@ impl PithosWriter {
                     let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
                     let handle = Box::new(File::open(disk_path)?);
                     self.process_file_entry(
-                        &meta_file_path,
+                        meta_file_path,
                         &mut meta_file,
                         &processing_flags,
                         handle,
@@ -314,7 +314,7 @@ impl PithosWriter {
                     let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
                     let handle = Box::new(Cursor::new(raw_content.clone().into_bytes()));
                     self.process_file_entry(
-                        &meta_file_path,
+                        meta_file_path,
                         &mut meta_file,
                         &processing_flags,
                         handle,
