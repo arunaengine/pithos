@@ -44,13 +44,14 @@ pub fn create_symlink(
     target: &str,
     base_dir: Option<&PathBuf>,
 ) -> Result<(), PithosError> {
-    // If no output path provided create symlink in current working directory
-    let (path, target) = if let Some(base_dir) = base_dir {
-        (base_dir.join(path), base_dir.join(target))
+    // Resolve only the link location. The target is stored verbatim so relative
+    // targets remain relative to the created symlink.
+    let path = if let Some(base_dir) = base_dir {
+        base_dir.join(path)
     } else {
-        (current_dir()?.join(path), current_dir()?.join(target))
+        current_dir()?.join(path)
     };
-    std::os::unix::fs::symlink(path, target)?;
+    std::os::unix::fs::symlink(target, path)?;
 
     Ok(())
 }
