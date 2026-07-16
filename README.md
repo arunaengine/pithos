@@ -29,6 +29,7 @@ Pithos (a large ancient greek storage container) is a packaging file format for 
 - **Smart Compression**: Via compression probing Pithos can automatically detect and apply fast ZStandard compression for compressible data and optionally skip it when the data is incompressible.
 - **Metadata**: Pithos not only includes technical metadata like file size and checksums but can also embed any semantic metadata directly in the file.
 - **Indexing**: A built in index allows for fast random access of arbitrary ranges in encrypted and compressed files.
+- **RO-Crate ingestion**: Directories and ZIP archives can be converted to Pithos; ZIP members are streamed without extraction.
 - **Tooling**: Pithos comes with a rich set of existing tools that simplify file handling and can additionally be handled with existing tools for the Crypt4GH and Zstandard file formats.
 
 Pithos comes with two main crates, a library for programmatic use and a CLI application that uses the library:
