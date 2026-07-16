@@ -5,19 +5,19 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.1"
 authors = ["Jannis Schlegel <das_Abroxas@proton.me>", "Sebastian Beyvers <sb@pus.de>"]
 edition = "2024"
 repository = "https://github.com/arunaengine/pithos"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-thiserror = "2.0.16"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = [
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
     "time",
     "fmt",
     "registry",
 ] }
-x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }

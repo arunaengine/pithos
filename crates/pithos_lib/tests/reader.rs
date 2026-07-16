@@ -13,6 +13,7 @@ use std::fs::{File, OpenOptions, read_to_string};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use tempfile::TempDir;
+use x25519_dalek::StaticSecret;
 
 #[test]
 fn test_reader_single_file() {
@@ -31,6 +32,19 @@ fn test_reader_single_file() {
 }
 
 #[test]
+fn test_reader_hides_files_without_keys() {
+    let temp_dir = TempDir::new().unwrap();
+    let pithos_file = write_dummy_pithos(&temp_dir, false, false);
+    let unauthorized_key = StaticSecret::from([0x42; 32]);
+
+    let mut reader = PithosReaderSimple::new_with_key(pithos_file, unauthorized_key).unwrap();
+    let (directory, _) = reader.read_directory().unwrap();
+
+    assert!(directory.files.is_empty());
+    assert!(reader.read_file_paths(&directory).unwrap().is_empty());
+}
+
+#[test]
 fn test_reader_file_ranges() {
     let temp_dir = TempDir::new().unwrap();
     let pithos_file = write_dummy_pithos(&temp_dir, false, false);
@@ -42,10 +56,10 @@ fn test_reader_file_ranges() {
     let temp_dir = TempDir::new().unwrap();
     let outfile_single = temp_dir.path().join("range.txt");
     let outfile_multi = temp_dir.path().join("ranges.txt");
-    if let Some(entry) = directory.get_file_by_path("t8.shakespeare.txt") {
+    if let Some(_) = directory.get_file_by_path("t8.shakespeare.txt") {
         reader
             .read_file(
-                &entry.path,
+                "t8.shakespeare.txt",
                 &directory,
                 Some(&outfile_single),
                 Some(vec![261..272]),
@@ -55,7 +69,7 @@ fn test_reader_file_ranges() {
 
         reader
             .read_file(
-                &entry.path,
+                "t8.shakespeare.txt",
                 &directory,
                 Some(&outfile_multi),
                 Some(vec![261..272, 1434..1441]),

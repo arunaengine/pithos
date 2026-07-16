@@ -1,6 +1,24 @@
-/target
-./tes*
-tst*
-test.txt.*
+# Cargo build output
+/target/
+
+# rustfmt backups
+**/*.rs.bk
+
+# MSVC debug symbols
+*.pdb
+
+# cargo-mutants output
+**/mutants.out*/
+
+# rustc internal compiler error dumps
+rustc-ice-*.txt
+
+# Local notes/scratch files
 todo.md
-.idea
+
+# Local IDE config
+.idea/
+
+# Local agent/tooling state
+.opencode/
+.junie/

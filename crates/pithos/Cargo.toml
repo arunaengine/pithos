@@ -1,17 +1,17 @@
 [package]
 name = "pithos"
 description = "CLI for the Pithos container file format"
-version = "0.7.0"
+version = "0.7.1"
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
 
 [dependencies]
-clap = { version = "4.5.21", features = ["derive"] }
-pithos_lib = { path = "../pithos_lib" }
+clap = { version = "4.6.1", features = ["derive"] }
+pithos_lib = { version = "0.7.1", path = "../pithos_lib" }
 thiserror = { workspace = true }
-tracing = "0.1.40"
-tracing-subscriber = {version = "0.3.18", features = ["env-filter", "time"]}
-x25519-dalek = {workspace = true}
+tracing.workspace = true
+tracing-subscriber.workspace = true
+x25519-dalek.workspace = true
 #indicatif = "0.17.9"

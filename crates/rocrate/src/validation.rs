@@ -15,20 +15,15 @@ lazy_static! {
 }
 
 /// Validation strictness levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidationLevel {
     /// Permissive - only warnings for non-critical issues
     Permissive,
     /// Standard - enforce RO-Crate specification compliance
+    #[default]
     Standard,
     /// Strict - full specification compliance with no warnings
     Strict,
-}
-
-impl Default for ValidationLevel {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 /// Validation report containing errors and warnings.

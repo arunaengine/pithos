@@ -1,6 +1,7 @@
 use crate::error::PithosError;
 use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
 use crate::helpers::crypt4gh::{CRYPT4GH_BLOCK_SIZE, Crypt4GHHeader, HeaderPacket};
+use crate::helpers::file_entry_map::KeyQuery;
 use crate::helpers::x25519_keys::private_key_from_pem_bytes;
 use crate::helpers::zstd::decompress_data;
 use crate::io::util::{create_dir, create_symlink};
@@ -106,17 +107,25 @@ impl PithosReaderSimple {
             directory = older_directory;
         }
 
-        // Remove all files from directory which cannot be decrypted
-        directory.files.retain_mut(|file| match file.block_data {
-            BlockDataState::Decrypted(_) => true,
-            BlockDataState::Encrypted(_) => {
-                if let Some(block_key) = available_file_keys.get(&file.file_id) {
-                    file.block_data.decrypt(block_key).is_ok()
-                } else {
-                    false
-                }
-            }
-        });
+        // Remove entries whose encrypted block indexes are unavailable to this reader.
+        directory
+            .files
+            .retain_mut(|id, path, file| match &mut file.block_data {
+                BlockDataState::Decrypted(_) => true,
+                BlockDataState::Encrypted(_) => match available_file_keys.get(&id) {
+                    Some(block_key) => match file.block_data.decrypt(block_key) {
+                        Ok(_) => {
+                            tracing::info!("Successfully decrypted {path}");
+                            true
+                        }
+                        Err(_) => {
+                            tracing::warn!("Could not decrypt {path}");
+                            false
+                        }
+                    },
+                    None => false,
+                },
+            })?;
 
         Ok((directory, (parent_dir_start, parent_dir_len)))
     }
@@ -129,7 +138,7 @@ impl PithosReaderSimple {
         Ok(directory
             .files
             .iter()
-            .map(|f| (f.file_type, f.path.clone()))
+            .map(|(_, p, f)| (f.file_type, p.to_owned()))
             .collect())
     }
 
@@ -146,8 +155,7 @@ impl PithosReaderSimple {
     ) -> Result<(), PithosError> {
         let file_entry = directory
             .files
-            .iter()
-            .find(|file| file.path == inner_path)
+            .get(&KeyQuery::Path(inner_path.to_string()))
             .ok_or(PithosError::FileNotFound(inner_path.to_string()))?;
 
         match &file_entry.file_type {
@@ -180,12 +188,12 @@ impl PithosReaderSimple {
             }
             FileType::Directory => {
                 // Create directory (parent?)
-                create_dir(&file_entry.path, output_path)?;
+                create_dir(inner_path, output_path)?;
             }
             FileType::Symlink => {
                 // Create symlink (UNIX only)
                 create_symlink(
-                    &file_entry.path,
+                    inner_path,
                     file_entry
                         .symlink_target
                         .as_ref()
@@ -219,12 +227,16 @@ impl PithosReaderSimple {
         }
 
         // Generate Crypt4GH header packets from keys
-        let data_key = directory
-            .get_file_encryption_key(file_entry.file_id)
-            .ok_or(PithosError::FileNotFound(format!(
-                "Could not extract key for file: {}",
-                inner_path
-            )))?;
+        let file_id = directory.files.get_id_by_path(inner_path).ok_or_else(|| {
+            PithosError::Other(format!("Could not find file id for {inner_path}"))
+        })?;
+        let data_key =
+            directory
+                .get_file_encryption_key(file_id)
+                .ok_or(PithosError::FileNotFound(format!(
+                    "Could not extract key for file: {}",
+                    inner_path
+                )))?;
         let packets = HeaderPacket::from_pithos(&self.private_key, reader_keys, &data_key)
             .map_err(|e| {
                 PithosError::Conversion(format!("Conversion to header packet failed: {e})"))

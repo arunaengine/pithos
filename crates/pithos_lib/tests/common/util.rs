@@ -27,7 +27,7 @@ pub fn write_dummy_pithos(temp_dir: &TempDir, multifile: bool, metadata: bool) -
     // Dummy file(s)
     let mut input_files = vec![InputFile {
         file_type: FileType::Data,
-        file_path: "t8.shakespeare.txt".to_string(),
+        inner_path: "t8.shakespeare.txt".to_string(),
         data: Content::File("tests/data/t8.shakespeare.sample.txt".to_string()),
         metadata: if metadata {
             Some(Content::Raw(r#"{"foo":"bar"}"#.to_string()))
@@ -41,7 +41,7 @@ pub fn write_dummy_pithos(temp_dir: &TempDir, multifile: bool, metadata: bool) -
     if multifile {
         input_files.push(InputFile {
             file_type: FileType::Data,
-            file_path: "SRR33138449.fastq".to_string(),
+            inner_path: "SRR33138449.fastq".to_string(),
             data: Content::File("tests/data/SRR33138449.sample.fastq".to_string()),
             metadata: if metadata {
                 Some(Content::Raw(r#"{"bar":"baz"}"#.to_string()))

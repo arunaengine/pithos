@@ -1,8 +1,7 @@
 use crate::model::serialization::SerializationError;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use chacha20poly1305::aead::{Aead, OsRng};
-use chacha20poly1305::{AeadCore, Nonce};
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+use chacha20poly1305::aead::{Aead, Generate};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use std::io::{Cursor, Read, Write};
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -76,7 +75,7 @@ impl HeaderPacket {
         let mut header_packets = vec![];
         for reader in reader_keys {
             let session_key = sender_key.diffie_hellman(&reader);
-            let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+            let nonce = Nonce::generate();
             let mut packet_data =
                 PacketData::Decrypted(vec![Packet::Encryption(EncryptionPacket {
                     packet_type: 0,
@@ -311,11 +310,10 @@ impl HeaderPacket {
         readers_pubkey: PublicKey,
         writers_private_key: Option<StaticSecret>,
     ) -> Result<(), Crypt4GHError> {
-        let sender_key =
-            writers_private_key.unwrap_or_else(|| StaticSecret::random_from_rng(OsRng));
+        let sender_key = writers_private_key.unwrap_or_else(StaticSecret::random);
 
         let session_key = sender_key.diffie_hellman(&readers_pubkey);
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let nonce = Nonce::generate();
 
         self.mac = self.packet_data.encrypt(session_key.as_bytes(), &nonce)?;
         self.writers_pubkey = PublicKey::from(&sender_key).to_bytes();

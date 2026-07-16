@@ -1,5 +1,6 @@
 use crate::error::PithosError;
 use crate::helpers::directory::DirectoryBuilder;
+use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use crate::helpers::hash::{Hasher, Hashes};
 use crate::helpers::zstd::{ZstdError, map_to_zstd_level};
 use crate::io::pithosreader::PithosReaderSimple;
@@ -18,7 +19,6 @@ use crate::{
 };
 use fastcdc::v2020::ChunkData;
 use indexmap::IndexMap;
-use rand_core::OsRng;
 use rocrate::ROCrate;
 use std::cmp::Ordering;
 use std::fs;
@@ -37,9 +37,9 @@ pub enum Content {
 #[derive(Debug)]
 pub struct InputFile {
     pub file_type: FileType,
-    pub file_path: String, // Internal path
     pub data: Content,
     pub metadata: Option<Content>,
+    pub inner_path: String, // Internal path
     pub encrypt: bool,
     pub compression_level: Option<u8>,
 }
@@ -64,7 +64,7 @@ impl TryFrom<&PathBuf> for InputFile {
 
         Ok(InputFile {
             file_type,
-            file_path: inner_path.to_string(),
+            inner_path: inner_path.to_string(),
             data: if file_type == FileType::Data {
                 Content::File(file_path_str)
             } else {
@@ -80,12 +80,11 @@ impl TryFrom<&PathBuf> for InputFile {
 pub struct PithosWriter {
     // Input
     writer_key: StaticSecret, //TODO: Multiple sender keys for individual EncryptionSections
-    cdc: Option<(u32, u32, u32)>,
+    cdc: Option<(usize, usize, usize)>,
     sink: Box<dyn Write>,
 
     // Processing
     directory: Directory, // Single or merged from multiple
-    file_idx: u64,
     written_bytes: u64,
 }
 
@@ -94,7 +93,7 @@ impl PithosWriter {
     pub fn new(
         writer_key: StaticSecret,
         reader_keys: Vec<PublicKey>,
-        cdc: Option<(u32, u32, u32)>,
+        cdc: Option<(usize, usize, usize)>,
         sink: Box<dyn Write>,
     ) -> Result<Self, PithosError> {
         // Init encryption section
@@ -110,7 +109,6 @@ impl PithosWriter {
             directory: DirectoryBuilder::new()
                 .encryption(encryption_sections)
                 .build()?,
-            file_idx: 0,
             written_bytes: 0,
         })
     }
@@ -119,14 +117,14 @@ impl PithosWriter {
     pub fn new_from_file<P: AsRef<Path>>(
         writer_key: StaticSecret,
         reader_keys: Vec<PublicKey>,
-        cdc: Option<(u32, u32, u32)>,
+        cdc: Option<(usize, usize, usize)>,
         pithos_file: P,
     ) -> Result<Self, PithosError> {
         // Read existing directories
         let mut reader = PithosReaderSimple::new_with_key(&pithos_file, writer_key.clone())?;
-        let (parent_directory, offset) = reader.read_directory()?;
+        let (directory, offset) = reader.read_directory()?;
 
-        // Open Pithos file in append mode
+        // Open Pithos file in append write mode
         let file = fs::OpenOptions::new()
             //.read(true) //?
             .append(true)
@@ -135,9 +133,11 @@ impl PithosWriter {
         let sink = Box::new(file);
 
         Ok(PithosWriter {
-            file_idx: parent_directory.next_free_file_index(),
             directory: DirectoryBuilder::new()
                 .parent_directory_offset(Some(offset))
+                .files(FileEntryMap::new_with_max(
+                    directory.files.get_current_max_id(),
+                ))
                 .encryption(IndexMap::from_iter([(
                     PublicKey::from(&writer_key).to_bytes(),
                     EncryptionSection::new(&reader_keys),
@@ -236,16 +236,22 @@ impl PithosWriter {
     #[tracing::instrument(level = "trace", skip(self, file_entry, processing_flags, content))]
     pub fn process_file_entry(
         &mut self,
+        entry_path: &str,
         file_entry: &mut FileEntry,
         processing_flags: &ProcessingFlags,
         content: Box<dyn Read>,
     ) -> Result<Reference, PithosError> {
         // Directory or Symlink FileEntry are just added to Pithos directory
-        if [FileType::Directory, FileType::Symlink].contains(&file_entry.file_type) {
-            self.directory.add_file_to_index(file_entry)?;
-            self.file_idx = self.file_idx.saturating_add(1);
+        let file_entry_key = Key::new(
+            self.directory.next_free_file_index(),
+            entry_path.to_string(),
+        );
 
-            return Reference::try_from(file_entry);
+        if [FileType::Directory, FileType::Symlink].contains(&file_entry.file_type) {
+            self.directory
+                .add_file_to_index(&file_entry_key, file_entry)?;
+
+            return Reference::try_from((&file_entry_key, file_entry));
         }
 
         // Split content in chunks
@@ -269,76 +275,86 @@ impl PithosWriter {
         }
 
         // Create random key and encrypt file block index
-        let enc_key = StaticSecret::random_from_rng(OsRng).to_bytes();
+        let enc_key = StaticSecret::random().to_bytes();
         file_entry.block_data.encrypt(enc_key)?;
 
         // Add file entry to directory
-        self.directory.add_file_to_index(file_entry)?;
         self.directory
-            .add_file_to_all_recipients((self.file_idx, enc_key));
-
-        // Increment file index
-        self.file_idx = self.file_idx.saturating_add(1);
+            .add_file_to_index(&file_entry_key, file_entry)?;
+        self.directory
+            .add_file_to_all_recipients((file_entry_key.id(), enc_key));
 
         // Return reference according to FileType
-        Reference::try_from(file_entry)
+        Reference::try_from((&file_entry_key, file_entry))
     }
 
     #[tracing::instrument(level = "trace", skip(self, input))]
     pub fn process_input(&mut self, input: InputFile) -> Result<Reference, PithosError> {
-        // Create FileEntry from data file input
-        let mut data_fe =
-            FileEntry::new_from_content(None, input.file_type, &input.file_path, &input.data)?;
+        // Create FileEntry with its ProcessingFlags from data file input
+        let mut data_file = FileEntry::new_from_content(input.file_type, &input.data)?;
         let processing_flags = ProcessingFlags::new(input.encrypt, input.compression_level);
 
+        // First process metadata to add reference
         if let Some(metadata) = input.metadata {
+            let meta_file_path = &format!("{}.meta", input.inner_path);
+
             let reference = match &metadata {
                 Content::File(disk_path) => {
-                    let mut meta_fe = FileEntry::new_from_content(
-                        Some(self.file_idx),
-                        FileType::Metadata,
-                        &format!("{}.meta", input.file_path),
-                        &metadata,
-                    )?;
-
+                    let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
                     let handle = Box::new(File::open(disk_path)?);
-                    self.process_file_entry(&mut meta_fe, &processing_flags, handle)?
+                    self.process_file_entry(
+                        meta_file_path,
+                        &mut meta_file,
+                        &processing_flags,
+                        handle,
+                    )?
                 }
                 Content::Raw(raw_content) => {
-                    let mut meta_fe = FileEntry::new_from_content(
-                        Some(self.file_idx),
-                        FileType::Metadata,
-                        &format!("{}.meta", input.file_path),
-                        &metadata,
-                    )?;
-
+                    let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
                     let handle = Box::new(Cursor::new(raw_content.clone().into_bytes()));
-                    self.process_file_entry(&mut meta_fe, &processing_flags, handle)?
+                    self.process_file_entry(
+                        meta_file_path,
+                        &mut meta_file,
+                        &processing_flags,
+                        handle,
+                    )?
                 }
                 Content::Reference(reference) => reference.clone(),
             };
 
-            data_fe.references.push(reference);
+            data_file.references.push(reference);
         }
 
         // Process data FileEntry
-        data_fe.file_id = self.file_idx;
         let data_reference = match input.data {
             Content::File(disk_path) => {
                 let handle = Box::new(File::open(disk_path)?);
-                self.process_file_entry(&mut data_fe, &processing_flags, handle)?
+                self.process_file_entry(
+                    &input.inner_path,
+                    &mut data_file,
+                    &processing_flags,
+                    handle,
+                )?
             }
             Content::Raw(raw_content) => {
                 let handle = Box::new(Cursor::new(raw_content.into_bytes()));
-                self.process_file_entry(&mut data_fe, &processing_flags, handle)?
+                self.process_file_entry(
+                    &input.inner_path,
+                    &mut data_file,
+                    &processing_flags,
+                    handle,
+                )?
             }
             Content::Reference(reference) => {
                 // Clone content (block_data) into new FileEntry
                 let ref_fe = self
                     .directory
                     .get_file_by_id(reference.target_file_id)
-                    .expect("FileEntry does not exist.");
-                data_fe.block_data = ref_fe.block_data.clone();
+                    .ok_or(PithosError::FileNotFound(format!(
+                        "Could not find reference. FileEntry with id {} does not exist.",
+                        reference.target_file_id
+                    )))?;
+                data_file.block_data = ref_fe.block_data.clone();
 
                 // Fetch encryption key of referenced file
                 // Add file entry to directory and make it available for all recipients
@@ -346,16 +362,17 @@ impl PithosWriter {
                     .directory
                     .get_file_encryption_key(reference.target_file_id)
                 {
-                    self.directory.add_file_to_index(&data_fe)?;
+                    let file_entry_key =
+                        Key::new(self.directory.next_free_file_index(), &input.inner_path);
+                    self.directory.add_file(&input.inner_path, &data_file)?;
                     self.directory
-                        .add_file_to_all_recipients((self.file_idx, enc_key));
-                    // Increment file index
-                    self.file_idx = self.file_idx.saturating_add(1);
-                    Reference::try_from(&mut data_fe)?
+                        .add_file_to_all_recipients((file_entry_key.id(), enc_key));
+
+                    Reference::try_from((&file_entry_key, &mut data_file))?
                 } else {
                     return Err(PithosError::FileNotFound(format!(
                         "Could not extract key for file: {}",
-                        ref_fe.path
+                        input.inner_path
                     )));
                 }
             }
@@ -367,9 +384,9 @@ impl PithosWriter {
     #[tracing::instrument(level = "trace", skip(self, files))]
     pub fn process_input_files(&mut self, files: Vec<InputFile>) -> Result<(), PithosError> {
         for file in files {
-            tracing::info!("Processing [{:?}] {}", file.file_type, file.file_path);
+            tracing::info!("Processing [{:?}] {}", file.file_type, file.inner_path);
             match file.file_type {
-                FileType::Directory => self.process_directory(file.file_path, None)?,
+                FileType::Directory => self.process_directory(file.inner_path, None)?,
                 _ => {
                     self.process_input(file)?;
                 }
@@ -403,7 +420,7 @@ impl PithosWriter {
             // Store necessary info
             let input_file = InputFile {
                 file_type: FileType::try_from(&symlink_metadata(entry.path())?)?,
-                file_path: relative_path,
+                inner_path: relative_path,
                 data: Content::File(entry.path().to_string_lossy().to_string()),
                 metadata: None,
                 encrypt: true,
@@ -416,15 +433,18 @@ impl PithosWriter {
         entries.sort_by(|a, b| {
             // In case of RO-Crate always sort ro-crate-metadata.json to top
             if ro_crate.is_some() {
-                if a.file_path.contains("ro-crate-metadata.json") {
+                if a.inner_path.contains("ro-crate-metadata.json") {
                     return Ordering::Less;
-                } else if b.file_path.contains("ro-crate-metadata.json") {
+                } else if b.inner_path.contains("ro-crate-metadata.json") {
                     return Ordering::Greater;
                 }
             }
 
             if a.file_type == b.file_type {
-                return a.file_path.to_lowercase().cmp(&b.file_path.to_lowercase());
+                return a
+                    .inner_path
+                    .to_lowercase()
+                    .cmp(&b.inner_path.to_lowercase());
             }
             a.file_type.cmp(&b.file_type)
         });
@@ -442,11 +462,11 @@ impl PithosWriter {
                         .data_entities()
                         .keys()
                         .collect::<Vec<_>>()
-                        .contains(&&entry.file_path)
+                        .contains(&&entry.inner_path)
                     {
                         tracing::info!(
                             "Found {} in ro-crate-metadata.json data entities ids",
-                            entry.file_path
+                            entry.inner_path
                         );
                     }
                     entry.metadata = Some(Content::Reference(ro_crate_meta_ref.clone()))
@@ -456,7 +476,7 @@ impl PithosWriter {
         } else {
             // Just process all files
             for entry in entries {
-                tracing::info!("Processing [{:?}] {}", entry.file_type, entry.file_path);
+                tracing::info!("Processing [{:?}] {}", entry.file_type, entry.inner_path);
                 self.process_input(entry)?;
             }
         }

@@ -107,7 +107,9 @@ impl Directory {
 
         // Write file entries
         writer.write_varint(self.files.len() as u64)?;
-        for file in &self.files {
+        for (id, path, file) in &self.files {
+            writer.write_varint::<u64>(id)?;
+            encode_string(writer, path)?;
             file.serialize(writer)?;
         }
         writer.write_varint(self.blocks.len() as u64)?;
@@ -172,8 +174,6 @@ impl BlockDataState {
 impl FileEntry {
     #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
-        writer.write_varint(self.file_id)?;
-        encode_string(writer, &self.path)?;
         self.file_type.serialize(writer)?;
         self.block_data.serialize(writer)?;
         writer.write_varint(self.created)?;

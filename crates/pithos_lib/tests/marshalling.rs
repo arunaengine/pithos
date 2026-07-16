@@ -1,4 +1,6 @@
 use indexmap::IndexMap;
+use pithos_lib::helpers::directory::DirectoryBuilder;
+use pithos_lib::helpers::file_entry_map::{FileEntryMap, Key};
 use pithos_lib::helpers::x25519_keys::generate_private_key;
 use pithos_lib::model::serialization::encode_string;
 use pithos_lib::model::structs::*;
@@ -95,8 +97,6 @@ fn block_index_entry_roundtrip() {
 #[test]
 fn directory_roundtrip() {
     let file_entry = FileEntry {
-        file_id: 1,
-        path: "file.txt".to_string(),
         file_type: FileType::Data,
         block_data: BlockDataState::Decrypted(vec![([1u8; 32], [2u8; 32])]),
         created: 123,
@@ -127,20 +127,59 @@ fn directory_roundtrip() {
             )]),
         },
     )]);
+
+    let mut files = FileEntryMap::new();
+    files.insert(Key::new(0, "file.txt"), file_entry).unwrap();
+
     let original = Directory {
         identifier: *b"PITHOSDR",
         parent_directory_offset: None,
-        files: vec![file_entry.clone()],
+        files,
         blocks: IndexMap::from_iter([([1u8; 32], block_index)]),
         relations: vec![(1, "rel".to_string())],
         encryption: enc_section,
         dir_len: 12345,
         crc32: 67890,
     };
+
     let mut buf = Vec::new();
     original.serialize(&mut buf).unwrap();
     let decoded = Directory::deserialize(&mut Cursor::new(buf)).unwrap();
     assert_eq!(original, decoded);
+}
+
+#[test]
+fn directory_builder_crc_matches_recalculation() {
+    let file_entry = FileEntry {
+        file_type: FileType::Data,
+        block_data: BlockDataState::Decrypted(vec![]),
+        created: 0,
+        modified: 0,
+        file_size: 0,
+        permissions: 0o644,
+        references: vec![],
+        symlink_target: None,
+    };
+    let block_index = BlockIndexEntry {
+        offset: 0,
+        stored_size: 0,
+        original_size: 0,
+        flags: ProcessingFlags(0),
+        location: BlockLocation::Local,
+    };
+    let mut files = FileEntryMap::new();
+    files.insert(Key::new(0, "file.txt"), file_entry).unwrap();
+    let blocks = IndexMap::from_iter([([1u8; 32], block_index)]);
+
+    let directory = DirectoryBuilder::new()
+        .files(files)
+        .blocks(blocks)
+        .build()
+        .unwrap();
+    let mut recalculated = directory.clone();
+    recalculated.update_crc32().unwrap();
+
+    assert_eq!(directory.crc32, recalculated.crc32);
 }
 
 #[test]
@@ -174,8 +213,8 @@ fn block_data_state_roundtrip() {
 #[test]
 fn file_entry_roundtrip() {
     let original = FileEntry {
-        file_id: 123,
-        path: "foo/bar.txt".to_string(),
+        //file_id: 123,
+        //path: "foo/bar.txt".to_string(),
         file_type: FileType::Symlink,
         block_data: BlockDataState::Decrypted(vec![([1u8; 32], [2u8; 32])]),
         created: 111,

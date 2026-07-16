@@ -1,6 +1,7 @@
 pub mod common;
 
 use crate::common::util::{extract_zip, load_test_keys};
+use pithos_lib::helpers::file_entry_map::KeyQuery;
 use pithos_lib::helpers::ro_crate::read_ro_crate_directory;
 use pithos_lib::helpers::x25519_keys::private_key_from_pem_bytes;
 use pithos_lib::io::pithosreader::PithosReaderSimple;
@@ -33,7 +34,7 @@ fn test_single_file() {
     // Dummy file
     let input_file = InputFile {
         file_type: FileType::Data,
-        file_path: "t8.shakespeare.txt".to_string(),
+        inner_path: "t8.shakespeare.txt".to_string(),
         data: Content::File("tests/data/t8.shakespeare.sample.txt".to_string()),
         metadata: None,
         encrypt: true,
@@ -59,7 +60,7 @@ fn test_append_single_file() {
     // Dummy file
     let input_file = InputFile {
         file_type: FileType::Data,
-        file_path: "t8.shakespeare.txt".to_string(),
+        inner_path: "t8.shakespeare.txt".to_string(),
         data: Content::File("tests/data/t8.shakespeare.sample.txt".to_string()),
         metadata: None,
         encrypt: true,
@@ -83,7 +84,7 @@ fn test_append_single_file() {
     // Dummy file to append
     let input_file = InputFile {
         file_type: FileType::Data,
-        file_path: "SRR33138449.sample.fastq".to_string(),
+        inner_path: "SRR33138449.sample.fastq".to_string(),
         data: Content::File("tests/data/SRR33138449.sample.fastq".to_string()),
         metadata: None,
         encrypt: true,
@@ -112,14 +113,18 @@ fn test_append_single_file() {
     let (directory, _) = reader.read_directory().unwrap();
 
     assert_eq!(directory.files.len(), 2);
-    assert_eq!(directory.files[0].file_id, 0);
-    assert_eq!(directory.files[0].path, "t8.shakespeare.txt");
-    assert_eq!(directory.files[0].file_type, FileType::Data);
-    assert_eq!(directory.files[0].file_size, 79463);
-    assert_eq!(directory.files[1].file_id, 1);
-    assert_eq!(directory.files[1].path, "SRR33138449.sample.fastq");
-    assert_eq!(directory.files[1].file_type, FileType::Data);
-    assert_eq!(directory.files[1].file_size, 342848);
+
+    let (key, entry) = directory.files.get_entry(&KeyQuery::Id(0)).unwrap();
+    assert_eq!(key.id(), 0);
+    assert_eq!(key.path(), "t8.shakespeare.txt");
+    assert_eq!(entry.file_type, FileType::Data);
+    assert_eq!(entry.file_size, 79463);
+
+    let (key, entry) = directory.files.get_entry(&KeyQuery::Id(1)).unwrap();
+    assert_eq!(key.id(), 1);
+    assert_eq!(key.path(), "SRR33138449.sample.fastq");
+    assert_eq!(entry.file_type, FileType::Data);
+    assert_eq!(entry.file_size, 342848);
 }
 
 #[test]
@@ -128,15 +133,15 @@ fn test_multiple_files() {
     let input_files = vec![
         InputFile {
             file_type: FileType::Data,
-            file_path: "SRR33138449.fastq".to_string(),
+            inner_path: "SRR33138449.fastq".to_string(),
             data: Content::File("tests/data/SRR33138449.sample.fastq".to_string()),
             metadata: Some(Content::Raw(
                 r#"{
-  "@id": "SRR33138449.fastq",
-  "@type": "File",
-  "name": "SRR33138449 run sequencing reads",
-  "description": "Something something description",
-}"#
+                  "@id": "SRR33138449.fastq",
+                  "@type": "File",
+                  "name": "SRR33138449 run sequencing reads",
+                  "description": "Something something description"
+                }"#
                 .to_string(),
             )),
             encrypt: true,
@@ -144,7 +149,7 @@ fn test_multiple_files() {
         },
         InputFile {
             file_type: FileType::Data,
-            file_path: "t8.shakespeare.txt".to_string(),
+            inner_path: "t8.shakespeare.txt".to_string(),
             data: Content::File("tests/data/t8.shakespeare.sample.txt".to_string()),
             metadata: Some(Content::Raw(
                 r#"{"@id": "t8.shakespeare.txt","@type": "File"}"#.to_string(),
@@ -174,7 +179,7 @@ fn test_append_multiple_files() {
     let input_files = vec![
         InputFile {
             file_type: FileType::Data,
-            file_path: "SRR33138449.fastq".to_string(),
+            inner_path: "SRR33138449.fastq".to_string(),
             data: Content::File("tests/data/SRR33138449.sample.fastq".to_string()),
             metadata: None,
             encrypt: true,
@@ -182,7 +187,7 @@ fn test_append_multiple_files() {
         },
         InputFile {
             file_type: FileType::Data,
-            file_path: "t8.shakespeare.txt".to_string(),
+            inner_path: "t8.shakespeare.txt".to_string(),
             data: Content::File("tests/data/t8.shakespeare.sample.txt".to_string()),
             metadata: None,
             encrypt: true,
@@ -215,7 +220,7 @@ fn test_append_multiple_files() {
     let append_files = vec![
         InputFile {
             file_type: FileType::Data,
-            file_path: "conclusions.txt".to_string(),
+            inner_path: "conclusions.txt".to_string(),
             data: Content::File("tests/data/dummy_dir/conclusions.txt".to_string()),
             metadata: None,
             encrypt: true,
@@ -223,7 +228,7 @@ fn test_append_multiple_files() {
         },
         InputFile {
             file_type: FileType::Data,
-            file_path: "dummy_results.txt".to_string(),
+            inner_path: "dummy_results.txt".to_string(),
             data: Content::File("tests/data/dummy_dir/dummy_results.txt".to_string()),
             metadata: None,
             encrypt: true,
@@ -251,25 +256,29 @@ fn test_append_multiple_files() {
 
     assert_eq!(directory.files.len(), 4);
 
-    assert_eq!(directory.files[0].file_id, 0);
-    assert_eq!(directory.files[0].path, "SRR33138449.fastq");
-    assert_eq!(directory.files[0].file_type, FileType::Data);
-    assert_eq!(directory.files[0].file_size, 342848);
+    let (key, entry) = directory.files.get_entry(&KeyQuery::Id(0)).unwrap();
+    assert_eq!(key.id(), 0);
+    assert_eq!(key.path(), "SRR33138449.fastq");
+    assert_eq!(entry.file_type, FileType::Data);
+    assert_eq!(entry.file_size, 342848);
 
-    assert_eq!(directory.files[1].file_id, 1);
-    assert_eq!(directory.files[1].path, "t8.shakespeare.txt");
-    assert_eq!(directory.files[1].file_type, FileType::Data);
-    assert_eq!(directory.files[1].file_size, 79463);
+    let (key, entry) = directory.files.get_entry(&KeyQuery::Id(1)).unwrap();
+    assert_eq!(key.id(), 1);
+    assert_eq!(key.path(), "t8.shakespeare.txt");
+    assert_eq!(entry.file_type, FileType::Data);
+    assert_eq!(entry.file_size, 79463);
 
-    assert_eq!(directory.files[2].file_id, 2);
-    assert_eq!(directory.files[2].path, "conclusions.txt");
-    assert_eq!(directory.files[2].file_type, FileType::Data);
-    assert_eq!(directory.files[2].file_size, 91);
+    let (key, entry) = directory.files.get_entry(&KeyQuery::Id(2)).unwrap();
+    assert_eq!(key.id(), 2);
+    assert_eq!(key.path(), "conclusions.txt");
+    assert_eq!(entry.file_type, FileType::Data);
+    assert_eq!(entry.file_size, 91);
 
-    assert_eq!(directory.files[3].file_id, 3);
-    assert_eq!(directory.files[3].path, "dummy_results.txt");
-    assert_eq!(directory.files[3].file_type, FileType::Data);
-    assert_eq!(directory.files[3].file_size, 558);
+    let (key, entry) = directory.files.get_entry(&KeyQuery::Id(3)).unwrap();
+    assert_eq!(key.id(), 3);
+    assert_eq!(key.path(), "dummy_results.txt");
+    assert_eq!(entry.file_type, FileType::Data);
+    assert_eq!(entry.file_size, 558);
 }
 
 #[test]
@@ -302,51 +311,40 @@ fn test_directory() {
 
     assert_eq!(directory.files.len(), 8);
 
-    assert_eq!(directory.files[0].file_id, 0);
-    assert_eq!(directory.files[0].path, "dataset");
-    assert_eq!(directory.files[0].file_type, FileType::Directory);
+    for (id, path, filetype, size) in vec![
+        (0, "dataset", FileType::Directory, 0),
+        (
+            1,
+            "dataset/brain_gene_expression_data",
+            FileType::Directory,
+            0,
+        ),
+        (2, "literature", FileType::Directory, 0),
+        (3, "conclusions.txt", FileType::Data, 91),
+        (
+            4,
+            "dataset/brain_gene_expression_data/brain_data_assession_number.txt",
+            FileType::Data,
+            29,
+        ),
+        (5, "dummy_results.txt", FileType::Data, 558),
+        (
+            6,
+            "literature/Hodges06_human_brain_Affy.pdf",
+            FileType::Data,
+            359786,
+        ),
+        (7, "ro-crate-metadata.json", FileType::Data, 2748),
+    ] {
+        let (key, entry) = directory.files.get_entry(&KeyQuery::Id(id)).unwrap();
+        assert_eq!(key.id(), id);
+        assert_eq!(key.path(), path);
+        assert_eq!(entry.file_type, filetype);
 
-    assert_eq!(directory.files[1].file_id, 1);
-    assert_eq!(
-        directory.files[1].path,
-        "dataset/brain_gene_expression_data"
-    );
-    assert_eq!(directory.files[1].file_type, FileType::Directory);
-
-    assert_eq!(directory.files[2].file_id, 2);
-    assert_eq!(directory.files[2].path, "literature");
-    assert_eq!(directory.files[2].file_type, FileType::Directory);
-
-    assert_eq!(directory.files[3].file_id, 3);
-    assert_eq!(directory.files[3].path, "conclusions.txt");
-    assert_eq!(directory.files[3].file_type, FileType::Data);
-    assert_eq!(directory.files[3].file_size, 91);
-
-    assert_eq!(directory.files[4].file_id, 4);
-    assert_eq!(
-        directory.files[4].path,
-        "dataset/brain_gene_expression_data/brain_data_assession_number.txt"
-    );
-    assert_eq!(directory.files[4].file_type, FileType::Data);
-    assert_eq!(directory.files[4].file_size, 29);
-
-    assert_eq!(directory.files[5].file_id, 5);
-    assert_eq!(directory.files[5].path, "dummy_results.txt");
-    assert_eq!(directory.files[5].file_type, FileType::Data);
-    assert_eq!(directory.files[5].file_size, 558);
-
-    assert_eq!(directory.files[6].file_id, 6);
-    assert_eq!(
-        directory.files[6].path,
-        "literature/Hodges06_human_brain_Affy.pdf"
-    );
-    assert_eq!(directory.files[6].file_type, FileType::Data);
-    assert_eq!(directory.files[6].file_size, 359786);
-
-    assert_eq!(directory.files[7].file_id, 7);
-    assert_eq!(directory.files[7].path, "ro-crate-metadata.json");
-    assert_eq!(directory.files[7].file_type, FileType::Data);
-    assert_eq!(directory.files[7].file_size, 2748);
+        if entry.file_type != FileType::Directory {
+            assert_eq!(entry.file_size, size);
+        }
+    }
 }
 
 #[test]
@@ -385,12 +383,8 @@ fn test_rocrate_conversion() {
     let (directory, _) = reader.read_directory().unwrap();
 
     assert_eq!(directory.files.len(), 7);
-    assert_eq!(
-        "ro-crate-metadata.json",
-        directory
-            .files
-            .first()
-            .expect("There should at least one file")
-            .path
-    );
+
+    // First file in index has to be ro-crate-metadata.json
+    let (key, _) = directory.files.get_entry(&KeyQuery::Id(0)).unwrap();
+    assert_eq!("ro-crate-metadata.json", key.path());
 }
