@@ -11,7 +11,10 @@ use pithos_lib::helpers::x25519_keys::private_key_from_pem_bytes;
 use pithos_lib::io::pithosreader::PithosReaderSimple;
 use pithos_lib::io::pithoswriter::{Content, InputFile, PithosWriter};
 use pithos_lib::model::structs::{FileType, Reference};
-use std::fs::{File, copy, create_dir_all, read, read_dir, read_to_string, remove_file, write};
+use std::fs::{
+    File, copy, create_dir_all, read, read_dir, read_link, read_to_string, remove_file,
+    symlink_metadata, write,
+};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -658,15 +661,17 @@ fn test_rocrate_zip_synthesizes_parent_directories() {
 }
 
 #[test]
-fn test_rocrate_zip_preserves_symlink() {
+fn test_rocrate_zip_preserves_and_extracts_symlink() {
     let temp_dir = TempDir::new().unwrap();
     let zip_path = temp_dir.path().join("symlink.zip");
+    let target = temp_dir.path().join("outside-target");
+    let target_string = target.to_string_lossy().into_owned();
     let metadata = minimal_ro_crate_metadata(&[]);
     write_raw_zip(
         &zip_path,
         &[
             ("ro-crate-metadata.json", metadata.as_bytes(), 0),
-            ("link", b"target.txt", 0o120777),
+            ("link", target_string.as_bytes(), 0o120777),
         ],
         false,
     );
@@ -677,8 +682,22 @@ fn test_rocrate_zip_preserves_symlink() {
     let entry = directory.get_file_by_path("link").unwrap();
 
     assert_eq!(entry.file_type, FileType::Symlink);
-    assert_eq!(entry.symlink_target.as_deref(), Some("target.txt"));
+    assert_eq!(
+        entry.symlink_target.as_deref(),
+        Some(target_string.as_str())
+    );
     assert!(entry.references.is_empty());
+
+    let output_dir = temp_dir.path().join("extracted");
+    create_dir_all(&output_dir).unwrap();
+    let mut reader = PithosReaderSimple::new_with_key(&pithos_path, reader_key).unwrap();
+    let (directory, _) = reader.read_directory().unwrap();
+    reader
+        .read_file("link", &directory, Some(&output_dir), None)
+        .unwrap();
+
+    assert_eq!(read_link(output_dir.join("link")).unwrap(), target);
+    assert!(symlink_metadata(temp_dir.path().join("outside-target")).is_err());
 }
 
 #[test]
