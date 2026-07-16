@@ -5,7 +5,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 authors = ["Jannis Schlegel <das_Abroxas@proton.me>", "Sebastian Beyvers <sb@pus.de>"]
 edition = "2024"
 repository = "https://github.com/arunaengine/pithos"

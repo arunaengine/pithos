@@ -1,7 +1,7 @@
 [package]
 name = "pithos_lib"
 description = "Library and components for encrypting / compressing pithos (.pith) files, including specification"
-version = "0.7.0"
+version = "0.7.1"
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
