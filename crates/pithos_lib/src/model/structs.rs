@@ -7,8 +7,6 @@ use crate::error::PithosError;
 use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use indexmap::IndexMap;
 use integer_encoding::VarIntWriter;
-use rocrate::DataEntity;
-use rocrate::entity::EntityTrait;
 use std::fs::{Metadata, symlink_metadata};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -180,23 +178,6 @@ impl TryFrom<&Metadata> for FileType {
     }
 }
 
-impl TryFrom<&DataEntity> for FileType {
-    type Error = PithosError;
-
-    fn try_from(value: &DataEntity) -> Result<Self, Self::Error> {
-        if value.entity_type().contains(&"File".to_string()) {
-            Ok(FileType::Data)
-        } else if value.entity_type().contains(&"Dataset".to_string()) {
-            Ok(FileType::Directory)
-        } else {
-            Err(PithosError::InvalidFileType(format!(
-                "Data entity must have type File or Dataset: {:?}",
-                value.entity_type()
-            )))
-        }
-    }
-}
-
 /// A block's content hash and the key used to encrypt its content.
 pub type BlockDataEntry = ([u8; 32], [u8; 32]);
 
@@ -356,6 +337,26 @@ impl FileEntry {
                 None
             },
         })
+    }
+
+    pub(crate) fn new_from_archive(
+        file_type: FileType,
+        file_size: u64,
+        created: u64,
+        modified: u64,
+        permissions: u32,
+        symlink_target: Option<String>,
+    ) -> Self {
+        Self {
+            file_type,
+            block_data: BlockDataState::Decrypted(Vec::new()),
+            created,
+            modified,
+            file_size,
+            permissions,
+            references: Vec::new(),
+            symlink_target,
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(file_type, content))]

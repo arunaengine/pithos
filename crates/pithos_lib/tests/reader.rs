@@ -1,19 +1,33 @@
 pub mod common;
 
 use crate::common::util::write_dummy_pithos;
+use pithos_lib::error::PithosError;
 use pithos_lib::helpers::chacha_poly1305::decrypt_chunk;
 use pithos_lib::helpers::crypt4gh::{
     CRYPT4GH_ENCRYPTED_BLOCK_SIZE, Crypt4GHHeader, Packet, PacketData,
 };
-use pithos_lib::helpers::ro_crate::{read_ro_crate_directory, read_ro_crate_zip};
+use pithos_lib::helpers::ro_crate::{RoCrateSource, read_ro_crate_directory, read_ro_crate_zip};
 use pithos_lib::helpers::x25519_keys::{private_key_from_pem_bytes, public_key_from_pem_bytes};
 use pithos_lib::io::pithosreader::PithosReaderSimple;
 use pithos_lib::model::structs::{FileType, Reference};
+use rocraters::ro_crate::graph_vector::GraphVector;
+use rocraters::ro_crate::read::CrateReadError;
+use rocraters::ro_crate::schema::RoCrateSchemaVersion;
 use std::fs::{File, OpenOptions, read_to_string};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use x25519_dalek::StaticSecret;
+
+fn write_zip_entry(path: &Path, name: &str, content: &[u8]) {
+    let file = File::create(path).unwrap();
+    let mut archive = zip::ZipWriter::new(file);
+    archive
+        .start_file(name, zip::write::SimpleFileOptions::default())
+        .unwrap();
+    archive.write_all(content).unwrap();
+    archive.finish().unwrap();
+}
 
 #[test]
 fn test_reader_single_file() {
@@ -117,43 +131,157 @@ fn test_reader_multiple_files() {
 }
 
 #[test]
-fn test_rocrate_read_directory() {
-    let rocrate = read_ro_crate_directory("tests/data/dummy_dir").unwrap();
+fn test_rocrate_read_directory_1_2() {
+    let loaded = read_ro_crate_directory("tests/data/dummy_dir").unwrap();
     assert_eq!(
-        rocrate.base_path,
-        Some(PathBuf::from("tests/data/dummy_dir"))
+        loaded.source,
+        RoCrateSource::Directory(PathBuf::from("tests/data/dummy_dir"))
     );
 
-    let data_entity_ids = vec![
+    let mut expected_data_entity_ids = vec![
         "conclusions.txt",
         "dummy_results.txt",
         "dataset/",
         "literature/",
     ];
-    let mut collected = rocrate.data_entities().keys().collect::<Vec<&String>>();
-    collected.retain(|id| !data_entity_ids.contains(&id.as_str()));
-    assert!(collected.is_empty());
+    let mut data_entity_ids = loaded
+        .ro_crate
+        .graph
+        .iter()
+        .filter_map(|entity| match entity {
+            GraphVector::DataEntity(entity) => Some(entity.id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<&str>>();
+    data_entity_ids.sort_unstable();
+    expected_data_entity_ids.sort_unstable();
+    assert_eq!(data_entity_ids, expected_data_entity_ids);
 
-    let contextual_entities_ids = vec![
+    let mut contextual_entity_ids = loaded
+        .ro_crate
+        .graph
+        .iter()
+        .filter_map(|entity| match entity {
+            GraphVector::ContextualEntity(entity) => Some(entity.id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<&str>>();
+    contextual_entity_ids.sort_unstable();
+    let mut expected_contextual_entity_ids = vec![
         "mailto:josiah.carberry@example.com",
         "https://orcid.org/0000-0002-1825-0097",
     ];
-    let mut collected = rocrate
-        .contextual_entities()
-        .keys()
-        .collect::<Vec<&String>>();
-    collected.retain(|id| !contextual_entities_ids.contains(&id.as_str()));
-    assert!(collected.is_empty());
+    expected_contextual_entity_ids.sort_unstable();
+    assert_eq!(contextual_entity_ids, expected_contextual_entity_ids);
+
+    assert_eq!(
+        loaded
+            .ro_crate
+            .graph
+            .iter()
+            .filter(|entity| matches!(entity, GraphVector::MetadataDescriptor(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        loaded
+            .ro_crate
+            .graph
+            .iter()
+            .filter(|entity| matches!(entity, GraphVector::RootDataEntity(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        loaded.ro_crate.get_rocrate_version(),
+        Some(RoCrateSchemaVersion::V1_2)
+    );
 }
 
 #[test]
-fn test_rocrate_read_zip() {
-    let rocrate = read_ro_crate_zip("tests/data/ro-crate.zip").unwrap();
+fn test_rocrate_read_zip_1_1() {
+    let loaded = read_ro_crate_zip("tests/data/ro-crate.zip").unwrap();
 
     assert_eq!(
-        rocrate.base_path,
-        Some(PathBuf::from("tests/data/ro-crate.zip"))
+        loaded.source,
+        RoCrateSource::Zip(PathBuf::from("tests/data/ro-crate.zip"))
     );
+    assert!(!loaded.ro_crate.graph.is_empty());
+}
+
+#[test]
+fn test_rocrate_directory_requires_metadata() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let error = read_ro_crate_directory(temp_dir.path()).unwrap_err();
+
+    assert!(matches!(error, PithosError::MissingRoCrateMetadata(_)));
+}
+
+#[test]
+fn test_rocrate_rejects_incomplete_root() {
+    let temp_dir = TempDir::new().unwrap();
+    let metadata_path = temp_dir.path().join("ro-crate-metadata.json");
+    let metadata = r#"{
+      "@context": "https://w3id.org/ro/crate/1.2/context",
+      "@graph": [
+        {
+          "@id": "ro-crate-metadata.json",
+          "@type": "CreativeWork",
+          "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+          "about": {"@id": "./"}
+        },
+        {
+          "@id": "./",
+          "@type": "Dataset"
+        }
+      ]
+    }"#;
+    std::fs::write(metadata_path, metadata).unwrap();
+
+    let error = read_ro_crate_directory(temp_dir.path()).unwrap_err();
+
+    assert!(matches!(
+        error,
+        PithosError::RoCrate(CrateReadError::JsonError(_))
+    ));
+}
+
+#[test]
+fn test_rocrate_zip_returns_error_for_invalid_archive() {
+    let temp_dir = TempDir::new().unwrap();
+    let zip_path = temp_dir.path().join("invalid.zip");
+    std::fs::write(&zip_path, b"not a ZIP archive").unwrap();
+
+    let error = read_ro_crate_zip(&zip_path).unwrap_err();
+
+    assert!(matches!(error, PithosError::Zip(_)));
+}
+
+#[test]
+fn test_rocrate_zip_requires_root_metadata() {
+    let temp_dir = TempDir::new().unwrap();
+    let zip_path = temp_dir.path().join("without-metadata.zip");
+    write_zip_entry(&zip_path, "data.txt", b"data");
+
+    let error = read_ro_crate_zip(&zip_path).unwrap_err();
+
+    assert!(matches!(error, PithosError::MissingRoCrateMetadata(_)));
+}
+
+#[test]
+fn test_rocrate_zip_rejects_metadata_below_wrapper_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let zip_path = temp_dir.path().join("wrapped.zip");
+    write_zip_entry(
+        &zip_path,
+        "wrapper/ro-crate-metadata.json",
+        br#"{"@context":"https://w3id.org/ro/crate/1.1/context","@graph":[]}"#,
+    );
+
+    let error = read_ro_crate_zip(&zip_path).unwrap_err();
+
+    assert!(matches!(error, PithosError::MissingRoCrateMetadata(_)));
 }
 
 #[test]
