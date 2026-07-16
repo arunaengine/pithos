@@ -8,4 +8,4 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-pithos_lib = { version = "0.7.1", path = "../pithos_lib" }
+pithos_lib = { version = "0.7.2", path = "../pithos_lib" }
