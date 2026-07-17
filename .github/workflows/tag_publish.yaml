@@ -1,23 +1,81 @@
-name: test_build_publish
+name: Publish crates.io packages
+
 on:
   push:
     tags:
       - v*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: release
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: Derive release version
-        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Validate release tag and package versions
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            printf 'Release tag must be vX.Y.Z compliant with SemVer: %s\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          RELEASE_VERSION="${RELEASE_TAG#v}"
+          RELEASE_COMMIT="$(git rev-list -n 1 "$GITHUB_REF")"
+          git merge-base --is-ancestor "$RELEASE_COMMIT" origin/main || {
+            printf 'Release tag must point to a commit reachable from main.\n' >&2
+            exit 1
+          }
+
+          for package in pithos_lib pithos; do
+            package_id="$(cargo pkgid -p "$package")"
+            package_version="${package_id##*@}"
+            if [[ "$package_version" != "$RELEASE_VERSION" ]]; then
+              printf '%s version %s does not match release tag %s.\n' "$package" "$package_version" "$RELEASE_VERSION" >&2
+              exit 1
+            fi
+          done
+
+          printf 'RELEASE_VERSION=%s\n' "$RELEASE_VERSION" >> "$GITHUB_ENV"
 
       - name: Run workspace tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Check dependency policy
+        run: cargo deny check
 
       - name: Package library
         run: cargo package -p pithos_lib --locked
@@ -25,10 +83,30 @@ jobs:
       - name: Dry-run library publish
         run: cargo publish -p pithos_lib --dry-run --locked
 
-      - name: Publish library
-        run: cargo publish -p pithos_lib --token ${CRATES_TOKEN} --locked
+      - name: Publish or verify library
+        shell: bash
         env:
-          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+        run: |
+          if cargo publish -p pithos_lib --locked; then
+            exit 0
+          fi
+
+          cargo info "pithos_lib@$RELEASE_VERSION" --registry crates-io >/dev/null
+
+      - name: Wait for library to reach crates.io
+        shell: bash
+        run: |
+          for attempt in {1..30}; do
+            if cargo info "pithos_lib@$RELEASE_VERSION" --registry crates-io >/dev/null 2>&1; then
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          printf 'pithos_lib %s did not become available on crates.io.\n' "$RELEASE_VERSION" >&2
+          exit 1
 
       - name: Package CLI
         run: cargo package -p pithos --locked
@@ -36,7 +114,13 @@ jobs:
       - name: Dry-run CLI publish
         run: cargo publish -p pithos --dry-run --locked
 
-      - name: Publish CLI
-        run: cargo publish -p pithos --token ${CRATES_TOKEN} --locked
+      - name: Publish or verify CLI
+        shell: bash
         env:
-          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+        run: |
+          if cargo publish -p pithos --locked; then
+            exit 0
+          fi
+
+          cargo info "pithos@$RELEASE_VERSION" --registry crates-io >/dev/null
