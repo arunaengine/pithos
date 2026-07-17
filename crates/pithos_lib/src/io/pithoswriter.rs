@@ -2,6 +2,10 @@ use crate::error::PithosError;
 use crate::helpers::directory::DirectoryBuilder;
 use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use crate::helpers::hash::{Hasher, Hashes};
+use crate::helpers::ro_crate::{
+    LoadedRoCrate, RO_CRATE_METADATA_FILE, RoCrateSource, ZipEntryDescriptor, ZipEntryKind,
+    inspect_ro_crate_zip_manifest,
+};
 use crate::helpers::zstd::{ZstdError, map_to_zstd_level};
 use crate::io::pithosreader::PithosReaderSimple;
 use crate::io::util::{create_stream_cdc, extract_filename};
@@ -19,13 +23,12 @@ use crate::{
 };
 use fastcdc::v2020::ChunkData;
 use indexmap::IndexMap;
-use rocrate::ROCrate;
-use std::cmp::Ordering;
 use std::fs;
 use std::fs::{File, symlink_metadata};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zip::ZipArchive;
 
 #[derive(Debug)]
 pub enum Content {
@@ -75,6 +78,85 @@ impl TryFrom<&PathBuf> for InputFile {
             compression_level: Some(2),
         })
     }
+}
+
+fn collect_directory_entries(directory: &Path) -> Result<Vec<InputFile>, PithosError> {
+    if !directory.is_dir() {
+        return Err(PithosError::Conversion(format!(
+            "Input path is not a directory: {}",
+            directory.display()
+        )));
+    }
+
+    let mut entries = Vec::new();
+    for entry in walkdir::WalkDir::new(directory) {
+        let entry = entry?;
+        let relative_path = entry.path().strip_prefix(directory)?;
+
+        if relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let inner_path = relative_path
+            .components()
+            .map(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .ok_or(PithosError::Conversion(
+                        "Invalid UTF-8 in file path".to_string(),
+                    ))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("/");
+        let file_type = FileType::try_from(&symlink_metadata(entry.path())?)?;
+        let file_path = entry
+            .path()
+            .to_str()
+            .ok_or(PithosError::Conversion(
+                "Invalid UTF-8 in file path".to_string(),
+            ))?
+            .to_string();
+
+        entries.push(InputFile {
+            file_type,
+            inner_path,
+            data: Content::File(file_path),
+            metadata: None,
+            encrypt: true,
+            compression_level: Some(2),
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        a.file_type
+            .cmp(&b.file_type)
+            .then_with(|| {
+                a.inner_path
+                    .to_lowercase()
+                    .cmp(&b.inner_path.to_lowercase())
+            })
+            .then_with(|| a.inner_path.cmp(&b.inner_path))
+    });
+
+    Ok(entries)
+}
+
+fn file_entry_from_ro_crate_zip_descriptor(descriptor: &ZipEntryDescriptor) -> FileEntry {
+    let file_type = match descriptor.kind {
+        ZipEntryKind::Directory => FileType::Directory,
+        ZipEntryKind::File => FileType::Data,
+        ZipEntryKind::Symlink => FileType::Symlink,
+    };
+
+    FileEntry::new_from_archive(
+        file_type,
+        descriptor.uncompressed_size,
+        descriptor.timestamp,
+        descriptor.timestamp,
+        descriptor.permissions,
+        None,
+    )
 }
 
 pub struct PithosWriter {
@@ -226,7 +308,7 @@ impl PithosWriter {
     /// # Arguments
     /// * `file_entry` - Mutable reference to a `FileEntry` representing the file's metadata and block index.
     /// * `processing_flags` - Reference to `ProcessingFlags` specifying compression and encryption options.
-    /// * `content` - Boxed trait object implementing `Read`, representing the file's content stream.
+    /// * `content` - Reader representing the file's content stream.
     ///
     /// # Returns
     /// Returns a `Reference` struct describing the relationship and ID of the processed file.
@@ -234,12 +316,12 @@ impl PithosWriter {
     /// # Errors
     /// Returns `PithosWriterError` if any step fails.
     #[tracing::instrument(level = "trace", skip(self, file_entry, processing_flags, content))]
-    pub fn process_file_entry(
+    pub fn process_file_entry<R: Read>(
         &mut self,
         entry_path: &str,
         file_entry: &mut FileEntry,
         processing_flags: &ProcessingFlags,
-        content: Box<dyn Read>,
+        content: R,
     ) -> Result<Reference, PithosError> {
         // Directory or Symlink FileEntry are just added to Pithos directory
         let file_entry_key = Key::new(
@@ -301,7 +383,7 @@ impl PithosWriter {
             let reference = match &metadata {
                 Content::File(disk_path) => {
                     let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
-                    let handle = Box::new(File::open(disk_path)?);
+                    let handle = File::open(disk_path)?;
                     self.process_file_entry(
                         meta_file_path,
                         &mut meta_file,
@@ -311,7 +393,7 @@ impl PithosWriter {
                 }
                 Content::Raw(raw_content) => {
                     let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
-                    let handle = Box::new(Cursor::new(raw_content.clone().into_bytes()));
+                    let handle = Cursor::new(raw_content.clone().into_bytes());
                     self.process_file_entry(
                         meta_file_path,
                         &mut meta_file,
@@ -328,7 +410,7 @@ impl PithosWriter {
         // Process data FileEntry
         let data_reference = match input.data {
             Content::File(disk_path) => {
-                let handle = Box::new(File::open(disk_path)?);
+                let handle = File::open(disk_path)?;
                 self.process_file_entry(
                     &input.inner_path,
                     &mut data_file,
@@ -337,7 +419,7 @@ impl PithosWriter {
                 )?
             }
             Content::Raw(raw_content) => {
-                let handle = Box::new(Cursor::new(raw_content.into_bytes()));
+                let handle = Cursor::new(raw_content.into_bytes());
                 self.process_file_entry(
                     &input.inner_path,
                     &mut data_file,
@@ -386,7 +468,7 @@ impl PithosWriter {
         for file in files {
             tracing::info!("Processing [{:?}] {}", file.file_type, file.inner_path);
             match file.file_type {
-                FileType::Directory => self.process_directory(file.inner_path, None)?,
+                FileType::Directory => self.process_directory(file.inner_path)?,
                 _ => {
                     self.process_input(file)?;
                 }
@@ -395,90 +477,11 @@ impl PithosWriter {
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self, directory, ro_crate))]
-    pub fn process_directory<P: AsRef<Path>>(
-        &mut self,
-        directory: P,
-        ro_crate: Option<&ROCrate>,
-    ) -> Result<(), PithosError> {
-        // Walk directory and create file entries
-        let mut entries = Vec::new();
-        for entry in walkdir::WalkDir::new(&directory)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let relative_path = entry
-                .path()
-                .strip_prefix(&directory)?
-                .to_string_lossy()
-                .to_string();
-
-            if relative_path.is_empty() {
-                continue; // Skip empty paths
-            }
-
-            // Store necessary info
-            let input_file = InputFile {
-                file_type: FileType::try_from(&symlink_metadata(entry.path())?)?,
-                inner_path: relative_path,
-                data: Content::File(entry.path().to_string_lossy().to_string()),
-                metadata: None,
-                encrypt: true,
-                compression_level: Some(2),
-            };
-            entries.push(input_file);
-        }
-
-        // Sort directories to front and then by path
-        entries.sort_by(|a, b| {
-            // In case of RO-Crate always sort ro-crate-metadata.json to top
-            if ro_crate.is_some() {
-                if a.inner_path.contains("ro-crate-metadata.json") {
-                    return Ordering::Less;
-                } else if b.inner_path.contains("ro-crate-metadata.json") {
-                    return Ordering::Greater;
-                }
-            }
-
-            if a.file_type == b.file_type {
-                return a
-                    .inner_path
-                    .to_lowercase()
-                    .cmp(&b.inner_path.to_lowercase());
-            }
-            a.file_type.cmp(&b.file_type)
-        });
-
-        if let Some(ro_crate) = ro_crate {
-            // Process ro-crate-metadata.json first and reference all other files which are mentioned as data entity
-            let mut entry = entries.remove(0);
-            entry.file_type = FileType::Metadata;
-            let ro_crate_meta_ref = self.process_input(entry)?;
-
-            // Process the rest all files
-            for mut entry in entries {
-                if entry.file_type == FileType::Data {
-                    if ro_crate
-                        .data_entities()
-                        .keys()
-                        .collect::<Vec<_>>()
-                        .contains(&&entry.inner_path)
-                    {
-                        tracing::info!(
-                            "Found {} in ro-crate-metadata.json data entities ids",
-                            entry.inner_path
-                        );
-                    }
-                    entry.metadata = Some(Content::Reference(ro_crate_meta_ref.clone()))
-                }
-                self.process_input(entry)?;
-            }
-        } else {
-            // Just process all files
-            for entry in entries {
-                tracing::info!("Processing [{:?}] {}", entry.file_type, entry.inner_path);
-                self.process_input(entry)?;
-            }
+    #[tracing::instrument(level = "trace", skip(self, directory))]
+    pub fn process_directory<P: AsRef<Path>>(&mut self, directory: P) -> Result<(), PithosError> {
+        for entry in collect_directory_entries(directory.as_ref())? {
+            tracing::info!("Processing [{:?}] {}", entry.file_type, entry.inner_path);
+            self.process_input(entry)?;
         }
 
         Ok(())
@@ -490,7 +493,7 @@ impl PithosWriter {
         directories: Vec<P>,
     ) -> Result<(), PithosError> {
         for directory in directories {
-            self.process_directory(directory, None)?
+            self.process_directory(directory)?
         }
 
         Ok(())
@@ -550,14 +553,113 @@ impl PithosWriter {
         Ok(())
     }
 
-    //TODO: Zipped RO-Crate processing ...
-    #[tracing::instrument(level = "trace", skip(self, crate_data))]
-    pub fn process_ro_crate(&mut self, crate_data: &ROCrate) -> Result<(), PithosError> {
-        if let Some(base_path) = &crate_data.base_path {
-            self.process_directory(base_path, Some(crate_data))?
-        } else {
-            self.process_directory("", Some(crate_data))?
+    fn process_ro_crate_directory(&mut self, directory: &Path) -> Result<(), PithosError> {
+        let mut entries = collect_directory_entries(directory)?;
+        let metadata_index = entries
+            .iter()
+            .position(|entry| entry.inner_path == RO_CRATE_METADATA_FILE)
+            .ok_or_else(|| PithosError::MissingRoCrateMetadata(directory.to_path_buf()))?;
+
+        if entries[metadata_index].file_type != FileType::Data {
+            return Err(PithosError::InvalidRoCrateSource {
+                path: directory.join(RO_CRATE_METADATA_FILE),
+                expected: "regular metadata file",
+            });
         }
+
+        let mut metadata = entries.remove(metadata_index);
+        metadata.file_type = FileType::Metadata;
+        let metadata_reference = self.process_input(metadata)?;
+
+        for mut entry in entries {
+            if entry.file_type == FileType::Data {
+                entry.metadata = Some(Content::Reference(metadata_reference.clone()));
+            }
+            self.process_input(entry)?;
+        }
+
         Ok(())
+    }
+
+    fn process_ro_crate_zip(&mut self, path: &Path) -> Result<(), PithosError> {
+        let manifest = inspect_ro_crate_zip_manifest(path)?;
+        let metadata = manifest.metadata.clone();
+        let metadata_index = metadata
+            .archive_index
+            .ok_or_else(|| PithosError::MissingRoCrateMetadata(path.to_path_buf()))?;
+        let mut archive = ZipArchive::new(File::open(path)?)?;
+        let processing_flags = ProcessingFlags::new(true, Some(2));
+
+        let mut metadata_file_entry = file_entry_from_ro_crate_zip_descriptor(&metadata);
+        metadata_file_entry.file_type = FileType::Metadata;
+        let metadata_reference = {
+            let member = archive.by_index(metadata_index)?;
+            self.process_file_entry(
+                &metadata.inner_path,
+                &mut metadata_file_entry,
+                &processing_flags,
+                member,
+            )?
+        };
+
+        for descriptor in manifest.entries {
+            let mut file_entry = file_entry_from_ro_crate_zip_descriptor(&descriptor);
+            if file_entry.file_type == FileType::Data {
+                file_entry.references.push(metadata_reference.clone());
+            }
+
+            match descriptor.kind {
+                ZipEntryKind::Directory => {
+                    self.process_file_entry(
+                        &descriptor.inner_path,
+                        &mut file_entry,
+                        &processing_flags,
+                        Cursor::new(Vec::<u8>::new()),
+                    )?;
+                }
+                ZipEntryKind::File => {
+                    let index = descriptor.archive_index.ok_or_else(|| {
+                        PithosError::UnsupportedZipEntry(descriptor.inner_path.clone())
+                    })?;
+                    {
+                        let member = archive.by_index(index)?;
+                        self.process_file_entry(
+                            &descriptor.inner_path,
+                            &mut file_entry,
+                            &processing_flags,
+                            member,
+                        )?;
+                    }
+                }
+                ZipEntryKind::Symlink => {
+                    let index = descriptor.archive_index.ok_or_else(|| {
+                        PithosError::UnsupportedZipEntry(descriptor.inner_path.clone())
+                    })?;
+                    let target = {
+                        let mut member = archive.by_index(index)?;
+                        let mut target = String::new();
+                        member.read_to_string(&mut target)?;
+                        target
+                    };
+                    file_entry.symlink_target = Some(target);
+                    self.process_file_entry(
+                        &descriptor.inner_path,
+                        &mut file_entry,
+                        &processing_flags,
+                        Cursor::new(Vec::<u8>::new()),
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, loaded))]
+    pub fn process_ro_crate(&mut self, loaded: &LoadedRoCrate) -> Result<(), PithosError> {
+        match &loaded.source {
+            RoCrateSource::Directory(path) => self.process_ro_crate_directory(path),
+            RoCrateSource::Zip(path) => self.process_ro_crate_zip(path),
+        }
     }
 }

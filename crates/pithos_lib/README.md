@@ -18,14 +18,16 @@ Both components provide convenience functionality to write individual Pithos fil
 
 PithosWriter Example:
 ```rust
+use x25519_dalek::{PublicKey, StaticSecret};
+
 // Create a simple Pithos file with a single entry
-let sender_key = [0u8; 32];
-let recipient_key = [1u8; 32];
+let sender_key = StaticSecret::from([0u8; 32]);
+let recipient_key = PublicKey::from([1u8; 32]);
 
 // Dummy input file
 let input_file = InputFile {
     file_type: FileType::Data,
-    file_path: "very_important.txt".to_string(),
+    inner_path: "very_important.txt".to_string(),
     data: Content::File("tests/data/t8.shakespeare.sample.txt".to_string()),
     metadata: None,
     encrypt: true,
@@ -40,6 +42,48 @@ writer.write_file_header().unwrap();
 writer.process_input(input_file).unwrap();
 writer.write_directory().unwrap();
 ```
+
+### RO-Crate ingestion
+
+Load an RO-Crate directory and process it with a configured `PithosWriter`:
+
+```rust
+use pithos_lib::helpers::ro_crate::read_ro_crate_directory;
+
+let loaded = read_ro_crate_directory("path/to/ro-crate")?;
+writer.process_ro_crate(&loaded)?;
+```
+
+ZIP archives use the same writer operation:
+
+```rust
+use pithos_lib::helpers::ro_crate::read_ro_crate_zip;
+
+let loaded = read_ro_crate_zip("path/to/ro-crate.zip")?;
+writer.process_ro_crate(&loaded)?;
+```
+
+`loaded.ro_crate` is the upstream `ro-crate-rs` graph. Conversion stores the original
+`ro-crate-metadata.json` bytes instead of reserializing that graph, and every physical regular
+data file references the metadata entry. ZIP conversion streams archive members directly and
+does not extract them first.
+
+The upstream parser accepts RO-Crate 1.1 and 1.2 metadata. Pithos uses its warning-level
+vocabulary checks, not full RO-Crate conformance validation. The upstream root deserializer is
+strict: the root Dataset must contain `@id`, `@type`, `name`, `description`, `datePublished`, and
+`license`.
+
+### Breaking migration
+
+| Removed API | Replacement |
+| --- | --- |
+| `rocrate::ROCrate` | `pithos_lib::helpers::ro_crate::RoCrate` re-export from `rocraters` |
+| `ROCrate.base_path` | `LoadedRoCrate.source` |
+| `data_entities()` | Match `GraphVector::DataEntity` in `loaded.ro_crate.graph` |
+| `contextual_entities()` | Match `GraphVector::ContextualEntity` |
+| `ROCrateBuilder` | Upstream public structs/graph construction; no Pithos compatibility builder |
+| Local validation levels/reports | Upstream read validation behavior |
+| Local directory/ZIP reader traits | `read_ro_crate_directory` and `read_ro_crate_zip` |
 
 PithosReader Example:
 ```rust

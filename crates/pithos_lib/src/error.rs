@@ -4,9 +4,12 @@ use crate::helpers::x25519_keys::CryptError;
 use crate::helpers::zstd::ZstdError;
 use crate::model::deserialization::DeserializationError;
 use crate::model::serialization::SerializationError;
+use rocraters::ro_crate::read::CrateReadError;
 use std::io;
+use std::path::PathBuf;
 use std::time::SystemTimeError;
 use thiserror::Error;
+use zip::result::ZipError;
 
 /// Custom top-level error type for all of Pithos
 #[derive(Error, Debug)]
@@ -35,6 +38,29 @@ pub enum PithosError {
     Cipher(#[from] ChaChaPoly1305Error),
     #[error("Decryption error: {0}")]
     Compression(#[from] ZstdError),
+    #[error("RO-Crate parse or validation error: {0}")]
+    RoCrate(#[from] CrateReadError),
+    #[error("ZIP archive error: {0}")]
+    Zip(#[from] ZipError),
+    #[error("Invalid RO-Crate source {path}: expected {expected}")]
+    InvalidRoCrateSource {
+        path: PathBuf,
+        expected: &'static str,
+    },
+    #[error("RO-Crate metadata file is missing from {0}")]
+    MissingRoCrateMetadata(PathBuf),
+    #[error("Unsafe ZIP member path: {0}")]
+    UnsafeZipPath(String),
+    #[error("Duplicate ZIP member path after normalization: {0}")]
+    DuplicateZipPath(String),
+    #[error("ZIP member path conflicts with a required directory: {0}")]
+    ZipPathConflict(String),
+    #[error("Overlapping ZIP members are not supported: {0}")]
+    OverlappingZipEntries(PathBuf),
+    #[error("Encrypted ZIP member is not supported: {0}")]
+    EncryptedZipEntry(String),
+    #[error("Unsupported ZIP entry type or compression for {0}")]
+    UnsupportedZipEntry(String),
     #[error("Invalid block data state: {0}")]
     InvalidBlockDataState(String),
     #[error("Block hash not found: {0:?}")]

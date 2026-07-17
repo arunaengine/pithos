@@ -1,9 +1,9 @@
-{ "@context": "https://w3id.org/ro/crate/1.1/context",
+{ "@context": "https://w3id.org/ro/crate/1.2/context",
   "@graph": [
     {
       "@type": "CreativeWork",
       "@id": "ro-crate-metadata.json",
-      "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"},
+      "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
       "about": {"@id": "./"}
     },
     {
@@ -11,6 +11,10 @@
       "@type": [
         "Dataset"
       ],
+      "name": "Dummy RO-Crate",
+      "description": "A fixture RO-Crate used by the Pithos reader tests.",
+      "datePublished": "2026-01-01",
+      "license": {"@id": "https://spdx.org/licenses/MIT"},
       "hasPart": [
         {
           "@id": "conclusions.txt"
