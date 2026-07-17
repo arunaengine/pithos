@@ -2,7 +2,7 @@
 
 **Version:** 1.0
 **Status:** Draft
-**Date:** September 2025
+**Date:** July 2026
 **Purpose:** Next-generation file format for scientific data management, optimized for object storage with built-in deduplication, encryption, and metadata support
 
 ## 1. Introduction
@@ -118,16 +118,22 @@ The directory MUST contain all file and block metadata:
 /// Directory - lists all files and blocks in this segment
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directory {
-    pub identifier: [u8; 8],                            // MUST be b"PITHOSDR"
+    pub identifier: [u8; 8],                            // MUST be exactly ASCII b"PITHOSDR"
     pub parent_directory_offset: Option<(u64, u64)>,    // Previous directory (start, len) (varint, backwards chain)
     pub files: Vec<FileEntry>,                          // Files in this segment
     pub blocks: Vec<BlockIndexEntry>,                   // Blocks in this segment
     pub relations: Vec<(u64, String)>,                  // Relation idx, relationname / id
     pub encryption: Vec<EncryptionSection>,
     pub dir_len: u64,
-    pub crc32: u32,                                     // CRC32 of all preceding fields
+    pub crc32: u32,                                     // CRC-32/ISO-HDLC of serialized bytes through dir_len
 }
 ```
+
+The directory marker MUST be exactly the eight ASCII bytes `PITHOSDR`. 
+The final 12 directory bytes MUST be `dir_len:u64be || crc32:u32be`, where `dir_len` is the complete directory length from the marker through the CRC, inclusive. 
+The CRC MUST be CRC-32/ISO-HDLC with width 32, polynomial `0x04C11DB7`, initial value`0xFFFFFFFF`, reflected input and output, and final XOR `0xFFFFFFFF` (the check value for ASCII `123456789` is `0xCBF43926`). 
+It MUST cover every exact serialized byte from the marker through the fixed-width `dir_len`, excluding only the stored final CRC. 
+Readers MUST validate the marker, embedded length, CRC, and exact parser consumption for the terminal directory and independently for every parent directory before decrypting, merging, or otherwise using its metadata. Invalid directories MUST be rejected.
 
 ### 4.4 File Representation
 

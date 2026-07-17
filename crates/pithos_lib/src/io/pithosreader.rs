@@ -9,10 +9,11 @@ use crate::io::extraction::ExtractionRoot;
 use crate::model::structs::{
     BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileType,
 };
+use crc32fast::hash;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -25,6 +26,46 @@ pub struct PithosReaderSimple {
 }
 
 impl PithosReaderSimple {
+    fn parse_directory(bytes: &[u8]) -> Result<Directory, PithosError> {
+        if bytes.len() < 25 {
+            return Err(PithosError::DirectoryLengthMismatch {
+                expected: 25,
+                actual: bytes.len() as u64,
+            });
+        }
+        if bytes[..8] != Directory::DIRECTORY_MARKER {
+            return Err(PithosError::InvalidDirectoryMarker {
+                expected: Directory::DIRECTORY_MARKER,
+                actual: bytes[..8].try_into().unwrap(),
+            });
+        }
+        let expected_len =
+            u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
+        if expected_len != bytes.len() as u64 {
+            return Err(PithosError::DirectoryLengthMismatch {
+                expected: bytes.len() as u64,
+                actual: expected_len,
+            });
+        }
+        let expected_crc = u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+        let actual_crc = hash(&bytes[..bytes.len() - 4]);
+        if expected_crc != actual_crc {
+            return Err(PithosError::DirectoryChecksumMismatch {
+                expected: actual_crc,
+                actual: expected_crc,
+            });
+        }
+        let mut cursor = Cursor::new(bytes);
+        let directory = Directory::deserialize(&mut cursor)?;
+        if cursor.position() != bytes.len() as u64 {
+            return Err(PithosError::DirectoryConsumptionMismatch {
+                expected: bytes.len() as u64,
+                actual: cursor.position(),
+            });
+        }
+        Ok(directory)
+    }
+
     /// Open a Pithos archive and prepare for reading
     #[tracing::instrument(level = "trace", skip(pithos_path, private_key_pem_path))]
     pub fn new<P: AsRef<Path>>(
@@ -80,18 +121,13 @@ impl PithosReaderSimple {
         })?);
         let parent_dir_start = file_len - parent_dir_len;
 
-        // Last 4 bytes: crc32, next 8 bytes: directory length (u64, BE)
-        let _crc32 = u32::from_be_bytes(footer[8..12].try_into().map_err(|_| {
-            PithosError::Conversion("Failed to convert crc32 checksum bytes to u32".to_string())
-        })?);
-
         self.file.seek(SeekFrom::End(0 - parent_dir_len as i64))?;
         let mut dir_buf = vec![0u8; parent_dir_len as usize];
         self.file.read_exact(&mut dir_buf)?;
 
         // Deserialize full directory
         let mut available_file_keys = HashMap::new();
-        let mut directory = Directory::deserialize(&mut dir_buf.as_slice())?;
+        let mut directory = Self::parse_directory(&dir_buf)?;
         available_file_keys.extend(directory.decrypt_recipient(&self.private_key)?);
 
         // Merge with parent directories
@@ -100,7 +136,7 @@ impl PithosReaderSimple {
             self.file.seek(SeekFrom::Start(start))?;
             let mut dir_buf = vec![0u8; len as usize];
             self.file.read_exact(&mut dir_buf)?;
-            let mut older_directory = Directory::deserialize(&mut dir_buf.as_slice())?;
+            let mut older_directory = Self::parse_directory(&dir_buf)?;
             available_file_keys.extend(older_directory.decrypt_recipient(&self.private_key)?);
 
             // Merge directories and swap

@@ -1,6 +1,5 @@
 use crate::error::PithosError;
 use crate::helpers::file_entry_map::{FileEntryMap, Key, KeyQuery};
-use crate::model::serialization::encode_string;
 use crate::model::structs::{RecipientData, RecipientSection};
 use crate::model::{
     serialization::SerializationError,
@@ -9,8 +8,6 @@ use crate::model::{
 use crc32fast::Hasher;
 use indexmap::IndexMap;
 use indexmap::map::Entry;
-use integer_encoding::VarIntWriter;
-use std::io::Write;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct DirectoryBuilder {
@@ -435,34 +432,11 @@ impl Directory {
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn update_crc32(&mut self) -> Result<(), SerializationError> {
         let mut buf = Vec::new();
-        if let Some((start, len)) = self.parent_directory_offset {
-            buf.extend(&[1u8]);
-            buf.write_varint(start)?;
-            buf.write_varint(len)?;
-        }
-        for (id, path, file) in &self.files {
-            buf.write_varint(id)?;
-            encode_string(&mut buf, path)?;
-            file.serialize(&mut buf)?
-        }
-        for (hash, block) in &self.blocks {
-            buf.write_all(hash)?;
-            block.serialize(&mut buf)?
-        }
-        buf.write_varint(self.relations.len() as u64)?;
-        for (idx, name) in &self.relations {
-            buf.write_varint(*idx)?;
-            encode_string(&mut buf, name)?;
-        }
-        for (key, enc) in &self.encryption {
-            buf.write_all(key)?;
-            enc.serialize(&mut buf)?
-        }
-        buf.write_varint(self.dir_len)?;
+        self.serialize(&mut buf)?;
 
         // Calculate CRC32 checksum
         let mut hasher = Hasher::new();
-        hasher.update(&buf);
+        hasher.update(&buf[..buf.len() - 4]);
         self.crc32 = hasher.finalize();
 
         Ok(())

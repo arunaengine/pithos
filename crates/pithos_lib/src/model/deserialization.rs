@@ -139,11 +139,19 @@ impl BlockIndexEntry {
 
 // Directory
 impl Directory {
+    pub(crate) const DIRECTORY_MARKER: [u8; 8] = *b"PITHOSDR";
+
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, PithosError> {
         // Read static directory identifier
         let mut identifier = [0u8; 8];
         reader.read_exact(&mut identifier)?;
+        if identifier != Self::DIRECTORY_MARKER {
+            return Err(PithosError::InvalidDirectoryMarker {
+                expected: Self::DIRECTORY_MARKER,
+                actual: identifier,
+            });
+        }
 
         // Read parent directory offset
         let mut tag = [0u8; 1];

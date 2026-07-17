@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use pithos_lib::error::PithosError;
 use pithos_lib::helpers::directory::DirectoryBuilder;
 use pithos_lib::helpers::file_entry_map::{FileEntryMap, Key};
 use pithos_lib::helpers::x25519_keys::generate_private_key;
@@ -149,7 +150,7 @@ fn directory_roundtrip() {
 }
 
 #[test]
-fn directory_builder_crc_matches_recalculation() {
+fn directory_integrity_crc_matches_serialized_prefix() {
     let file_entry = FileEntry {
         file_type: FileType::Data,
         block_data: BlockDataState::Decrypted(vec![]),
@@ -176,10 +177,55 @@ fn directory_builder_crc_matches_recalculation() {
         .blocks(blocks)
         .build()
         .unwrap();
-    let mut recalculated = directory.clone();
-    recalculated.update_crc32().unwrap();
+    let mut serialized = Vec::new();
+    directory.serialize(&mut serialized).unwrap();
+    assert_eq!(
+        directory.crc32,
+        crc32fast::hash(&serialized[..serialized.len() - 4])
+    );
+}
 
-    assert_eq!(directory.crc32, recalculated.crc32);
+#[test]
+fn directory_integrity_minimal_vector_matches_specification() {
+    let directory = Directory {
+        identifier: *b"PITHOSDR",
+        parent_directory_offset: None,
+        files: FileEntryMap::new(),
+        blocks: IndexMap::new(),
+        relations: vec![],
+        encryption: IndexMap::new(),
+        dir_len: 25,
+        crc32: 0,
+    };
+    let mut prefix = Vec::new();
+    directory.serialize(&mut prefix).unwrap();
+    let crc = crc32fast::hash(&prefix[..prefix.len() - 4]);
+    let mut complete = prefix.clone();
+    let crc_start = complete.len() - 4;
+    complete[crc_start..].copy_from_slice(&crc.to_be_bytes());
+
+    assert_eq!(crc, 0xb1674081);
+    assert_eq!(
+        complete,
+        hex_bytes("504954484f53445200000000000000000000000019b1674081")
+    );
+}
+
+#[test]
+fn directory_integrity_deserialization_rejects_invalid_marker() {
+    let mut bytes = hex_bytes("504954484f53445200000000000000000000000019b1674081");
+    bytes[..8].copy_from_slice(b"INVALID!");
+    let error = Directory::deserialize(&mut Cursor::new(bytes)).unwrap_err();
+
+    assert!(matches!(error, PithosError::InvalidDirectoryMarker { .. }));
+}
+
+fn hex_bytes(value: &str) -> Vec<u8> {
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
 }
 
 fn serialized_directory(path: &str, entry: FileEntry) -> Vec<u8> {

@@ -30,6 +30,14 @@ pub enum PithosError {
     Serialization(#[from] SerializationError),
     #[error("Deserialization error: {0:?}")]
     Deserialization(#[from] DeserializationError),
+    #[error("Invalid directory marker: expected {expected:?}, got {actual:?}")]
+    InvalidDirectoryMarker { expected: [u8; 8], actual: [u8; 8] },
+    #[error("Directory length mismatch: expected {expected}, got {actual}")]
+    DirectoryLengthMismatch { expected: u64, actual: u64 },
+    #[error("Directory checksum mismatch: expected {expected:#010x}, got {actual:#010x}")]
+    DirectoryChecksumMismatch { expected: u32, actual: u32 },
+    #[error("Directory parser consumption mismatch: expected {expected}, got {actual}")]
+    DirectoryConsumptionMismatch { expected: u64, actual: u64 },
     #[error("Crypt error: {0}")]
     Crypt(#[from] CryptError),
     #[error("Crypt4GH error: {0}")]

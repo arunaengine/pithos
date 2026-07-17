@@ -1,6 +1,6 @@
 pub mod common;
 
-use crate::common::util::{create_pithos_writer, write_dummy_pithos};
+use crate::common::util::{create_pithos_writer, load_test_keys, write_dummy_pithos};
 use pithos_lib::error::PithosError;
 use pithos_lib::helpers::chacha_poly1305::decrypt_chunk;
 use pithos_lib::helpers::crypt4gh::{
@@ -10,12 +10,12 @@ use pithos_lib::helpers::file_entry_map::Key;
 use pithos_lib::helpers::ro_crate::{RoCrateSource, read_ro_crate_directory, read_ro_crate_zip};
 use pithos_lib::helpers::x25519_keys::{private_key_from_pem_bytes, public_key_from_pem_bytes};
 use pithos_lib::io::pithosreader::PithosReaderSimple;
-use pithos_lib::io::pithoswriter::{Content, InputFile};
+use pithos_lib::io::pithoswriter::{Content, InputFile, PithosWriter};
 use pithos_lib::model::structs::{BlockDataState, FileEntry, FileType, Reference};
 use rocraters::ro_crate::graph_vector::GraphVector;
 use rocraters::ro_crate::read::CrateReadError;
 use rocraters::ro_crate::schema::RoCrateSchemaVersion;
-use std::fs::{File, OpenOptions, read_to_string};
+use std::fs::{File, OpenOptions, read, read_to_string, write};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -66,6 +66,120 @@ fn write_zip_entry(path: &Path, name: &str, content: &[u8]) {
         .unwrap();
     archive.write_all(content).unwrap();
     archive.finish().unwrap();
+}
+
+fn append_empty_directory(path: &Path) {
+    let (writer_key, _, reader_key) = load_test_keys();
+    let mut writer = PithosWriter::new_from_file(writer_key, vec![reader_key], None, path).unwrap();
+    writer.write_directory().unwrap();
+    drop(writer);
+}
+
+fn directory_bounds(bytes: &[u8]) -> (usize, usize) {
+    let length =
+        u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap()) as usize;
+    (bytes.len() - length, length)
+}
+
+#[test]
+fn test_directory_integrity_valid_terminal_archive() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
+
+    assert!(reader.read_directory().is_ok());
+}
+
+#[test]
+fn test_directory_integrity_terminal_marker_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    let mut bytes = read(&archive).unwrap();
+    let (start, _) = directory_bounds(&bytes);
+    bytes[start] ^= 1;
+    write(&archive, bytes).unwrap();
+
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
+    assert!(matches!(
+        reader.read_directory(),
+        Err(PithosError::InvalidDirectoryMarker { .. })
+    ));
+}
+
+#[test]
+fn test_directory_integrity_terminal_crc_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    let mut bytes = read(&archive).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    write(&archive, bytes).unwrap();
+
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
+    assert!(matches!(
+        reader.read_directory(),
+        Err(PithosError::DirectoryChecksumMismatch { .. })
+    ));
+}
+
+#[test]
+fn test_directory_integrity_rejects_extra_unconsumed_byte() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    let mut bytes = read(&archive).unwrap();
+    let (start, length) = directory_bounds(&bytes);
+    let mut directory = bytes.split_off(start);
+    directory.insert(directory.len() - 12, 0);
+    let new_length = (length + 1) as u64;
+    let footer_start = directory.len() - 12;
+    directory[footer_start..footer_start + 8].copy_from_slice(&new_length.to_be_bytes());
+    let crc_start = directory.len() - 4;
+    let crc = crc32fast::hash(&directory[..crc_start]);
+    directory[crc_start..].copy_from_slice(&crc.to_be_bytes());
+    bytes.extend_from_slice(&directory);
+    write(&archive, bytes).unwrap();
+
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
+    assert!(matches!(
+        reader.read_directory(),
+        Err(PithosError::DirectoryConsumptionMismatch { .. })
+    ));
+}
+
+#[test]
+fn test_directory_integrity_valid_append_chain() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    append_empty_directory(&archive);
+
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
+    assert!(reader.read_directory().is_ok());
+}
+
+#[test]
+fn test_directory_integrity_parent_embedded_length_mismatch() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    append_empty_directory(&archive);
+    let mut bytes = read(&archive).unwrap();
+    let (final_start, final_length) = directory_bounds(&bytes);
+    let final_directory = &bytes[final_start..final_start + final_length];
+    let mut cursor = std::io::Cursor::new(final_directory);
+    let directory = pithos_lib::model::structs::Directory::deserialize(&mut cursor).unwrap();
+    let (parent_start, parent_length) = directory.parent_directory_offset.unwrap();
+    let parent_start = parent_start as usize;
+    let parent_length = parent_length as usize;
+    let parent = &mut bytes[parent_start..parent_start + parent_length];
+    parent[parent_length - 12..parent_length - 4]
+        .copy_from_slice(&((parent_length + 1) as u64).to_be_bytes());
+    let crc = crc32fast::hash(&parent[..parent_length - 4]);
+    parent[parent_length - 4..].copy_from_slice(&crc.to_be_bytes());
+    write(&archive, bytes).unwrap();
+
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
+    assert!(matches!(
+        reader.read_directory(),
+        Err(PithosError::DirectoryLengthMismatch { .. })
+    ));
 }
 
 #[test]
