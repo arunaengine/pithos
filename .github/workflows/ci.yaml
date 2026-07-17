@@ -2,9 +2,18 @@ name: CI
 on:
   - push
   - pull_request
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -16,30 +25,32 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run workspace tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
 
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install nightly rustfmt
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install stable rustfmt
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
+        run: cargo fmt --all -- --check
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install nightly clippy
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install stable clippy
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
@@ -47,10 +58,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run clippy
-        run: cargo +nightly clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
