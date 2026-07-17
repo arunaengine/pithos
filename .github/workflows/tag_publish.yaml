@@ -97,7 +97,7 @@ jobs:
       - name: Wait for library to reach crates.io
         shell: bash
         run: |
-          for attempt in {1..30}; do
+          for _ in {1..30}; do
             if cargo info "pithos_lib@$RELEASE_VERSION" --registry crates-io >/dev/null 2>&1; then
               exit 0
             fi
