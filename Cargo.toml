@@ -8,6 +8,7 @@ resolver = "2"
 version = "0.7.2"
 authors = ["Jannis Schlegel <das_Abroxas@proton.me>", "Sebastian Beyvers <sb@pus.de>"]
 edition = "2024"
+rust-version = "1.88"
 repository = "https://github.com/arunaengine/pithos"
 license = "MIT OR Apache-2.0"
 
