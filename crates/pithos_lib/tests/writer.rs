@@ -419,7 +419,7 @@ fn test_directory() {
 
     assert_eq!(directory.files.len(), 8);
 
-    for (id, path, filetype, size) in vec![
+    for (id, path, filetype, size) in [
         (0, "dataset", FileType::Directory, 0),
         (
             1,
