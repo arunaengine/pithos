@@ -61,6 +61,147 @@ fn read_zip_member(path: &Path, name: &str) -> Vec<u8> {
     bytes
 }
 
+fn assert_compression_round_trip(
+    payload: &[u8],
+    compression_level: u8,
+    encrypt: bool,
+    cdc: Option<(usize, usize, usize)>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let source_path = temp_dir.path().join("input.bin");
+    write(&source_path, payload).unwrap();
+
+    let (pithos_path, reader_key, mut writer) = create_pithos_writer(&temp_dir, cdc);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "input.bin".to_string(),
+            data: Content::File(source_path.to_string_lossy().into_owned()),
+            metadata: None,
+            encrypt,
+            compression_level: Some(compression_level),
+        })
+        .unwrap();
+    writer.write_directory().unwrap();
+
+    let (directory, _) = read_pithos_directory(&pithos_path, &reader_key).unwrap();
+    for block in directory.blocks.values() {
+        assert_eq!(block.flags.is_encrypted(), encrypt);
+        let stored_level = block.flags.get_compression_level();
+        if compression_level == 0 {
+            assert_eq!(stored_level, 0);
+            if !encrypt {
+                assert_eq!(block.stored_size, block.original_size);
+            }
+        } else {
+            assert!(stored_level == 0 || stored_level == compression_level);
+        }
+    }
+    assert_eq!(
+        extract_pithos_entry(&pithos_path, &reader_key, "input.bin", &temp_dir),
+        payload
+    );
+}
+
+fn deterministic_incompressible_payload(length: usize) -> Vec<u8> {
+    let mut state = 0x243f_6a88_u32;
+    (0..length)
+        .map(|index| {
+            state = state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223)
+                .rotate_left((index % 31) as u32);
+            (state ^ (index as u32)).to_le_bytes()[index % 4]
+        })
+        .collect()
+}
+
+#[test]
+fn test_compression_levels_round_trip() {
+    let payloads = [
+        ("repeated", vec![b'A'; 16 * 1024]),
+        (
+            "incompressible",
+            deterministic_incompressible_payload(16 * 1024),
+        ),
+    ];
+
+    for (_, payload) in payloads {
+        for compression_level in 0..=7 {
+            for encrypt in [false, true] {
+                assert_compression_round_trip(&payload, compression_level, encrypt, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_compression_empty_level_zero_round_trip() {
+    for encrypt in [false, true] {
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("empty.bin");
+        write(&source_path, []).unwrap();
+
+        let (pithos_path, reader_key, mut writer) = create_pithos_writer(&temp_dir, None);
+        writer.write_file_header().unwrap();
+        writer
+            .process_input(InputFile {
+                file_type: FileType::Data,
+                inner_path: "empty.bin".to_string(),
+                data: Content::File(source_path.to_string_lossy().into_owned()),
+                metadata: None,
+                encrypt,
+                compression_level: Some(0),
+            })
+            .unwrap();
+        writer.write_directory().unwrap();
+
+        let (directory, _) = read_pithos_directory(&pithos_path, &reader_key).unwrap();
+        assert!(directory.blocks.is_empty());
+        assert_eq!(
+            extract_pithos_entry(&pithos_path, &reader_key, "empty.bin", &temp_dir),
+            Vec::<u8>::new()
+        );
+    }
+}
+
+#[test]
+fn test_compression_multiblock_level_zero_round_trip() {
+    let payload = deterministic_incompressible_payload(16 * 1024);
+    for encrypt in [false, true] {
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("multiblock.bin");
+        write(&source_path, &payload).unwrap();
+
+        let (pithos_path, reader_key, mut writer) =
+            create_pithos_writer(&temp_dir, Some((256, 512, 1024)));
+        writer.write_file_header().unwrap();
+        writer
+            .process_input(InputFile {
+                file_type: FileType::Data,
+                inner_path: "multiblock.bin".to_string(),
+                data: Content::File(source_path.to_string_lossy().into_owned()),
+                metadata: None,
+                encrypt,
+                compression_level: Some(0),
+            })
+            .unwrap();
+        writer.write_directory().unwrap();
+
+        let (directory, _) = read_pithos_directory(&pithos_path, &reader_key).unwrap();
+        assert!(directory.blocks.len() > 1);
+        for block in directory.blocks.values() {
+            assert_eq!(block.flags.get_compression_level(), 0);
+            assert_eq!(block.flags.is_encrypted(), encrypt);
+        }
+        assert_eq!(
+            extract_pithos_entry(&pithos_path, &reader_key, "multiblock.bin", &temp_dir),
+            payload
+        );
+    }
+}
+
 fn write_raw_zip(path: &Path, entries: &[(&str, &[u8], u32)], overlap_duplicates: bool) {
     let mut archive = Vec::new();
     let mut central_directory = Vec::new();

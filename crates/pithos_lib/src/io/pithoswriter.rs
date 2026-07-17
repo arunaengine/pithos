@@ -281,7 +281,7 @@ impl PithosWriter {
         if compression_level > 0
             && probe_compression_ratio(&chunk.data, Some(compression_level))? < 0.85
         {
-            chunk.data = compress_data(chunk.data.as_slice(), None)?;
+            chunk.data = compress_data(chunk.data.as_slice(), Some(compression_level))?;
         } else {
             // No compression, as the input is likely to have high entropy
             block_index_entry.flags.set_compression_level(0);
