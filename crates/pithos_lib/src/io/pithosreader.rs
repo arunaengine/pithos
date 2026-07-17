@@ -1,10 +1,11 @@
 use crate::error::PithosError;
+use crate::helpers::archive_path::{validate_entry, validate_map};
 use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
 use crate::helpers::crypt4gh::{CRYPT4GH_BLOCK_SIZE, Crypt4GHHeader, HeaderPacket};
 use crate::helpers::file_entry_map::KeyQuery;
 use crate::helpers::x25519_keys::private_key_from_pem_bytes;
 use crate::helpers::zstd::decompress_data;
-use crate::io::util::{create_dir, create_symlink};
+use crate::io::extraction::ExtractionRoot;
 use crate::model::structs::{
     BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileType,
 };
@@ -126,6 +127,7 @@ impl PithosReaderSimple {
                     None => false,
                 },
             })?;
+        validate_map(&directory.files)?;
 
         Ok((directory, (parent_dir_start, parent_dir_len)))
     }
@@ -153,6 +155,14 @@ impl PithosReaderSimple {
         output_path: Option<&PathBuf>,
         ranges: Option<Vec<Range<u64>>>,
     ) -> Result<(), PithosError> {
+        validate_map(&directory.files)?;
+        validate_entry(
+            inner_path,
+            directory
+                .files
+                .get(&KeyQuery::Path(inner_path.to_string()))
+                .ok_or(PithosError::FileNotFound(inner_path.to_string()))?,
+        )?;
         let file_entry = directory
             .files
             .get(&KeyQuery::Path(inner_path.to_string()))
@@ -160,19 +170,38 @@ impl PithosReaderSimple {
 
         match &file_entry.file_type {
             FileType::Data | FileType::Metadata => {
-                // Write output
-                let mut output_target: Box<dyn Write> = if let Some(dest) = output_path {
-                    let target = if dest.is_dir() {
-                        &dest.join(inner_path)
+                if output_path.is_none() {
+                    let mut output_target: Box<dyn Write> = Box::new(io::stdout());
+                    if let Some(ranges) = ranges {
+                        for range in ranges {
+                            self.read_data_range_to_sink(
+                                range,
+                                file_entry,
+                                &directory.blocks,
+                                &mut output_target,
+                            )?;
+                        }
                     } else {
-                        dest
-                    };
-
-                    Box::new(File::create(target).map_err(PithosError::Io)?)
+                        self.read_data_to_sink(file_entry, &directory.blocks, output_target)?;
+                    }
+                    return Ok(());
+                }
+                let dest = output_path.unwrap();
+                let (root_path, final_path, create_root) = if dest.is_dir() {
+                    (dest.as_path(), inner_path.to_string(), false)
                 } else {
-                    Box::new(io::stdout())
+                    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+                    let name =
+                        dest.file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| {
+                                PithosError::Conversion("Invalid output file name".into())
+                            })?;
+                    (parent, name.to_string(), false)
                 };
-
+                let root = ExtractionRoot::open(root_path, create_root)?;
+                let pending = root.pending_file(&final_path)?;
+                let mut output_target: Box<dyn Write> = Box::new(pending.writer()?);
                 if let Some(ranges) = ranges {
                     for range in ranges {
                         self.read_data_range_to_sink(
@@ -185,21 +214,25 @@ impl PithosReaderSimple {
                 } else {
                     self.read_data_to_sink(file_entry, &directory.blocks, output_target)?;
                 }
+                pending.commit()?;
             }
             FileType::Directory => {
-                // Create directory (parent?)
-                create_dir(inner_path, output_path)?;
+                let root_path = output_path
+                    .map(PathBuf::as_path)
+                    .unwrap_or_else(|| Path::new("."));
+                ExtractionRoot::open(root_path, true)?.create_dir(inner_path)?;
             }
             FileType::Symlink => {
-                // Create symlink (UNIX only)
-                create_symlink(
-                    inner_path,
-                    file_entry
-                        .symlink_target
-                        .as_ref()
-                        .expect("Symlink has no target"),
-                    output_path,
-                )?;
+                let target = file_entry.symlink_target.as_deref().ok_or_else(|| {
+                    PithosError::InvalidSymlinkEntry {
+                        path: inner_path.into(),
+                        reason: "missing target".into(),
+                    }
+                })?;
+                let root_path = output_path
+                    .map(PathBuf::as_path)
+                    .unwrap_or_else(|| Path::new("."));
+                ExtractionRoot::open(root_path, true)?.create_symlink(inner_path, target)?;
             }
         }
 

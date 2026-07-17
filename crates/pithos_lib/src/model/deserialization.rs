@@ -7,6 +7,7 @@
 // - Error handling via DeserializationError
 
 use crate::error::PithosError;
+use crate::helpers::archive_path::{validate_entry, validate_map};
 use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use crate::model::structs::*;
 use byteorder::{BigEndian, ReadBytesExt};
@@ -163,8 +164,11 @@ impl Directory {
         for _ in 0..files_len {
             let id = reader.read_varint::<u64>()?;
             let path = decode_string(reader)?;
-            files.insert(Key::new(id, path), FileEntry::deserialize(reader)?)?;
+            let entry = FileEntry::deserialize(reader)?;
+            validate_entry(&path, &entry)?;
+            files.insert(Key::new(id, path), entry)?;
         }
+        validate_map(&files)?;
 
         let blocks_len = reader.read_varint::<u64>()?;
         let mut blocks = IndexMap::new();

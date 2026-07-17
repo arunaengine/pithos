@@ -1,3 +1,4 @@
+pub(crate) mod archive_path;
 pub mod chacha_poly1305;
 pub mod crypt4gh;
 pub mod directory;

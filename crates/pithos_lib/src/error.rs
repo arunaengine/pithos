@@ -73,6 +73,18 @@ pub enum PithosError {
     RelationIdOccupied(u64),
     #[error("Path already occupied: {0}")]
     PathOccupied(String),
+    #[error("Invalid archive path {path}: {reason}")]
+    InvalidArchivePath { path: String, reason: String },
+    #[error("Invalid symlink target {target} for {path}: {reason}")]
+    InvalidSymlinkTarget {
+        path: String,
+        target: String,
+        reason: String,
+    },
+    #[error("Invalid symlink entry {path}: {reason}")]
+    InvalidSymlinkEntry { path: String, reason: String },
+    #[error("Extraction collision at {path}: {reason}")]
+    ExtractionCollision { path: String, reason: String },
     #[error("Invalid file type: {0}")]
     InvalidFileType(String),
     #[error("No recipient section found for the provided private key")]

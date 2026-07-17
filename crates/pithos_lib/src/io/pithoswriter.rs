@@ -1,4 +1,5 @@
 use crate::error::PithosError;
+use crate::helpers::archive_path::{validate_candidate, validate_map};
 use crate::helpers::directory::DirectoryBuilder;
 use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use crate::helpers::hash::{Hasher, Hashes};
@@ -51,8 +52,7 @@ impl TryFrom<&PathBuf> for InputFile {
     type Error = PithosError;
 
     fn try_from(file_path: &PathBuf) -> Result<Self, Self::Error> {
-        let file = File::open(file_path)?;
-        let metadata = file.metadata()?;
+        let metadata = symlink_metadata(file_path)?;
         let file_type = FileType::try_from(&metadata)?;
         let file_path_str = file_path
             .to_str()
@@ -68,7 +68,10 @@ impl TryFrom<&PathBuf> for InputFile {
         Ok(InputFile {
             file_type,
             inner_path: inner_path.to_string(),
-            data: if file_type == FileType::Data {
+            data: if file_type == FileType::Data
+                || file_type == FileType::Directory
+                || file_type == FileType::Symlink
+            {
                 Content::File(file_path_str)
             } else {
                 Content::Raw("".to_string())
@@ -323,6 +326,7 @@ impl PithosWriter {
         processing_flags: &ProcessingFlags,
         content: R,
     ) -> Result<Reference, PithosError> {
+        validate_candidate(&self.directory.files, entry_path, file_entry)?;
         // Directory or Symlink FileEntry are just added to Pithos directory
         let file_entry_key = Key::new(
             self.directory.next_free_file_index(),
@@ -372,8 +376,25 @@ impl PithosWriter {
 
     #[tracing::instrument(level = "trace", skip(self, input))]
     pub fn process_input(&mut self, input: InputFile) -> Result<Reference, PithosError> {
+        let data_check = FileEntry::new_from_content(input.file_type, &input.data)?;
+        validate_candidate(&self.directory.files, &input.inner_path, &data_check)?;
+        let mut preflight = self.directory.files.clone();
+        preflight.insert(
+            Key::new(preflight.next_free_id(false), input.inner_path.clone()),
+            data_check.clone(),
+        )?;
+        if let Some(metadata) = &input.metadata
+            && !matches!(metadata, Content::Reference(_))
+        {
+            let metadata_check = FileEntry::new_from_content(FileType::Metadata, metadata)?;
+            validate_candidate(
+                &preflight,
+                &format!("{}.meta", input.inner_path),
+                &metadata_check,
+            )?;
+        }
         // Create FileEntry with its ProcessingFlags from data file input
-        let mut data_file = FileEntry::new_from_content(input.file_type, &input.data)?;
+        let mut data_file = data_check;
         let processing_flags = ProcessingFlags::new(input.encrypt, input.compression_level);
 
         // First process metadata to add reference
@@ -409,7 +430,9 @@ impl PithosWriter {
 
         // Process data FileEntry
         let data_reference = match input.data {
-            Content::File(disk_path) => {
+            Content::File(disk_path)
+                if [FileType::Data, FileType::Metadata].contains(&input.file_type) =>
+            {
                 let handle = File::open(disk_path)?;
                 self.process_file_entry(
                     &input.inner_path,
@@ -418,6 +441,12 @@ impl PithosWriter {
                     handle,
                 )?
             }
+            Content::File(_) => self.process_file_entry(
+                &input.inner_path,
+                &mut data_file,
+                &processing_flags,
+                Cursor::new(Vec::<u8>::new()),
+            )?,
             Content::Raw(raw_content) => {
                 let handle = Cursor::new(raw_content.into_bytes());
                 self.process_file_entry(
@@ -540,6 +569,7 @@ impl PithosWriter {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn write_directory(&mut self) -> Result<(), PithosError> {
+        validate_map(&self.directory.files)?;
         // Encrypt recipients of writer section
         self.directory.encrypt_recipients(&self.writer_key)?;
 

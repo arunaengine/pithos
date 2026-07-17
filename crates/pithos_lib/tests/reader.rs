@@ -1,15 +1,17 @@
 pub mod common;
 
-use crate::common::util::write_dummy_pithos;
+use crate::common::util::{create_pithos_writer, write_dummy_pithos};
 use pithos_lib::error::PithosError;
 use pithos_lib::helpers::chacha_poly1305::decrypt_chunk;
 use pithos_lib::helpers::crypt4gh::{
     CRYPT4GH_ENCRYPTED_BLOCK_SIZE, Crypt4GHHeader, Packet, PacketData,
 };
+use pithos_lib::helpers::file_entry_map::Key;
 use pithos_lib::helpers::ro_crate::{RoCrateSource, read_ro_crate_directory, read_ro_crate_zip};
 use pithos_lib::helpers::x25519_keys::{private_key_from_pem_bytes, public_key_from_pem_bytes};
 use pithos_lib::io::pithosreader::PithosReaderSimple;
-use pithos_lib::model::structs::{FileType, Reference};
+use pithos_lib::io::pithoswriter::{Content, InputFile};
+use pithos_lib::model::structs::{BlockDataState, FileEntry, FileType, Reference};
 use rocraters::ro_crate::graph_vector::GraphVector;
 use rocraters::ro_crate::read::CrateReadError;
 use rocraters::ro_crate::schema::RoCrateSchemaVersion;
@@ -18,6 +20,43 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use x25519_dalek::StaticSecret;
+
+fn reader_key() -> StaticSecret {
+    private_key_from_pem_bytes(
+        std::fs::read("tests/data/keys/recipient1_private.pem")
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap()
+}
+
+fn empty_entry(file_type: FileType, target: Option<&str>) -> FileEntry {
+    FileEntry {
+        file_type,
+        block_data: BlockDataState::Decrypted(vec![]),
+        created: 0,
+        modified: 0,
+        file_size: 0,
+        permissions: 0o644,
+        references: vec![],
+        symlink_target: target.map(str::to_owned),
+    }
+}
+
+fn caller_directory(
+    archive: &Path,
+    entry_path: &str,
+    file_type: FileType,
+    target: Option<&str>,
+) -> (PithosReaderSimple, pithos_lib::model::structs::Directory) {
+    let mut reader = PithosReaderSimple::new_with_key(archive, reader_key()).unwrap();
+    let (mut directory, _) = reader.read_directory().unwrap();
+    directory
+        .files
+        .insert(Key::new(9000, entry_path), empty_entry(file_type, target))
+        .unwrap();
+    (reader, directory)
+}
 
 fn write_zip_entry(path: &Path, name: &str, content: &[u8]) {
     let file = File::create(path).unwrap();
@@ -43,6 +82,227 @@ fn test_reader_single_file() {
     assert_eq!(inner_paths.len(), 1);
     assert_eq!(inner_paths[0].0, FileType::Data);
     assert_eq!(inner_paths[0].1, "t8.shakespeare.txt");
+}
+
+#[test]
+fn test_safe_extraction_rejects_caller_constructed_unsafe_paths() {
+    let temp_dir = TempDir::new().unwrap();
+    let pithos_file = write_dummy_pithos(&temp_dir, false, false);
+    let key = private_key_from_pem_bytes(
+        std::fs::read("tests/data/keys/recipient1_private.pem")
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    let mut reader = PithosReaderSimple::new_with_key(&pithos_file, key).unwrap();
+    let (mut directory, _) = reader.read_directory().unwrap();
+    let entry = FileEntry {
+        file_type: FileType::Data,
+        block_data: BlockDataState::Decrypted(vec![]),
+        created: 0,
+        modified: 0,
+        file_size: 0,
+        permissions: 0o644,
+        references: vec![],
+        symlink_target: None,
+    };
+    directory
+        .files
+        .insert(Key::new(999, "../outside"), entry.clone())
+        .unwrap();
+    directory
+        .files
+        .insert(Key::new(1000, "/absolute"), entry)
+        .unwrap();
+    let output = temp_dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    assert!(
+        reader
+            .read_file("../outside", &directory, Some(&output), None)
+            .is_err()
+    );
+    assert!(
+        reader
+            .read_file("/absolute", &directory, Some(&output), None)
+            .is_err()
+    );
+    assert!(!temp_dir.path().join("outside").exists());
+}
+
+#[test]
+fn test_safe_extraction_rejects_preexisting_parent_symlink() {
+    let temp = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp, false, false);
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let output = temp.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    std::os::unix::fs::symlink(&outside, output.join("nested")).unwrap();
+    let (mut reader, directory) = caller_directory(&archive, "nested/file", FileType::Data, None);
+    assert!(
+        reader
+            .read_file("nested/file", &directory, Some(&output), None)
+            .is_err()
+    );
+    assert!(!outside.join("file").exists());
+}
+
+#[test]
+fn test_safe_extraction_rejects_existing_final_symlink() {
+    let temp = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp, false, false);
+    let outside = temp.path().join("outside");
+    std::fs::write(&outside, b"unchanged").unwrap();
+    let output = temp.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    std::os::unix::fs::symlink(&outside, output.join("file")).unwrap();
+    let (mut reader, directory) = caller_directory(&archive, "file", FileType::Data, None);
+    assert!(
+        reader
+            .read_file("file", &directory, Some(&output), None)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
+}
+
+#[test]
+fn test_safe_extraction_rejects_existing_final_regular_file() {
+    let temp = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp, false, false);
+    let output = temp.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    std::fs::write(output.join("file"), b"unchanged").unwrap();
+    let (mut reader, directory) = caller_directory(&archive, "file", FileType::Data, None);
+    assert!(
+        reader
+            .read_file("file", &directory, Some(&output), None)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(output.join("file")).unwrap(), b"unchanged");
+}
+
+#[test]
+fn test_safe_extraction_rejects_existing_final_directory_for_data() {
+    let temp = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp, false, false);
+    let output = temp.path().join("output");
+    std::fs::create_dir_all(output.join("file")).unwrap();
+    let (mut reader, directory) = caller_directory(&archive, "file", FileType::Data, None);
+    assert!(
+        reader
+            .read_file("file", &directory, Some(&output), None)
+            .is_err()
+    );
+    assert!(output.join("file").is_dir());
+}
+
+#[test]
+fn test_safe_extraction_cleans_pending_file_after_read_failure() {
+    let temp = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp, false, false);
+    let output = temp.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let (mut reader, mut directory) = caller_directory(&archive, "failed", FileType::Data, None);
+    for (_, path, entry) in directory.files.iter_mut() {
+        if path == "failed" {
+            entry.block_data = BlockDataState::Decrypted(vec![([9; 32], [0; 32])]);
+        }
+    }
+    assert!(
+        reader
+            .read_file("failed", &directory, Some(&output), None)
+            .is_err()
+    );
+    assert!(!output.join("failed").exists());
+    assert!(!std::fs::read_dir(&output).unwrap().any(|item| {
+        item.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".pithos-tmp-")
+    }));
+}
+
+#[test]
+fn test_safe_extraction_extracts_safe_nested_regular_file() {
+    let temp = TempDir::new().unwrap();
+    let (archive, key, mut writer) = create_pithos_writer(&temp, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "nested/file".into(),
+            data: Content::Raw("nested payload".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    writer.write_directory().unwrap();
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key).unwrap();
+    let (directory, _) = reader.read_directory().unwrap();
+    let output = temp.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    reader
+        .read_file("nested/file", &directory, Some(&output), None)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(output.join("nested/file")).unwrap(),
+        b"nested payload"
+    );
+}
+
+#[test]
+fn test_safe_extraction_creates_contained_and_dangling_symlinks() {
+    let temp = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp, false, false);
+    let output = temp.path().join("output");
+    std::fs::create_dir_all(output.join("nested")).unwrap();
+    let (mut reader, mut directory) = caller_directory(
+        &archive,
+        "nested/link",
+        FileType::Symlink,
+        Some("../target"),
+    );
+    directory
+        .files
+        .insert(
+            Key::new(9001, "dangling"),
+            empty_entry(FileType::Symlink, Some("missing/target")),
+        )
+        .unwrap();
+    reader
+        .read_file("nested/link", &directory, Some(&output), None)
+        .unwrap();
+    reader
+        .read_file("dangling", &directory, Some(&output), None)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_link(output.join("nested/link")).unwrap(),
+        PathBuf::from("../target")
+    );
+    assert_eq!(
+        std::fs::read_link(output.join("dangling")).unwrap(),
+        PathBuf::from("missing/target")
+    );
+}
+
+#[test]
+fn test_safe_extraction_rejects_caller_constructed_ancestor_conflict() {
+    let temp = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp, false, false);
+    let output = temp.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let (mut reader, mut directory) = caller_directory(&archive, "a", FileType::Data, None);
+    directory
+        .files
+        .insert(Key::new(9001, "a/child"), empty_entry(FileType::Data, None))
+        .unwrap();
+    assert!(
+        reader
+            .read_file("a", &directory, Some(&output), None)
+            .is_err()
+    );
+    assert!(!output.join("a").exists());
 }
 
 #[test]

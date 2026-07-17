@@ -12,8 +12,7 @@ use pithos_lib::io::pithosreader::PithosReaderSimple;
 use pithos_lib::io::pithoswriter::{Content, InputFile, PithosWriter};
 use pithos_lib::model::structs::{FileType, Reference};
 use std::fs::{
-    File, copy, create_dir_all, read, read_dir, read_link, read_to_string, remove_file,
-    symlink_metadata, write,
+    File, copy, create_dir_all, read, read_dir, read_link, read_to_string, remove_file, write,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -805,8 +804,8 @@ fn test_rocrate_zip_synthesizes_parent_directories() {
 fn test_rocrate_zip_preserves_and_extracts_symlink() {
     let temp_dir = TempDir::new().unwrap();
     let zip_path = temp_dir.path().join("symlink.zip");
-    let target = temp_dir.path().join("outside-target");
-    let target_string = target.to_string_lossy().into_owned();
+    let target = PathBuf::from("target");
+    let target_string = "target";
     let metadata = minimal_ro_crate_metadata(&[]);
     write_raw_zip(
         &zip_path,
@@ -823,10 +822,7 @@ fn test_rocrate_zip_preserves_and_extracts_symlink() {
     let entry = directory.get_file_by_path("link").unwrap();
 
     assert_eq!(entry.file_type, FileType::Symlink);
-    assert_eq!(
-        entry.symlink_target.as_deref(),
-        Some(target_string.as_str())
-    );
+    assert_eq!(entry.symlink_target.as_deref(), Some(target_string));
     assert!(entry.references.is_empty());
 
     let output_dir = temp_dir.path().join("extracted");
@@ -838,7 +834,119 @@ fn test_rocrate_zip_preserves_and_extracts_symlink() {
         .unwrap();
 
     assert_eq!(read_link(output_dir.join("link")).unwrap(), target);
-    assert!(symlink_metadata(temp_dir.path().join("outside-target")).is_err());
+}
+
+#[test]
+fn test_writer_rejects_unsafe_paths_before_block_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+    let result = writer.process_input(InputFile {
+        file_type: FileType::Data,
+        inner_path: "../outside".into(),
+        data: Content::Raw("payload".into()),
+        metadata: None,
+        encrypt: false,
+        compression_level: Some(0),
+    });
+    assert!(matches!(
+        result,
+        Err(PithosError::InvalidArchivePath { .. })
+    ));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+}
+
+#[test]
+fn test_writer_rejects_candidate_ancestor_before_metadata_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "a".into(),
+            data: Content::Raw("existing".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        writer
+            .process_input(InputFile {
+                file_type: FileType::Data,
+                inner_path: "a/child".into(),
+                data: Content::Raw("child".into()),
+                metadata: Some(Content::Raw("metadata".into())),
+                encrypt: false,
+                compression_level: Some(0),
+            })
+            .is_err()
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+}
+
+#[test]
+fn test_writer_rejects_unsafe_symlink_targets() {
+    let temp_dir = TempDir::new().unwrap();
+    let (_path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    let mut entry = pithos_lib::model::structs::FileEntry {
+        file_type: FileType::Symlink,
+        block_data: pithos_lib::model::structs::BlockDataState::Decrypted(vec![]),
+        created: 0,
+        modified: 0,
+        file_size: 0,
+        permissions: 0o777,
+        references: vec![],
+        symlink_target: Some("/outside".into()),
+    };
+    assert!(matches!(
+        writer.process_file_entry(
+            "link",
+            &mut entry,
+            &pithos_lib::model::structs::ProcessingFlags(0),
+            std::io::Cursor::new(Vec::<u8>::new())
+        ),
+        Err(PithosError::InvalidSymlinkTarget { .. })
+    ));
+}
+
+#[test]
+fn test_writer_rejects_unsafe_rocrate_absolute_symlink_target() {
+    let temp_dir = TempDir::new().unwrap();
+    let zip_path = temp_dir.path().join("unsafe-link.zip");
+    let metadata = minimal_ro_crate_metadata(&[]);
+    write_raw_zip(
+        &zip_path,
+        &[
+            ("ro-crate-metadata.json", metadata.as_bytes(), 0),
+            ("link", b"/outside", 0o120777),
+        ],
+        false,
+    );
+    let loaded = read_ro_crate_zip(&zip_path).unwrap();
+    let (_path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    assert!(writer.process_ro_crate(&loaded).is_err());
+}
+
+#[test]
+fn test_writer_rejects_unsafe_rocrate_root_escaping_symlink_target() {
+    let temp_dir = TempDir::new().unwrap();
+    let zip_path = temp_dir.path().join("unsafe-link.zip");
+    let metadata = minimal_ro_crate_metadata(&[]);
+    write_raw_zip(
+        &zip_path,
+        &[
+            ("ro-crate-metadata.json", metadata.as_bytes(), 0),
+            ("link", b"../outside", 0o120777),
+        ],
+        false,
+    );
+    let loaded = read_ro_crate_zip(&zip_path).unwrap();
+    let (_path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    assert!(writer.process_ro_crate(&loaded).is_err());
 }
 
 #[test]
@@ -952,9 +1060,11 @@ fn test_rocrate_directory_zip_parity() {
 
     assert_eq!(directory_entries, zip_entries);
     for path in ["ro-crate-metadata.json", "nested/file.txt", "unlisted.txt"] {
+        let directory_output = TempDir::new().unwrap();
+        let zip_output = TempDir::new().unwrap();
         let directory_bytes =
-            extract_pithos_entry(&directory_pithos, &directory_key, path, &temp_dir);
-        let zip_bytes = extract_pithos_entry(&zip_pithos, &zip_key, path, &temp_dir);
+            extract_pithos_entry(&directory_pithos, &directory_key, path, &directory_output);
+        let zip_bytes = extract_pithos_entry(&zip_pithos, &zip_key, path, &zip_output);
         assert_eq!(directory_bytes, zip_bytes, "{path}");
     }
     assert_eq!(

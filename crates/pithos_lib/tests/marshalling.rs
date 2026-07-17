@@ -107,7 +107,7 @@ fn directory_roundtrip() {
             target_file_id: 2,
             relationship: 3,
         }],
-        symlink_target: Some("target".to_string()),
+        symlink_target: None,
     };
     let block_index = BlockIndexEntry {
         offset: 4,
@@ -180,6 +180,76 @@ fn directory_builder_crc_matches_recalculation() {
     recalculated.update_crc32().unwrap();
 
     assert_eq!(directory.crc32, recalculated.crc32);
+}
+
+fn serialized_directory(path: &str, entry: FileEntry) -> Vec<u8> {
+    let mut files = FileEntryMap::new();
+    files.insert(Key::new(0, path), entry).unwrap();
+    let directory = DirectoryBuilder::new().files(files).build().unwrap();
+    let mut bytes = Vec::new();
+    directory.serialize(&mut bytes).unwrap();
+    bytes
+}
+
+fn plain_entry(target: Option<&str>) -> FileEntry {
+    FileEntry {
+        file_type: FileType::Data,
+        block_data: BlockDataState::Decrypted(vec![]),
+        created: 0,
+        modified: 0,
+        file_size: 0,
+        permissions: 0o644,
+        references: vec![],
+        symlink_target: target.map(str::to_owned),
+    }
+}
+
+#[test]
+fn directory_deserialization_rejects_unsafe_entry_paths() {
+    for path in ["../outside", "/absolute", "nested//file", "C:/file"] {
+        assert!(
+            Directory::deserialize(&mut Cursor::new(serialized_directory(
+                path,
+                plain_entry(None)
+            )))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn directory_deserialization_rejects_missing_inconsistent_symlink_targets() {
+    let mut missing = plain_entry(None);
+    missing.file_type = FileType::Symlink;
+    assert!(
+        Directory::deserialize(&mut Cursor::new(serialized_directory("link", missing))).is_err()
+    );
+    assert!(
+        Directory::deserialize(&mut Cursor::new(serialized_directory(
+            "file",
+            plain_entry(Some("target"))
+        )))
+        .is_err()
+    );
+    let mut blocks = plain_entry(Some("target"));
+    blocks.file_type = FileType::Symlink;
+    blocks.block_data = BlockDataState::Decrypted(vec![([0; 32], [0; 32])]);
+    assert!(
+        Directory::deserialize(&mut Cursor::new(serialized_directory("link", blocks))).is_err()
+    );
+    let mut encrypted = plain_entry(Some("target"));
+    encrypted.file_type = FileType::Symlink;
+    encrypted.block_data = BlockDataState::Encrypted(vec![]);
+    assert!(
+        Directory::deserialize(&mut Cursor::new(serialized_directory("link", encrypted))).is_err()
+    );
+}
+
+#[test]
+fn directory_deserialization_rejects_unsafe_symlink_targets() {
+    let mut link = plain_entry(Some("../outside"));
+    link.file_type = FileType::Symlink;
+    assert!(Directory::deserialize(&mut Cursor::new(serialized_directory("link", link))).is_err());
 }
 
 #[test]
