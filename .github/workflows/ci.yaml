@@ -1,5 +1,7 @@
 name: CI
-on: push
+on:
+  - push
+  - pull_request
 jobs:
   tests:
     runs-on: ubuntu-latest
@@ -46,3 +48,20 @@ jobs:
 
       - name: Run clippy
         run: cargo +nightly clippy --workspace --all-targets -- -D warnings
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Check dependency policy
+        run: cargo deny check
