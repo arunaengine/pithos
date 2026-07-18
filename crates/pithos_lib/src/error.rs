@@ -73,6 +73,13 @@ pub enum PithosError {
     InvalidBlockDataState(String),
     #[error("Block hash not found: {0:?}")]
     BlockHashNotFound([u8; 32]),
+    #[error("Block size mismatch: expected {expected}, got {actual}")]
+    BlockSizeMismatch { expected: u64, actual: u64 },
+    #[error("Block hash mismatch: expected {expected:?}, got {actual:?}")]
+    BlockHashMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
     #[error("File not found: {0}")]
     FileNotFound(String),
     #[error("File already exists: {0}")]

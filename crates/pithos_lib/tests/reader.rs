@@ -81,6 +81,146 @@ fn directory_bounds(bytes: &[u8]) -> (usize, usize) {
     (bytes.len() - length, length)
 }
 
+fn write_identity_integrity_archive(
+    temp_dir: &TempDir,
+) -> (
+    PathBuf,
+    StaticSecret,
+    pithos_lib::model::structs::Directory,
+    [u8; 32],
+) {
+    let (archive, key, mut writer) = create_pithos_writer(temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "integrity.txt".into(),
+            data: Content::Raw("deterministic integrity payload".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    writer.write_directory().unwrap();
+    drop(writer);
+
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key.clone()).unwrap();
+    let (directory, _) = reader.read_directory().unwrap();
+    let file_entry = directory.get_file_by_path("integrity.txt").unwrap();
+    let hash = match &file_entry.block_data {
+        BlockDataState::Decrypted(blocks) => blocks[0].0,
+        BlockDataState::Encrypted(_) => panic!("identity archive has encrypted block data"),
+    };
+    (archive, key, directory, hash)
+}
+
+fn mutate_block_payload(
+    archive: &Path,
+    directory: &pithos_lib::model::structs::Directory,
+    hash: [u8; 32],
+) {
+    let block = directory.blocks.get(&hash).unwrap();
+    let mut bytes = read(archive).unwrap();
+    let offset = block.offset as usize;
+    assert_eq!(&bytes[offset..offset + 4], b"BLCK");
+    bytes[offset + 4] ^= 1;
+    write(archive, bytes).unwrap();
+}
+
+#[test]
+fn test_block_integrity_valid_identity_read() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, _) = write_identity_integrity_archive(&temp_dir);
+    let output = temp_dir.path().join("valid.txt");
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key).unwrap();
+
+    reader
+        .read_file("integrity.txt", &directory, Some(&output), None)
+        .unwrap();
+    assert_eq!(read(&output).unwrap(), b"deterministic integrity payload");
+}
+
+#[test]
+fn test_block_integrity_full_read_rejects_corruption_without_commit() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, hash) = write_identity_integrity_archive(&temp_dir);
+    mutate_block_payload(&archive, &directory, hash);
+    let output = temp_dir.path().join("corrupt-full.txt");
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key).unwrap();
+
+    assert!(matches!(
+        reader.read_file("integrity.txt", &directory, Some(&output), None),
+        Err(PithosError::BlockHashMismatch { .. })
+    ));
+    assert!(!output.exists());
+}
+
+#[test]
+fn test_block_integrity_range_read_rejects_corruption_without_commit() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, hash) = write_identity_integrity_archive(&temp_dir);
+    mutate_block_payload(&archive, &directory, hash);
+    let output = temp_dir.path().join("corrupt-range.txt");
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key).unwrap();
+
+    assert!(matches!(
+        reader.read_file(
+            "integrity.txt",
+            &directory,
+            Some(&output),
+            #[allow(clippy::single_range_in_vec_init)]
+            Some(vec![0..1]),
+        ),
+        Err(PithosError::BlockHashMismatch { .. })
+    ));
+    assert!(!output.exists());
+}
+
+#[test]
+fn test_block_integrity_crypt4gh_rejects_corruption_before_block_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, hash) = write_identity_integrity_archive(&temp_dir);
+    mutate_block_payload(&archive, &directory, hash);
+    let recipient = public_key_from_pem_bytes(
+        read_to_string("tests/data/keys/recipient2_public.pem")
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let output = temp_dir.path().join("corrupt.crypt4gh");
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key).unwrap();
+    let sink = Box::new(File::create(&output).unwrap());
+
+    assert!(matches!(
+        reader.read_file_to_crypt4gh("integrity.txt", &directory, vec![recipient], Some(sink)),
+        Err(PithosError::BlockHashMismatch { .. })
+    ));
+    let output_bytes = read(&output).unwrap();
+    let header = Crypt4GHHeader::try_from(output_bytes.as_slice()).unwrap();
+    let header_len = 16
+        + header
+            .header_packets
+            .iter()
+            .map(|packet| packet.length as usize)
+            .sum::<usize>();
+    assert_eq!(output_bytes.len(), header_len);
+}
+
+#[test]
+fn test_block_integrity_size_mismatch_precedes_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, mut directory, hash) = write_identity_integrity_archive(&temp_dir);
+    directory.blocks.get_mut(&hash).unwrap().original_size += 1;
+    let output = temp_dir.path().join("wrong-size.txt");
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key).unwrap();
+
+    assert!(matches!(
+        reader.read_file("integrity.txt", &directory, Some(&output), None),
+        Err(PithosError::BlockSizeMismatch { .. })
+    ));
+    assert!(!output.exists());
+}
+
 #[test]
 fn test_directory_integrity_valid_terminal_archive() {
     let temp_dir = TempDir::new().unwrap();

@@ -320,7 +320,12 @@ Implementations SHOULD use content-defined chunking with recommended parameters:
 
 ### 6.2 Block Hashing
 
-All block hashes MUST use Blake3.
+Each block identifier MUST be the full 32-byte default unkeyed BLAKE3 digest of the exact
+plaintext chunk before compression or encryption. Readers MUST retrieve the stored block,
+authenticate and decrypt it when encrypted, decompress it when compressed using the recorded
+original size as the output bound, require the resulting plaintext length to equal the recorded
+original size, compute the complete plaintext digest, and compare it with the block identifier
+before releasing any output derived from that block.
 
 ### 6.3 Convergent Encryption
 
@@ -363,7 +368,8 @@ When archiving directory trees:
 
 ## 8. Security Considerations
 
-1. Implementations MUST verify block hashes before decompression/decryption
+1. Implementations MUST verify the complete plaintext block size and hash after authenticated
+   decryption and decompression, and before releasing output derived from the block
 2. CRC32 values MUST be validated for directories and encryption sections
 3. Convergent encryption reveals when identical files exist (accepted trade-off)
 4. External block URLs MUST use HTTPS in production environments

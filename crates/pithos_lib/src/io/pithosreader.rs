@@ -26,6 +26,40 @@ pub struct PithosReaderSimple {
 }
 
 impl PithosReaderSimple {
+    fn decode_and_verify_block(
+        stored_bytes: Vec<u8>,
+        key: &[u8; 32],
+        expected_hash: &[u8; 32],
+        block_meta: &BlockIndexEntry,
+    ) -> Result<Vec<u8>, PithosError> {
+        let mut plaintext = if block_meta.flags.is_encrypted() {
+            decrypt_chunk(&stored_bytes, key)?
+        } else {
+            stored_bytes
+        };
+        if block_meta.flags.get_compression_level() > 0 {
+            plaintext = decompress_data(&plaintext, block_meta.original_size)?;
+        }
+
+        let actual_size = plaintext.len() as u64;
+        if actual_size != block_meta.original_size {
+            return Err(PithosError::BlockSizeMismatch {
+                expected: block_meta.original_size,
+                actual: actual_size,
+            });
+        }
+
+        let actual_hash = *blake3::hash(&plaintext).as_bytes();
+        if actual_hash != *expected_hash {
+            return Err(PithosError::BlockHashMismatch {
+                expected: *expected_hash,
+                actual: actual_hash,
+            });
+        }
+
+        Ok(plaintext)
+    }
+
     fn parse_directory(bytes: &[u8]) -> Result<Directory, PithosError> {
         if bytes.len() < 25 {
             return Err(PithosError::DirectoryLengthMismatch {
@@ -351,13 +385,7 @@ impl PithosReaderSimple {
                     let mut block_buf = vec![0u8; block_meta.stored_size as usize];
                     self.file.read_exact(&mut block_buf)?;
 
-                    // Decrypt and decompress according to ProcessingFlags
-                    if block_meta.flags.is_encrypted() {
-                        block_buf = decrypt_chunk(&block_buf, key)?;
-                    }
-                    if block_meta.flags.get_compression_level() > 0 {
-                        block_buf = decompress_data(&block_buf, block_meta.original_size)?;
-                    }
+                    block_buf = Self::decode_and_verify_block(block_buf, key, hash, block_meta)?;
 
                     // Write chunk data in 64KiB ChaCha20Poly1305 encrypted blocks
                     let mut chunk_offset = 0;
@@ -452,13 +480,7 @@ impl PithosReaderSimple {
                         }
                     }
 
-                    // Decrypt and decompress according to ProcessingFlags
-                    if block_meta.flags.is_encrypted() {
-                        block_data = decrypt_chunk(&block_data, key)?;
-                    }
-                    if block_meta.flags.get_compression_level() > 0 {
-                        block_data = decompress_data(&block_data, block_meta.original_size)?;
-                    }
+                    block_data = Self::decode_and_verify_block(block_data, key, hash, block_meta)?;
 
                     sink.write_all(&block_data)?;
                 }
@@ -515,14 +537,7 @@ impl PithosReaderSimple {
                     let mut block_buf = vec![0u8; block_meta.stored_size as usize];
                     self.file.read_exact(&mut block_buf)?;
 
-                    // Decrypt and decompress according to ProcessingFlags
-                    if block_meta.flags.is_encrypted() {
-                        block_buf = decrypt_chunk(&block_buf, key)?;
-                    }
-
-                    if block_meta.flags.get_compression_level() > 0 {
-                        block_buf = decompress_data(&block_buf, block_meta.original_size)?;
-                    }
+                    block_buf = Self::decode_and_verify_block(block_buf, key, hash, block_meta)?;
 
                     // Calculate the range within this block to write
                     let write_start = if byte_range.start > block_start {
