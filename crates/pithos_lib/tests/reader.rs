@@ -9,15 +9,16 @@ use pithos_lib::helpers::crypt4gh::{
 use pithos_lib::helpers::file_entry_map::Key;
 use pithos_lib::helpers::ro_crate::{RoCrateSource, read_ro_crate_directory, read_ro_crate_zip};
 use pithos_lib::helpers::x25519_keys::{private_key_from_pem_bytes, public_key_from_pem_bytes};
-use pithos_lib::io::pithosreader::{PithosReaderSimple, ReaderLimits};
+use pithos_lib::io::pithosreader::{ExternalBlockSource, PithosReaderSimple, ReaderLimits};
 use pithos_lib::io::pithoswriter::{Content, InputFile, PithosWriter};
-use pithos_lib::model::structs::{BlockDataState, FileEntry, FileType, Reference};
+use pithos_lib::model::structs::{BlockDataState, BlockLocation, FileEntry, FileType, Reference};
 use rocraters::ro_crate::graph_vector::GraphVector;
 use rocraters::ro_crate::read::CrateReadError;
 use rocraters::ro_crate::schema::RoCrateSchemaVersion;
 use std::fs::{File, OpenOptions, read, read_to_string, write};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use x25519_dalek::StaticSecret;
 
@@ -147,6 +148,223 @@ fn mutate_block_payload(
     assert_eq!(&bytes[offset..offset + 4], b"BLCK");
     bytes[offset + 4] ^= 1;
     write(archive, bytes).unwrap();
+}
+
+fn external_directory(
+    mut directory: pithos_lib::model::structs::Directory,
+    hash: [u8; 32],
+) -> pithos_lib::model::structs::Directory {
+    let block = directory.blocks.get_mut(&hash).unwrap();
+    block.location = BlockLocation::External {
+        url: "https://invalid.invalid/external-block".into(),
+    };
+    block.offset = u64::MAX;
+    directory
+}
+
+struct RecordingExternalSource {
+    response: Vec<u8>,
+    requested_url: Arc<Mutex<Option<String>>>,
+    requested_max: Arc<Mutex<Option<u64>>>,
+}
+
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ExternalBlockSource for RecordingExternalSource {
+    fn open(&self, url: &str, max_response_size: u64) -> Result<Box<dyn Read>, PithosError> {
+        *self.requested_url.lock().unwrap() = Some(url.to_owned());
+        *self.requested_max.lock().unwrap() = Some(max_response_size);
+        Ok(Box::new(Cursor::new(self.response.clone())))
+    }
+}
+
+fn external_block_bytes(
+    archive: &Path,
+    directory: &pithos_lib::model::structs::Directory,
+    hash: [u8; 32],
+) -> Vec<u8> {
+    let block = directory.blocks.get(&hash).unwrap();
+    let bytes = read(archive).unwrap();
+    let start = block.offset as usize;
+    let end = start + 4 + block.stored_size as usize;
+    bytes[start..end].to_vec()
+}
+
+#[test]
+fn test_external_blocks_use_injected_source_for_all_paths() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, hash) = write_identity_integrity_archive(&temp_dir);
+    let valid_response = external_block_bytes(&archive, &directory, hash);
+    let directory = external_directory(directory, hash);
+    let requested_url = Arc::new(Mutex::new(None));
+    let requested_max = Arc::new(Mutex::new(None));
+    let source = RecordingExternalSource {
+        response: valid_response.clone(),
+        requested_url: requested_url.clone(),
+        requested_max: requested_max.clone(),
+    };
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key.clone())
+        .unwrap()
+        .with_external_block_source(Box::new(source));
+    let output = temp_dir.path().join("external-full-success.txt");
+    reader
+        .read_file("integrity.txt", &directory, Some(&output), None)
+        .unwrap();
+    assert_eq!(read(&output).unwrap(), b"deterministic integrity payload");
+    assert_eq!(
+        requested_url.lock().unwrap().as_deref(),
+        Some("https://invalid.invalid/external-block")
+    );
+    assert_eq!(
+        *requested_max.lock().unwrap(),
+        Some(4 + directory.blocks.get(&hash).unwrap().stored_size + 1)
+    );
+
+    let source = RecordingExternalSource {
+        response: valid_response.clone(),
+        requested_url: Arc::new(Mutex::new(None)),
+        requested_max: Arc::new(Mutex::new(None)),
+    };
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key.clone())
+        .unwrap()
+        .with_external_block_source(Box::new(source));
+    let range_bytes = Arc::new(Mutex::new(Vec::new()));
+    let mut range_output: Box<dyn Write> = Box::new(SharedWriter(range_bytes.clone()));
+    let file_entry = directory.get_file_by_path("integrity.txt").unwrap();
+    reader
+        .read_data_range_to_sink(2..10, file_entry, &directory.blocks, &mut range_output)
+        .unwrap();
+    assert_eq!(*range_bytes.lock().unwrap(), b"terminis");
+
+    let recipient = public_key_from_pem_bytes(
+        read_to_string("tests/data/keys/recipient2_public.pem")
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let source = RecordingExternalSource {
+        response: valid_response,
+        requested_url: Arc::new(Mutex::new(None)),
+        requested_max: Arc::new(Mutex::new(None)),
+    };
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key)
+        .unwrap()
+        .with_external_block_source(Box::new(source));
+    let crypt4gh_output = Arc::new(Mutex::new(Vec::new()));
+    reader
+        .read_file_to_crypt4gh(
+            "integrity.txt",
+            &directory,
+            vec![recipient],
+            Some(Box::new(SharedWriter(crypt4gh_output.clone()))),
+        )
+        .unwrap();
+    assert!(!crypt4gh_output.lock().unwrap().is_empty());
+}
+
+#[test]
+fn test_external_blocks_reject_invalid_framing_without_plaintext() {
+    let cases = [
+        (
+            b"BLCK".to_vec(),
+            "external block framing error: short block payload",
+        ),
+        (
+            [b"BLCK".as_slice(), b"deterministic integrity payload", b"x"].concat(),
+            "external block framing error: response exceeds expected size",
+        ),
+        (
+            [b"NOPE".as_slice(), b"deterministic integrity payload"].concat(),
+            "external block framing error: invalid block marker",
+        ),
+    ];
+    for (response, expected_error) in cases {
+        let temp_dir = TempDir::new().unwrap();
+        let (archive, key, directory, hash) = write_identity_integrity_archive(&temp_dir);
+        let directory = external_directory(directory, hash);
+        let source = RecordingExternalSource {
+            response,
+            requested_url: Arc::new(Mutex::new(None)),
+            requested_max: Arc::new(Mutex::new(None)),
+        };
+        let output = temp_dir.path().join("invalid-external.txt");
+        let mut reader = PithosReaderSimple::new_with_key(&archive, key)
+            .unwrap()
+            .with_external_block_source(Box::new(source));
+        let result = reader.read_file("integrity.txt", &directory, Some(&output), None);
+        assert!(result.unwrap_err().to_string().contains(expected_error));
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn test_external_blocks_fail_closed_without_source() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, hash) = write_identity_integrity_archive(&temp_dir);
+    let directory = external_directory(directory, hash);
+
+    let full_output = temp_dir.path().join("external-full.txt");
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key.clone()).unwrap();
+    let full_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reader.read_file("integrity.txt", &directory, Some(&full_output), None)
+    }))
+    .map_err(|panic| {
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(ToString::to_string))
+            .unwrap_or_else(|| "unknown panic".into());
+        PithosError::Other(message)
+    })
+    .and_then(|result| result);
+    assert_eq!(
+        full_result.unwrap_err().to_string(),
+        "external block source required"
+    );
+    assert!(!full_output.exists());
+
+    let range_output = temp_dir.path().join("external-range.txt");
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key.clone()).unwrap();
+    let range_result = reader.read_file(
+        "integrity.txt",
+        &directory,
+        Some(&range_output),
+        Some(vec![0..1]),
+    );
+    assert_eq!(
+        range_result.unwrap_err().to_string(),
+        "external block source required"
+    );
+    assert!(!range_output.exists());
+
+    let recipient = public_key_from_pem_bytes(
+        read_to_string("tests/data/keys/recipient2_public.pem")
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key).unwrap();
+    let crypt4gh_result = reader.read_file_to_crypt4gh(
+        "integrity.txt",
+        &directory,
+        vec![recipient],
+        Some(Box::new(Vec::<u8>::new())),
+    );
+    assert_eq!(
+        crypt4gh_result.unwrap_err().to_string(),
+        "external block source required"
+    );
 }
 
 #[test]

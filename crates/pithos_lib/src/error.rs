@@ -83,6 +83,10 @@ pub enum PithosError {
     UnsupportedZipEntry(String),
     #[error("Invalid block data state: {0}")]
     InvalidBlockDataState(String),
+    #[error("external block source required")]
+    ExternalBlockSourceRequired,
+    #[error("external block framing error: {0}")]
+    ExternalBlockFraming(String),
     #[error("Block hash not found: {0:?}")]
     BlockHashNotFound([u8; 32]),
     #[error("Block size mismatch: expected {expected}, got {actual}")]

@@ -19,6 +19,10 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+pub trait ExternalBlockSource {
+    fn open(&self, url: &str, max_response_size: u64) -> Result<Box<dyn Read>, PithosError>;
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ReaderLimits {
     pub max_directory_bytes: u64,
@@ -46,6 +50,7 @@ pub struct PithosReaderSimple {
     /// User's private key
     private_key: StaticSecret,
     limits: ReaderLimits,
+    external_block_source: Option<Box<dyn ExternalBlockSource>>,
 }
 
 impl PithosReaderSimple {
@@ -197,6 +202,7 @@ impl PithosReaderSimple {
             file,
             private_key,
             limits: ReaderLimits::default(),
+            external_block_source: None,
         })
     }
 
@@ -213,12 +219,64 @@ impl PithosReaderSimple {
             file,
             private_key,
             limits: ReaderLimits::default(),
+            external_block_source: None,
         })
     }
 
     pub fn with_limits(mut self, limits: ReaderLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    pub fn with_external_block_source(mut self, source: Box<dyn ExternalBlockSource>) -> Self {
+        self.external_block_source = Some(source);
+        self
+    }
+
+    fn load_stored_block(&mut self, meta: &BlockIndexEntry) -> Result<Vec<u8>, PithosError> {
+        let stored_size = Self::checked_stored_size(meta, &self.limits)?;
+        let mut block_data = Self::zeroed_buffer(stored_size, "stored block")?;
+        let mut block_header = [0u8; 4];
+
+        match &meta.location {
+            BlockLocation::Local => {
+                self.validate_local_block_range(meta)?;
+                self.file.seek(SeekFrom::Start(meta.offset))?;
+                self.file.read_exact(&mut block_header)?;
+                BlockHeader::deserialize(&mut block_header.as_slice())?;
+                self.file.read_exact(&mut block_data)?;
+            }
+            BlockLocation::External { url } => {
+                let max_response_size = meta.stored_size.checked_add(5).ok_or_else(|| {
+                    PithosError::ExternalBlockFraming("response size overflow".into())
+                })?;
+                let source = self
+                    .external_block_source
+                    .as_ref()
+                    .ok_or(PithosError::ExternalBlockSourceRequired)?;
+                let mut response = source.open(url, max_response_size)?;
+                response.read_exact(&mut block_header).map_err(|error| {
+                    PithosError::ExternalBlockFraming(format!("short block marker: {error}"))
+                })?;
+                BlockHeader::deserialize(&mut block_header.as_slice()).map_err(|error| {
+                    PithosError::ExternalBlockFraming(format!("invalid block marker: {error}"))
+                })?;
+                response.read_exact(&mut block_data).map_err(|error| {
+                    PithosError::ExternalBlockFraming(format!("short block payload: {error}"))
+                })?;
+                let mut extra = [0u8; 1];
+                if response.read(&mut extra).map_err(|error| {
+                    PithosError::ExternalBlockFraming(format!("reading block boundary: {error}"))
+                })? != 0
+                {
+                    return Err(PithosError::ExternalBlockFraming(
+                        "response exceeds expected size".into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(block_data)
     }
 
     /// Init a simple Pithos reader
@@ -541,19 +599,7 @@ impl PithosReaderSimple {
                         .get(hash)
                         .ok_or(PithosError::BlockHashNotFound(*hash))?;
 
-                    // Jump to begin of block in file
-                    let stored_size = Self::checked_stored_size(block_meta, &self.limits)?;
-                    self.validate_local_block_range(block_meta)?;
-                    self.file.seek(SeekFrom::Start(block_meta.offset))?;
-
-                    // Read block header for block start validation
-                    let mut block_header = [0u8; 4];
-                    self.file.read_exact(&mut block_header)?;
-                    BlockHeader::deserialize(&mut block_header.as_slice())?;
-
-                    // Read block data
-                    let mut block_buf = Self::zeroed_buffer(stored_size, "stored block")?;
-                    self.file.read_exact(&mut block_buf)?;
+                    let mut block_buf = self.load_stored_block(block_meta)?;
 
                     block_buf = Self::decode_and_verify_block(
                         block_buf,
@@ -635,28 +681,7 @@ impl PithosReaderSimple {
                         .get(hash)
                         .ok_or(PithosError::BlockHashNotFound(*hash))?;
 
-                    let mut block_header = [0u8; 4];
-                    let stored_size = Self::checked_stored_size(block_meta, &self.limits)?;
-                    let mut block_data = Self::zeroed_buffer(stored_size, "stored block")?;
-                    match &block_meta.location {
-                        BlockLocation::Local => {
-                            self.validate_local_block_range(block_meta)?;
-                            self.file.seek(SeekFrom::Start(block_meta.offset))?;
-                            // Read block header for block start validation
-                            self.file.read_exact(&mut block_header)?;
-                            BlockHeader::deserialize(&mut block_header.as_slice())?;
-                            // Read block data
-                            self.file.read_exact(&mut block_data)?;
-                        }
-                        BlockLocation::External { url } => {
-                            let mut response = reqwest::blocking::get(url).unwrap();
-                            // Read block header for block start validation
-                            response.read_exact(&mut block_header)?;
-                            BlockHeader::deserialize(&mut block_header.as_slice())?;
-                            // Read block data
-                            self.file.read_exact(&mut block_data)?;
-                        }
-                    }
+                    let mut block_data = self.load_stored_block(block_meta)?;
 
                     block_data = Self::decode_and_verify_block(
                         block_data,
@@ -697,7 +722,7 @@ impl PithosReaderSimple {
                         .get(hash)
                         .ok_or(PithosError::BlockHashNotFound(*hash))?;
 
-                    let stored_size = Self::checked_stored_size(block_meta, &self.limits)?;
+                    Self::checked_stored_size(block_meta, &self.limits)?;
                     let block_start = block_byte_sum;
                     let block_end = block_byte_sum
                         .checked_add(block_meta.original_size)
@@ -716,16 +741,7 @@ impl PithosReaderSimple {
                         break;
                     }
 
-                    // Read block header for block start validation
-                    self.validate_local_block_range(block_meta)?;
-                    self.file.seek(SeekFrom::Start(block_meta.offset))?;
-                    let mut block_header = [0u8; 4];
-                    self.file.read_exact(&mut block_header)?;
-                    BlockHeader::deserialize(&mut block_header.as_slice())?;
-
-                    // Read block data
-                    let mut block_buf = Self::zeroed_buffer(stored_size, "stored block")?;
-                    self.file.read_exact(&mut block_buf)?;
+                    let mut block_buf = self.load_stored_block(block_meta)?;
 
                     block_buf = Self::decode_and_verify_block(
                         block_buf,
