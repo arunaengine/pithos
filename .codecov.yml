@@ -1,15 +1,16 @@
 codecov:
   require_ci_to_pass: true
 coverage:
-  range: 50..90 # coverage lower than 50 is red, higher than 90 green, between color code
+  range: 50..90
   status:
     project:
-      default: # settings affecting project coverage
-        enabled: true # auto % coverage target
-        threshold: "5%" # allow for 5% reduction of coverage without failing
-    # do not run coverage on patch nor changes
-      target: false
-    patch: false
+      default:
+        target: "65%"
+        threshold: "1%"
+    patch:
+      default:
+        target: "60%"
+        threshold: "5%"
     changes: false
 ignore:
   - "src/bin" # don't consider binaries in coverage report

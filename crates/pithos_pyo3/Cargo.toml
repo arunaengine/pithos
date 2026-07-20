@@ -2,8 +2,10 @@
 name = "pithos_pyo3"
 description = "Client for the Pithos object storage file format"
 version = "0.7.0"
+publish = false
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 

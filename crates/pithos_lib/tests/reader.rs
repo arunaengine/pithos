@@ -70,12 +70,13 @@ fn test_reader_file_ranges() {
     let temp_dir = TempDir::new().unwrap();
     let outfile_single = temp_dir.path().join("range.txt");
     let outfile_multi = temp_dir.path().join("ranges.txt");
-    if let Some(_) = directory.get_file_by_path("t8.shakespeare.txt") {
+    if directory.get_file_by_path("t8.shakespeare.txt").is_some() {
         reader
             .read_file(
                 "t8.shakespeare.txt",
                 &directory,
                 Some(&outfile_single),
+                #[allow(clippy::single_range_in_vec_init)]
                 Some(vec![261..272]),
             )
             .unwrap();
@@ -303,6 +304,7 @@ fn test_read_to_crypt4gh() {
     let crypt4gh_output = Box::new(
         OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&crypt4gh_output_path)
             .unwrap(),
@@ -338,7 +340,7 @@ fn test_read_to_crypt4gh() {
         if let PacketData::Decrypted(packets) = &header_packet.packet_data {
             for packet in packets {
                 if let Packet::Encryption(encryption_packet) = packet {
-                    data_key = Some(encryption_packet.get_encryption_key().clone());
+                    data_key = Some(*encryption_packet.get_encryption_key());
                     break 'outer;
                 }
             }
@@ -352,6 +354,7 @@ fn test_read_to_crypt4gh() {
     let raw_output_file = temp_dir.path().join("t8.shakespeare.txt");
     let mut output = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(&raw_output_file)
         .unwrap();

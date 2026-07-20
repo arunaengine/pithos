@@ -6,12 +6,7 @@ name: coverage
 jobs:
   report:
     name: Report
-    environment: coverage
     runs-on: ubuntu-latest
-    env:
-      CARGO_INCREMENTAL: "0"
-      RUSTFLAGS: "-Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort"
-      RUSTDOCFLAGS: "-Cpanic=abort"
 
     steps:
       - name: Checkout repository
@@ -19,9 +14,8 @@ jobs:
 
       - id: setup
         name: Setup Toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly
           components: llvm-tools-preview
 
       - id: cache
@@ -36,11 +30,12 @@ jobs:
       - id: coverage
         name: Generate Coverage Report
         run: |
-          mkdir .coverage
-          cargo llvm-cov --lcov --output-path=./.coverage/lcov.info
+          mkdir -p .coverage
+          cargo llvm-cov --locked --workspace --all-targets --lcov --output-path=./.coverage/lcov.info
 
       - id: upload
         name: Upload Coverage Report
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

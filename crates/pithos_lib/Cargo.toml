@@ -4,6 +4,7 @@ description = "Library and components for encrypting / compressing pithos (.pith
 version = "0.7.2"
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
