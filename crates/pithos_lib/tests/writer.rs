@@ -8,7 +8,7 @@ use pithos_lib::error::PithosError;
 use pithos_lib::helpers::file_entry_map::KeyQuery;
 use pithos_lib::helpers::ro_crate::{LoadedRoCrate, read_ro_crate_directory, read_ro_crate_zip};
 use pithos_lib::helpers::x25519_keys::private_key_from_pem_bytes;
-use pithos_lib::io::pithosreader::PithosReaderSimple;
+use pithos_lib::io::pithosreader::{PithosReaderSimple, ReaderLimits};
 use pithos_lib::io::pithoswriter::{Content, InputFile, PithosWriter};
 use pithos_lib::model::structs::{FileType, Reference};
 use std::fs::{
@@ -375,6 +375,61 @@ fn test_append_single_file() {
     assert_eq!(key.path(), "SRR33138449.sample.fastq");
     assert_eq!(entry.file_type, FileType::Data);
     assert_eq!(entry.file_size, 342848);
+}
+
+#[test]
+fn new_from_file_with_limits_accepts_exact_terminal_directory_length() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, sender_key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "file.txt".into(),
+            data: Content::Raw("payload".into()),
+            metadata: None,
+            encrypt: true,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    writer.write_directory().unwrap();
+
+    let bytes = read(&path).unwrap();
+    let directory_length =
+        u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
+    let limits = ReaderLimits {
+        max_directory_bytes: directory_length,
+        ..ReaderLimits::default()
+    };
+    PithosWriter::new_from_file_with_limits(sender_key, vec![], None, &path, limits).unwrap();
+}
+
+#[test]
+fn new_from_file_with_limits_rejects_smaller_terminal_directory_length() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, sender_key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer.write_directory().unwrap();
+
+    let bytes = read(&path).unwrap();
+    let directory_length =
+        u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
+    let limits = ReaderLimits {
+        max_directory_bytes: directory_length - 1,
+        ..ReaderLimits::default()
+    };
+    let error =
+        match PithosWriter::new_from_file_with_limits(sender_key, vec![], None, &path, limits) {
+            Ok(_) => panic!("directory limit should reject the archive"),
+            Err(error) => error,
+        };
+    assert!(matches!(
+        error,
+        PithosError::LimitExceeded {
+            field: "directory",
+            ..
+        }
+    ));
 }
 
 #[test]

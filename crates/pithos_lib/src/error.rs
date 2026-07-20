@@ -38,6 +38,18 @@ pub enum PithosError {
     DirectoryChecksumMismatch { expected: u32, actual: u32 },
     #[error("Directory parser consumption mismatch: expected {expected}, got {actual}")]
     DirectoryConsumptionMismatch { expected: u64, actual: u64 },
+    #[error("{field} exceeds limit {limit}: {actual}")]
+    LimitExceeded {
+        field: &'static str,
+        limit: u64,
+        actual: u64,
+    },
+    #[error("allocation failed for {field}: {size}")]
+    AllocationFailed { field: &'static str, size: u64 },
+    #[error("invalid directory range: {0}")]
+    InvalidDirectoryRange(String),
+    #[error("invalid directory chain: {0}")]
+    InvalidDirectoryChain(String),
     #[error("Crypt error: {0}")]
     Crypt(#[from] CryptError),
     #[error("Crypt4GH error: {0}")]

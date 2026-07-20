@@ -4,12 +4,12 @@ use crate::common::util::{create_pithos_writer, load_test_keys, write_dummy_pith
 use pithos_lib::error::PithosError;
 use pithos_lib::helpers::chacha_poly1305::decrypt_chunk;
 use pithos_lib::helpers::crypt4gh::{
-    CRYPT4GH_ENCRYPTED_BLOCK_SIZE, Crypt4GHHeader, Packet, PacketData,
+    CRYPT4GH_ENCRYPTED_BLOCK_SIZE, Crypt4GHError, Crypt4GHHeader, Packet, PacketData,
 };
 use pithos_lib::helpers::file_entry_map::Key;
 use pithos_lib::helpers::ro_crate::{RoCrateSource, read_ro_crate_directory, read_ro_crate_zip};
 use pithos_lib::helpers::x25519_keys::{private_key_from_pem_bytes, public_key_from_pem_bytes};
-use pithos_lib::io::pithosreader::PithosReaderSimple;
+use pithos_lib::io::pithosreader::{PithosReaderSimple, ReaderLimits};
 use pithos_lib::io::pithoswriter::{Content, InputFile, PithosWriter};
 use pithos_lib::model::structs::{BlockDataState, FileEntry, FileType, Reference};
 use rocraters::ro_crate::graph_vector::GraphVector;
@@ -73,6 +73,28 @@ fn append_empty_directory(path: &Path) {
     let mut writer = PithosWriter::new_from_file(writer_key, vec![reader_key], None, path).unwrap();
     writer.write_directory().unwrap();
     drop(writer);
+}
+
+fn complete_test_directory(parent: Option<(u64, u64)>) -> Vec<u8> {
+    let mut directory = pithos_lib::model::structs::Directory {
+        identifier: *b"PITHOSDR",
+        parent_directory_offset: parent,
+        files: pithos_lib::helpers::file_entry_map::FileEntryMap::new(),
+        blocks: indexmap::IndexMap::new(),
+        relations: vec![],
+        encryption: indexmap::IndexMap::new(),
+        dir_len: 0,
+        crc32: 0,
+    };
+    let mut bytes = Vec::new();
+    directory.serialize(&mut bytes).unwrap();
+    directory.dir_len = bytes.len() as u64;
+    bytes.clear();
+    directory.serialize(&mut bytes).unwrap();
+    let crc_start = bytes.len() - 4;
+    let crc = crc32fast::hash(&bytes[..crc_start]);
+    bytes[crc_start..].copy_from_slice(&crc.to_be_bytes());
+    bytes
 }
 
 fn directory_bounds(bytes: &[u8]) -> (usize, usize) {
@@ -293,6 +315,256 @@ fn test_directory_integrity_valid_append_chain() {
 
     let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
     assert!(reader.read_directory().is_ok());
+}
+
+#[test]
+fn test_robust_terminal_footer_max_length_returns_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    let mut bytes = read(&archive).unwrap();
+    let footer_start = bytes.len() - 12;
+    bytes[footer_start..footer_start + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+    write(&archive, bytes).unwrap();
+
+    let result = PithosReaderSimple::new_with_key(&archive, reader_key())
+        .unwrap()
+        .read_directory();
+    assert!(matches!(
+        result,
+        Err(PithosError::LimitExceeded {
+            field: "directory",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn test_robust_overlapping_parent_is_rejected_as_invalid_chain() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    append_empty_directory(&archive);
+    let bytes = read(&archive).unwrap();
+    let (final_start, final_length) = directory_bounds(&bytes);
+    let mut final_directory = pithos_lib::model::structs::Directory::deserialize(
+        &mut std::io::Cursor::new(&bytes[final_start..]),
+    )
+    .unwrap();
+    final_directory.parent_directory_offset = Some(((final_start + 1) as u64, final_length as u64));
+    final_directory.dir_len = 0;
+    final_directory.crc32 = 0;
+    let mut replacement = Vec::new();
+    final_directory.serialize(&mut replacement).unwrap();
+    final_directory.dir_len = replacement.len() as u64;
+    replacement.clear();
+    final_directory.serialize(&mut replacement).unwrap();
+    let crc = crc32fast::hash(&replacement[..replacement.len() - 4]);
+    let crc_start = replacement.len() - 4;
+    replacement[crc_start..].copy_from_slice(&crc.to_be_bytes());
+    let mut archive_bytes = bytes[..final_start].to_vec();
+    archive_bytes.extend_from_slice(&replacement);
+    write(&archive, archive_bytes).unwrap();
+
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
+    let error = reader.read_directory().unwrap_err();
+    assert!(error.to_string().contains("chain"));
+}
+
+#[test]
+fn test_robust_parent_boundary_uses_immediate_child() {
+    let temp_dir = TempDir::new().unwrap();
+    let middle = complete_test_directory(None);
+    let oldest = complete_test_directory(Some((27, middle.len() as u64)));
+    let terminal = complete_test_directory(Some((0, oldest.len() as u64)));
+    assert_eq!(oldest.len(), 27);
+    assert_eq!(middle.len(), 25);
+    let archive = temp_dir.path().join("three-directories.pithos");
+    let mut bytes = oldest;
+    bytes.extend_from_slice(&middle);
+    bytes.extend_from_slice(&terminal);
+    write(&archive, bytes).unwrap();
+
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
+    let error = reader.read_directory().unwrap_err();
+    assert!(
+        matches!(error, PithosError::InvalidDirectoryChain(_)),
+        "unexpected chain fixture error: {error:?}"
+    );
+}
+
+#[test]
+fn test_robust_oversized_stored_block_returns_error_without_commit() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, mut directory, _) = write_identity_integrity_archive(&temp_dir);
+    let hash = match directory
+        .get_file_by_path("integrity.txt")
+        .unwrap()
+        .block_data
+        .clone()
+    {
+        BlockDataState::Decrypted(blocks) => blocks[0].0,
+        BlockDataState::Encrypted(_) => unreachable!(),
+    };
+    directory.blocks.get_mut(&hash).unwrap().stored_size = u64::MAX;
+    let output = temp_dir.path().join("oversized.txt");
+    let result = PithosReaderSimple::new_with_key(&archive, key)
+        .unwrap()
+        .read_file("integrity.txt", &directory, Some(&output), None);
+    assert!(matches!(
+        result,
+        Err(PithosError::LimitExceeded {
+            field: "stored block",
+            ..
+        })
+    ));
+    assert!(!output.exists());
+}
+
+#[test]
+fn test_robust_zero_crypt4gh_packet_length_returns_error() {
+    let mut bytes = Vec::from(b"crypt4gh".as_slice());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 68]);
+    let result = Crypt4GHHeader::try_from(bytes.as_slice());
+    assert!(matches!(result, Err(Crypt4GHError::FromBytesError(_))));
+}
+
+#[test]
+fn test_robust_skipped_range_enforces_decoded_block_limit() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, hash) = write_identity_integrity_archive(&temp_dir);
+    let file_entry = directory.get_file_by_path("integrity.txt").unwrap();
+    let block_end = directory.blocks.get(&hash).unwrap().original_size;
+    let limits = ReaderLimits {
+        max_decoded_block_bytes: 0,
+        ..ReaderLimits::default()
+    };
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key)
+        .unwrap()
+        .with_limits(limits);
+    let mut sink: Box<dyn Write> = Box::new(Vec::<u8>::new());
+    assert!(matches!(
+        reader.read_data_range_to_sink(
+            block_end..block_end + 1,
+            file_entry,
+            &directory.blocks,
+            &mut sink,
+        ),
+        Err(PithosError::LimitExceeded {
+            field: "decoded block",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn test_robust_skipped_range_enforces_stored_block_limit() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, hash) = write_identity_integrity_archive(&temp_dir);
+    let file_entry = directory.get_file_by_path("integrity.txt").unwrap();
+    let block_end = directory.blocks.get(&hash).unwrap().original_size;
+    let limits = ReaderLimits {
+        max_stored_block_bytes: 0,
+        ..ReaderLimits::default()
+    };
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key)
+        .unwrap()
+        .with_limits(limits);
+    let mut sink: Box<dyn Write> = Box::new(Vec::<u8>::new());
+    assert!(matches!(
+        reader.read_data_range_to_sink(
+            block_end..block_end + 1,
+            file_entry,
+            &directory.blocks,
+            &mut sink,
+        ),
+        Err(PithosError::LimitExceeded {
+            field: "stored block",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn test_robust_configured_directory_limit_returns_limit_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    let limits = ReaderLimits {
+        max_directory_bytes: 24,
+        ..ReaderLimits::default()
+    };
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key())
+        .unwrap()
+        .with_limits(limits);
+    assert!(matches!(
+        reader.read_directory(),
+        Err(PithosError::LimitExceeded {
+            field: "directory",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn test_robust_configured_stored_block_limit_returns_limit_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, _) = write_identity_integrity_archive(&temp_dir);
+    let limits = ReaderLimits {
+        max_stored_block_bytes: 0,
+        ..ReaderLimits::default()
+    };
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key)
+        .unwrap()
+        .with_limits(limits);
+    assert!(matches!(
+        reader.read_file("integrity.txt", &directory, None, None),
+        Err(PithosError::LimitExceeded {
+            field: "stored block",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn test_robust_configured_decoded_block_limit_returns_limit_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let (archive, key, directory, _) = write_identity_integrity_archive(&temp_dir);
+    let limits = ReaderLimits {
+        max_decoded_block_bytes: 0,
+        ..ReaderLimits::default()
+    };
+    let mut reader = PithosReaderSimple::new_with_key(&archive, key)
+        .unwrap()
+        .with_limits(limits);
+    assert!(matches!(
+        reader.read_file("integrity.txt", &directory, None, None),
+        Err(PithosError::LimitExceeded {
+            field: "decoded block",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn test_robust_configured_parent_depth_returns_limit_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    append_empty_directory(&archive);
+    let limits = ReaderLimits {
+        max_parent_directories: 0,
+        ..ReaderLimits::default()
+    };
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key())
+        .unwrap()
+        .with_limits(limits);
+    assert!(matches!(
+        reader.read_directory(),
+        Err(PithosError::LimitExceeded {
+            field: "parent directories",
+            ..
+        })
+    ));
 }
 
 #[test]

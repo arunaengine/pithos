@@ -2,6 +2,7 @@ use crate::error::PithosError;
 use crate::helpers::file_entry_map::{FileEntryMap, Key, KeyQuery};
 use crate::model::structs::{RecipientData, RecipientSection};
 use crate::model::{
+    deserialization::DeserializationLimits,
     serialization::SerializationError,
     structs::{BlockIndexEntry, Directory, EncryptionSection, FileEntry},
 };
@@ -371,6 +372,15 @@ impl Directory {
         &mut self,
         reader_key: &StaticSecret,
     ) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
+        self.decrypt_recipient_with_limits(reader_key, &DeserializationLimits::default())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, reader_key, limits))]
+    pub fn decrypt_recipient_with_limits(
+        &mut self,
+        reader_key: &StaticSecret,
+        limits: &DeserializationLimits,
+    ) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
         // Store for decrypted sections
         let mut available_file_indices = Vec::<(u64, [u8; 32])>::new();
         let reader_pubkey = PublicKey::from(reader_key);
@@ -381,7 +391,9 @@ impl Directory {
                 let shared_key = reader_key.diffie_hellman(&PublicKey::from(*key));
                 match &r_section.recipient_data {
                     RecipientData::Encrypted(_) => {
-                        let entries = r_section.recipient_data.decrypt(&shared_key)?;
+                        let entries = r_section
+                            .recipient_data
+                            .decrypt_with_limits(&shared_key, limits)?;
                         available_file_indices.extend(entries);
                     }
                     RecipientData::Decrypted(entries) => {
@@ -405,7 +417,10 @@ impl Directory {
             match e_section.recipients.entry(*reader_pubkey.as_bytes()) {
                 Entry::Occupied(ref mut entry) => match &entry.get().recipient_data {
                     RecipientData::Encrypted(_) => {
-                        let entries = entry.get_mut().recipient_data.decrypt(&shared_key)?;
+                        let entries = entry
+                            .get_mut()
+                            .recipient_data
+                            .decrypt_with_limits(&shared_key, limits)?;
                         available_file_indices.extend(entries);
                     }
                     RecipientData::Decrypted(entries) => {

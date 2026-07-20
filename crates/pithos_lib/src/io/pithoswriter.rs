@@ -8,7 +8,7 @@ use crate::helpers::ro_crate::{
     inspect_ro_crate_zip_manifest,
 };
 use crate::helpers::zstd::{ZstdError, map_to_zstd_level};
-use crate::io::pithosreader::PithosReaderSimple;
+use crate::io::pithosreader::{PithosReaderSimple, ReaderLimits};
 use crate::io::util::{create_stream_cdc, extract_filename};
 use crate::model::serialization::SerializationError;
 use crate::model::structs::{
@@ -205,8 +205,29 @@ impl PithosWriter {
         cdc: Option<(usize, usize, usize)>,
         pithos_file: P,
     ) -> Result<Self, PithosError> {
+        Self::new_from_file_with_limits(
+            writer_key,
+            reader_keys,
+            cdc,
+            pithos_file,
+            ReaderLimits::default(),
+        )
+    }
+
+    #[tracing::instrument(
+        level = "trace",
+        skip(writer_key, reader_keys, cdc, pithos_file, limits)
+    )]
+    pub fn new_from_file_with_limits<P: AsRef<Path>>(
+        writer_key: StaticSecret,
+        reader_keys: Vec<PublicKey>,
+        cdc: Option<(usize, usize, usize)>,
+        pithos_file: P,
+        limits: ReaderLimits,
+    ) -> Result<Self, PithosError> {
         // Read existing directories
-        let mut reader = PithosReaderSimple::new_with_key(&pithos_file, writer_key.clone())?;
+        let mut reader =
+            PithosReaderSimple::new_with_key(&pithos_file, writer_key.clone())?.with_limits(limits);
         let (directory, offset) = reader.read_directory()?;
 
         // Open Pithos file in append write mode
