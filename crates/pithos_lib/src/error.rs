@@ -30,6 +30,8 @@ pub enum PithosError {
     Serialization(#[from] SerializationError),
     #[error("Deserialization error: {0:?}")]
     Deserialization(#[from] DeserializationError),
+    #[error("Unsupported file version: supported {supported:#06x}, actual {actual:#06x}")]
+    UnsupportedFileVersion { supported: u16, actual: u16 },
     #[error("Invalid directory marker: expected {expected:?}, got {actual:?}")]
     InvalidDirectoryMarker { expected: [u8; 8], actual: [u8; 8] },
     #[error("Directory length mismatch: expected {expected}, got {actual}")]

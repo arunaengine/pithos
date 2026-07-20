@@ -8,7 +8,8 @@ use crate::helpers::zstd::decompress_data;
 use crate::io::extraction::ExtractionRoot;
 use crate::model::deserialization::DeserializationLimits;
 use crate::model::structs::{
-    BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileType,
+    BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileHeader,
+    FileType,
 };
 use crc32fast::hash;
 use indexmap::IndexMap;
@@ -54,6 +55,18 @@ pub struct PithosReaderSimple {
 }
 
 impl PithosReaderSimple {
+    fn open_archive<P: AsRef<Path>>(pithos_path: P) -> Result<File, PithosError> {
+        let mut file = File::open(pithos_path)?;
+        let header = FileHeader::deserialize(&mut file)?;
+        if header.version != FileHeader::SUPPORTED_VERSION {
+            return Err(PithosError::UnsupportedFileVersion {
+                supported: FileHeader::SUPPORTED_VERSION,
+                actual: header.version,
+            });
+        }
+        Ok(file)
+    }
+
     fn decode_and_verify_block(
         stored_bytes: Vec<u8>,
         key: &[u8; 32],
@@ -191,8 +204,7 @@ impl PithosReaderSimple {
         pithos_path: P,
         private_key_pem_path: P,
     ) -> Result<Self, PithosError> {
-        // Open the Pithos file
-        let file = File::open(&pithos_path)?;
+        let file = Self::open_archive(&pithos_path)?;
 
         // Read and parse the PEM-encoded private key
         let pem_content = std::fs::read_to_string(private_key_pem_path)?;
@@ -212,8 +224,7 @@ impl PithosReaderSimple {
         pithos_path: P,
         private_key: StaticSecret,
     ) -> Result<Self, PithosError> {
-        // Open the Pithos file
-        let file = File::open(&pithos_path)?;
+        let file = Self::open_archive(&pithos_path)?;
 
         Ok(Self {
             file,

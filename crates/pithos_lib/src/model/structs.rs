@@ -25,9 +25,13 @@ impl Default for FileHeader {
     fn default() -> Self {
         FileHeader {
             magic: *b"PITH",
-            version: 0x0100,
+            version: Self::SUPPORTED_VERSION,
         }
     }
+}
+
+impl FileHeader {
+    pub const SUPPORTED_VERSION: u16 = 0x0100;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

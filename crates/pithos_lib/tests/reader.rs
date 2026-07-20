@@ -11,7 +11,10 @@ use pithos_lib::helpers::ro_crate::{RoCrateSource, read_ro_crate_directory, read
 use pithos_lib::helpers::x25519_keys::{private_key_from_pem_bytes, public_key_from_pem_bytes};
 use pithos_lib::io::pithosreader::{ExternalBlockSource, PithosReaderSimple, ReaderLimits};
 use pithos_lib::io::pithoswriter::{Content, InputFile, PithosWriter};
-use pithos_lib::model::structs::{BlockDataState, BlockLocation, FileEntry, FileType, Reference};
+use pithos_lib::model::deserialization::DeserializationError;
+use pithos_lib::model::structs::{
+    BlockDataState, BlockLocation, FileEntry, FileHeader, FileType, Reference,
+};
 use rocraters::ro_crate::graph_vector::GraphVector;
 use rocraters::ro_crate::read::CrateReadError;
 use rocraters::ro_crate::schema::RoCrateSchemaVersion;
@@ -57,6 +60,47 @@ fn caller_directory(
         .insert(Key::new(9000, entry_path), empty_entry(file_type, target))
         .unwrap();
     (reader, directory)
+}
+
+#[test]
+fn test_reader_rejects_invalid_header_magic_during_construction() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    let mut bytes = read(&archive).unwrap();
+    bytes[0] = b'X';
+    write(&archive, bytes).unwrap();
+
+    let error = match PithosReaderSimple::new_with_key(&archive, reader_key()) {
+        Ok(_) => panic!("reader construction must reject an invalid header magic"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        PithosError::Deserialization(DeserializationError::InvalidMarker(_))
+    ));
+}
+
+#[test]
+fn test_reader_rejects_invalid_header_version_during_construction() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp_dir, false, false);
+    let mut bytes = read(&archive).unwrap();
+    bytes[4..6].copy_from_slice(&[0x80, 0x04]);
+    write(&archive, bytes).unwrap();
+
+    let error = match PithosReaderSimple::new_with_key(&archive, reader_key()) {
+        Ok(_) => panic!("reader construction must reject an unsupported header version"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("0x0100"),
+        "missing supported version: {message}"
+    );
+    assert!(
+        message.contains("0x0200"),
+        "missing actual version: {message}"
+    );
 }
 
 fn write_zip_entry(path: &Path, name: &str, content: &[u8]) {
@@ -340,6 +384,7 @@ fn test_external_blocks_fail_closed_without_source() {
         "integrity.txt",
         &directory,
         Some(&range_output),
+        #[allow(clippy::single_range_in_vec_init)]
         Some(vec![0..1]),
     );
     assert_eq!(
@@ -591,12 +636,13 @@ fn test_robust_overlapping_parent_is_rejected_as_invalid_chain() {
 fn test_robust_parent_boundary_uses_immediate_child() {
     let temp_dir = TempDir::new().unwrap();
     let middle = complete_test_directory(None);
-    let oldest = complete_test_directory(Some((27, middle.len() as u64)));
-    let terminal = complete_test_directory(Some((0, oldest.len() as u64)));
+    let oldest = complete_test_directory(Some((33, middle.len() as u64)));
+    let terminal = complete_test_directory(Some((6, oldest.len() as u64)));
     assert_eq!(oldest.len(), 27);
     assert_eq!(middle.len(), 25);
     let archive = temp_dir.path().join("three-directories.pithos");
-    let mut bytes = oldest;
+    let mut bytes = FileHeader::default().serialize_to_bytes().unwrap();
+    bytes.extend_from_slice(&oldest);
     bytes.extend_from_slice(&middle);
     bytes.extend_from_slice(&terminal);
     write(&archive, bytes).unwrap();
