@@ -4,13 +4,17 @@ use crate::common::util::{
     create_pithos_writer, extract_pithos_entry, load_test_keys, minimal_ro_crate_metadata,
     read_pithos_directory, write_zip_entries,
 };
+use indexmap::IndexMap;
 use pithos_lib::error::PithosError;
+use pithos_lib::helpers::directory::DirectoryBuilder;
 use pithos_lib::helpers::file_entry_map::KeyQuery;
 use pithos_lib::helpers::ro_crate::{LoadedRoCrate, read_ro_crate_directory, read_ro_crate_zip};
 use pithos_lib::helpers::x25519_keys::private_key_from_pem_bytes;
 use pithos_lib::io::pithosreader::{PithosReaderSimple, ReaderLimits};
 use pithos_lib::io::pithoswriter::{Content, InputFile, PithosWriter};
-use pithos_lib::model::structs::{FileType, Reference};
+use pithos_lib::model::structs::{
+    BlockIndexEntry, BlockLocation, FileType, ProcessingFlags, Reference,
+};
 use std::fs::{
     File, copy, create_dir_all, read, read_dir, read_link, read_to_string, remove_file, write,
 };
@@ -375,6 +379,145 @@ fn test_append_single_file() {
     assert_eq!(key.path(), "SRR33138449.sample.fastq");
     assert_eq!(entry.file_type, FileType::Data);
     assert_eq!(entry.file_size, 342848);
+}
+
+#[test]
+fn format_006_append_reuses_ancestor_block_without_repointing() {
+    let temp_dir = TempDir::new().unwrap();
+    let payload = "format-006 ancestor block reuse\n".repeat(64).into_bytes();
+    let (path, reader_key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "base.bin".into(),
+            data: Content::Raw(String::from_utf8(payload.clone()).unwrap()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    writer.write_directory().unwrap();
+    drop(writer);
+
+    let base_bytes = read(&path).unwrap();
+    let (base_directory, _) = read_pithos_directory(&path, &reader_key).unwrap();
+    assert_eq!(base_directory.blocks.len(), 1);
+    let (hash, original_block) = base_directory.blocks.first().unwrap();
+    let hash = *hash;
+    let original_block = original_block.clone();
+
+    let (writer_key, reader_public_key, _) = load_test_keys();
+    let mut writer =
+        PithosWriter::new_from_file(writer_key, vec![reader_public_key], None, &path).unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "child.bin".into(),
+            data: Content::Raw(String::from_utf8(payload.clone()).unwrap()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        base_bytes.len() as u64
+    );
+    assert!(writer.get_directory_mut().blocks.is_empty());
+    writer.write_directory().unwrap();
+    drop(writer);
+
+    let final_bytes = read(&path).unwrap();
+    assert!(final_bytes.starts_with(&base_bytes));
+    let (directory, _) = read_pithos_directory(&path, &reader_key).unwrap();
+    assert_eq!(directory.blocks.len(), 1);
+    assert_eq!(directory.blocks.get(&hash), Some(&original_block));
+    assert!(directory.get_file_by_path("base.bin").is_some());
+    assert!(directory.get_file_by_path("child.bin").is_some());
+    assert_eq!(
+        extract_pithos_entry(&path, &reader_key, "base.bin", &temp_dir),
+        payload
+    );
+    remove_file(temp_dir.path().join("extracted-entry")).unwrap();
+    assert_eq!(
+        extract_pithos_entry(&path, &reader_key, "child.bin", &temp_dir),
+        payload
+    );
+}
+
+#[test]
+fn format_006_merge_preserves_older_compatible_block_record() {
+    let hash = [7; 32];
+    let older = BlockIndexEntry {
+        offset: 10,
+        stored_size: 20,
+        original_size: 30,
+        flags: ProcessingFlags::new(false, Some(0)),
+        location: BlockLocation::Local,
+    };
+    let newer = BlockIndexEntry {
+        offset: 40,
+        stored_size: 50,
+        original_size: 30,
+        flags: ProcessingFlags::new(true, Some(7)),
+        location: BlockLocation::External {
+            url: "https://example.invalid/block".into(),
+        },
+    };
+    let mut older_directory = DirectoryBuilder::new()
+        .blocks(IndexMap::from_iter([(hash, older.clone())]))
+        .build()
+        .unwrap();
+    let newer_directory = DirectoryBuilder::new()
+        .blocks(IndexMap::from_iter([(hash, newer)]))
+        .build()
+        .unwrap();
+
+    older_directory.merge(newer_directory).unwrap();
+
+    assert_eq!(older_directory.blocks.get(&hash), Some(&older));
+}
+
+#[test]
+fn format_006_merge_rejects_conflicting_original_size() {
+    let hash = [9; 32];
+    let mut older_directory = DirectoryBuilder::new()
+        .blocks(IndexMap::from_iter([(
+            hash,
+            BlockIndexEntry {
+                offset: 10,
+                stored_size: 20,
+                original_size: 30,
+                flags: ProcessingFlags::new(false, Some(0)),
+                location: BlockLocation::Local,
+            },
+        )]))
+        .build()
+        .unwrap();
+    let newer_directory = DirectoryBuilder::new()
+        .blocks(IndexMap::from_iter([(
+            hash,
+            BlockIndexEntry {
+                offset: 40,
+                stored_size: 50,
+                original_size: 31,
+                flags: ProcessingFlags::new(true, Some(7)),
+                location: BlockLocation::Local,
+            },
+        )]))
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        older_directory.merge(newer_directory),
+        Err(PithosError::BlockIndexConflict {
+            hash: actual_hash,
+            existing_original_size: 30,
+            new_original_size: 31,
+        }) if actual_hash == hash
+    ));
 }
 
 #[test]

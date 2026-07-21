@@ -193,7 +193,20 @@ impl Directory {
         block_hash: [u8; 32],
         block_entry: BlockIndexEntry,
     ) -> Result<(), PithosError> {
-        self.blocks.insert(block_hash, block_entry);
+        match self.blocks.entry(block_hash) {
+            Entry::Occupied(existing) => {
+                if existing.get().original_size != block_entry.original_size {
+                    return Err(PithosError::BlockIndexConflict {
+                        hash: block_hash,
+                        existing_original_size: existing.get().original_size,
+                        new_original_size: block_entry.original_size,
+                    });
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(block_entry);
+            }
+        }
         Ok(())
     }
 

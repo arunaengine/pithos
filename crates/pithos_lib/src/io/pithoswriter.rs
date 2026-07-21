@@ -170,6 +170,7 @@ pub struct PithosWriter {
 
     // Processing
     directory: Directory, // Single or merged from multiple
+    ancestor_blocks: IndexMap<[u8; 32], BlockIndexEntry>,
     written_bytes: u64,
 }
 
@@ -194,6 +195,7 @@ impl PithosWriter {
             directory: DirectoryBuilder::new()
                 .encryption(encryption_sections)
                 .build()?,
+            ancestor_blocks: IndexMap::new(),
             written_bytes: 0,
         })
     }
@@ -249,6 +251,7 @@ impl PithosWriter {
                     EncryptionSection::new(&reader_keys),
                 )]))
                 .build()?,
+            ancestor_blocks: directory.blocks.clone(),
             written_bytes,
             writer_key,
             cdc,
@@ -289,6 +292,9 @@ impl PithosWriter {
         if let Some(entry) = self.directory.block_hash_exists(&hashes.blake3) {
             // Return already existing block entry
             return Ok((entry, hashes, true));
+        }
+        if let Some(entry) = self.ancestor_blocks.get(hashes.blake3.as_bytes()) {
+            return Ok((entry.clone(), hashes, true));
         }
 
         // Init BlockIndexEntry

@@ -98,6 +98,14 @@ pub enum PithosError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
+    #[error(
+        "Block index conflict for hash {hash:?}: existing original size {existing_original_size}, new original size {new_original_size}"
+    )]
+    BlockIndexConflict {
+        hash: [u8; 32],
+        existing_original_size: u64,
+        new_original_size: u64,
+    },
     #[error("File not found: {0}")]
     FileNotFound(String),
     #[error("File already exists: {0}")]
