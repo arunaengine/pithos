@@ -397,7 +397,7 @@ impl FileEntry {
                 }
             }
             Content::Reference(_) => {
-                unimplemented!("Currently FileEntry cannot be created from Content::Reference")
+                return Err(PithosError::UnsupportedReferenceContent);
             }
         })
     }

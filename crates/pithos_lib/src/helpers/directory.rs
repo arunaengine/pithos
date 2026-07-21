@@ -214,7 +214,7 @@ impl Directory {
     pub fn add_file(&mut self, path: &str, file_entry: &FileEntry) -> Result<(), PithosError> {
         let key = Key::new(
             self.files
-                .next_free_id(self.parent_directory_offset.is_some()),
+                .next_free_id(self.parent_directory_offset.is_some())?,
             path.to_owned(),
         );
         self.files.insert(key, file_entry.clone())
@@ -326,7 +326,7 @@ impl Directory {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub fn next_free_file_index(&self) -> u64 {
+    pub fn next_free_file_index(&self) -> Result<u64, PithosError> {
         self.files
             .next_free_id(self.parent_directory_offset.is_some())
         /*

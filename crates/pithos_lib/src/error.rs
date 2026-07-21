@@ -32,6 +32,10 @@ pub enum PithosError {
     Deserialization(#[from] DeserializationError),
     #[error("Unsupported file version: supported {supported:#06x}, actual {actual:#06x}")]
     UnsupportedFileVersion { supported: u16, actual: u16 },
+    #[error("Multiple reader keys are not supported")]
+    UnsupportedMultipleReaderKeys,
+    #[error("Reference content is not supported for file entry construction")]
+    UnsupportedReferenceContent,
     #[error("Invalid directory marker: expected {expected:?}, got {actual:?}")]
     InvalidDirectoryMarker { expected: [u8; 8], actual: [u8; 8] },
     #[error("Directory length mismatch: expected {expected}, got {actual}")]
@@ -110,6 +114,8 @@ pub enum PithosError {
     FileNotFound(String),
     #[error("File already exists: {0}")]
     DuplicateFileId(String),
+    #[error("File ID allocation is exhausted")]
+    FileIdExhausted,
     #[error("Relation id already occupied: {0}")]
     RelationIdOccupied(u64),
     #[error("Path already occupied: {0}")]

@@ -62,7 +62,9 @@ impl TryFrom<&PathBuf> for InputFile {
             .to_string();
         let inner_path = match &file_type {
             FileType::Directory => file_path_str.as_str(),
-            _ => extract_filename(&file_path_str).expect("Input file is missing file name."),
+            _ => extract_filename(&file_path_str).ok_or(PithosError::Conversion(
+                "Input file is missing file name.".to_string(),
+            ))?,
         };
 
         Ok(InputFile {
@@ -356,7 +358,7 @@ impl PithosWriter {
         validate_candidate(&self.directory.files, entry_path, file_entry)?;
         // Directory or Symlink FileEntry are just added to Pithos directory
         let file_entry_key = Key::new(
-            self.directory.next_free_file_index(),
+            self.directory.next_free_file_index()?,
             entry_path.to_string(),
         );
 
@@ -407,7 +409,7 @@ impl PithosWriter {
         validate_candidate(&self.directory.files, &input.inner_path, &data_check)?;
         let mut preflight = self.directory.files.clone();
         preflight.insert(
-            Key::new(preflight.next_free_id(false), input.inner_path.clone()),
+            Key::new(preflight.next_free_id(false)?, input.inner_path.clone()),
             data_check.clone(),
         )?;
         if let Some(metadata) = &input.metadata
@@ -501,7 +503,7 @@ impl PithosWriter {
                     .get_file_encryption_key(reference.target_file_id)
                 {
                     let file_entry_key =
-                        Key::new(self.directory.next_free_file_index(), &input.inner_path);
+                        Key::new(self.directory.next_free_file_index()?, &input.inner_path);
                     self.directory.add_file(&input.inner_path, &data_file)?;
                     self.directory
                         .add_file_to_all_recipients((file_entry_key.id(), enc_key));

@@ -296,7 +296,7 @@ impl PithosReaderSimple {
         _pithos_path: P,
         _private_key: Vec<StaticSecret>,
     ) -> Result<Self, PithosError> {
-        unimplemented!("Multiple reader keys");
+        Err(PithosError::UnsupportedMultipleReaderKeys)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]

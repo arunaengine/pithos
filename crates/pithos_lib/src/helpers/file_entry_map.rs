@@ -271,13 +271,15 @@ impl FileEntryMap {
         self.current_max_id
     }
 
-    pub fn next_free_id(&self, has_parent: bool) -> u64 {
+    pub fn next_free_id(&self, has_parent: bool) -> Result<u64, PithosError> {
         if self.current_max_id == 0 && self.values.is_empty() && has_parent {
-            1
+            Ok(1)
         } else if self.current_max_id == 0 && self.values.is_empty() {
-            0
+            Ok(0)
         } else {
-            self.current_max_id + 1
+            self.current_max_id
+                .checked_add(1)
+                .ok_or(PithosError::FileIdExhausted)
         }
     }
 }
