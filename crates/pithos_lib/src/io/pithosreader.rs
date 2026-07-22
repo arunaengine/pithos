@@ -1,8 +1,7 @@
 use crate::error::PithosError;
-use crate::helpers::archive_path::{validate_entry, validate_map};
+use crate::helpers::archive_path::{validate_existing_candidate, validate_map};
 use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
 use crate::helpers::crypt4gh::{CRYPT4GH_BLOCK_SIZE, Crypt4GHHeader, HeaderPacket};
-use crate::helpers::file_entry_map::KeyQuery;
 use crate::helpers::x25519_keys::private_key_from_pem_bytes;
 use crate::helpers::zstd::decompress_data;
 use crate::io::extraction::ExtractionRoot;
@@ -462,18 +461,11 @@ impl PithosReaderSimple {
         output_path: Option<&PathBuf>,
         ranges: Option<Vec<Range<u64>>>,
     ) -> Result<(), PithosError> {
-        validate_map(&directory.files)?;
-        validate_entry(
-            inner_path,
-            directory
-                .files
-                .get(&KeyQuery::Path(inner_path.to_string()))
-                .ok_or(PithosError::FileNotFound(inner_path.to_string()))?,
-        )?;
         let file_entry = directory
             .files
-            .get(&KeyQuery::Path(inner_path.to_string()))
+            .get_by_path(inner_path)
             .ok_or(PithosError::FileNotFound(inner_path.to_string()))?;
+        validate_existing_candidate(&directory.files, inner_path, file_entry)?;
 
         match &file_entry.file_type {
             FileType::Data | FileType::Metadata => {

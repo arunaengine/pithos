@@ -18,7 +18,6 @@ pub struct DirectoryBuilder {
     blocks: IndexMap<[u8; 32], BlockIndexEntry>,
     relations: Vec<(u64, String)>,
     encryption: IndexMap<[u8; 32], EncryptionSection>,
-    dir_len: u64,
 }
 
 impl Default for DirectoryBuilder {
@@ -37,7 +36,6 @@ impl DirectoryBuilder {
             blocks: IndexMap::new(),
             relations: Self::default_relations(),
             encryption: IndexMap::new(),
-            dir_len: 25,
         }
     }
 
@@ -92,12 +90,6 @@ impl DirectoryBuilder {
         self
     }
 
-    #[tracing::instrument(level = "trace", skip(self, dir_len))]
-    pub fn dir_len(mut self, dir_len: u64) -> Self {
-        self.dir_len = dir_len;
-        self
-    }
-
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn build(self) -> Result<Directory, SerializationError> {
         let mut directory = Directory {
@@ -107,9 +99,10 @@ impl DirectoryBuilder {
             blocks: self.blocks,
             relations: self.relations,
             encryption: self.encryption,
-            dir_len: self.dir_len,
+            dir_len: 0,
             crc32: 0,
         };
+        directory.update_len()?;
         directory.update_crc32()?;
         Ok(directory)
     }
@@ -453,7 +446,8 @@ impl Directory {
     pub fn update_len(&mut self) -> Result<(), SerializationError> {
         let mut buf = Vec::new();
         self.serialize(&mut buf)?;
-        self.dir_len = buf.len() as u64;
+        self.dir_len = u64::try_from(buf.len())
+            .map_err(|_| SerializationError::Other("length does not fit in u64".to_string()))?;
         Ok(())
     }
 

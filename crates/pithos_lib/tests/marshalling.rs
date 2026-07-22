@@ -297,6 +297,111 @@ fn directory_integrity_crc_matches_serialized_prefix() {
     );
 }
 
+fn assert_builder_directory_integrity(directory: &Directory) {
+    let mut serialized = Vec::new();
+    directory.serialize(&mut serialized).unwrap();
+
+    assert_eq!(directory.dir_len, serialized.len() as u64);
+    assert_eq!(
+        u64::from_be_bytes(
+            serialized[serialized.len() - 12..serialized.len() - 4]
+                .try_into()
+                .unwrap()
+        ),
+        directory.dir_len
+    );
+    assert_eq!(
+        directory.crc32,
+        crc32fast::hash(&serialized[..serialized.len() - 4])
+    );
+}
+
+#[test]
+fn directory_builder_sets_integrity_for_empty_directory() {
+    let directory = DirectoryBuilder::new()
+        .set_relations(vec![])
+        .build()
+        .unwrap();
+
+    assert!(directory.files.is_empty());
+    assert!(directory.relations.is_empty());
+    assert_builder_directory_integrity(&directory);
+}
+
+#[test]
+fn directory_builder_sets_integrity_for_default_relations() {
+    let directory = DirectoryBuilder::new().build().unwrap();
+
+    assert_eq!(directory.relations.len(), 10);
+    assert_builder_directory_integrity(&directory);
+}
+
+#[test]
+fn directory_builder_sets_integrity_for_populated_directory() {
+    let mut files = FileEntryMap::new();
+    files
+        .insert(Key::new(7, "file.txt"), plain_entry(None))
+        .unwrap();
+    let blocks = IndexMap::from_iter([(
+        [1u8; 32],
+        BlockIndexEntry {
+            offset: 4,
+            stored_size: 5,
+            original_size: 6,
+            flags: ProcessingFlags(0),
+            location: BlockLocation::Local,
+        },
+    )]);
+    let directory = DirectoryBuilder::new()
+        .files(files)
+        .blocks(blocks)
+        .set_relations(vec![(42, "Related".into())])
+        .build()
+        .unwrap();
+
+    assert_eq!(directory.files.len(), 1);
+    assert_eq!(directory.blocks.len(), 1);
+    assert_eq!(directory.relations, vec![(42, "Related".into())]);
+    assert_builder_directory_integrity(&directory);
+}
+
+#[test]
+fn directory_builder_sets_integrity_for_encrypted_directory() {
+    let sender_key = generate_private_key().unwrap();
+    let recipient_key = generate_private_key().unwrap();
+    let mut recipient_data = RecipientData::Decrypted(vec![(7, [3u8; 32])]);
+    recipient_data
+        .encrypt(&sender_key.diffie_hellman(&PublicKey::from(&recipient_key)))
+        .unwrap();
+    let directory = DirectoryBuilder::new()
+        .encryption(IndexMap::from_iter([(
+            PublicKey::from(&sender_key).to_bytes(),
+            EncryptionSection {
+                recipients: IndexMap::from_iter([(
+                    PublicKey::from(&recipient_key).to_bytes(),
+                    RecipientSection { recipient_data },
+                )]),
+            },
+        )]))
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        directory
+            .encryption
+            .values()
+            .next()
+            .unwrap()
+            .recipients
+            .values()
+            .next()
+            .unwrap()
+            .recipient_data,
+        RecipientData::Encrypted(_)
+    ));
+    assert_builder_directory_integrity(&directory);
+}
+
 #[test]
 fn directory_integrity_minimal_vector_matches_specification() {
     let directory = Directory {

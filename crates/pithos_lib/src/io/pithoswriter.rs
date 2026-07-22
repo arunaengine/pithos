@@ -1,5 +1,5 @@
 use crate::error::PithosError;
-use crate::helpers::archive_path::{validate_candidate, validate_map};
+use crate::helpers::archive_path::{validate_map, validate_new_candidate};
 use crate::helpers::directory::DirectoryBuilder;
 use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use crate::helpers::hash::{Hasher, Hashes};
@@ -355,7 +355,17 @@ impl PithosWriter {
         processing_flags: &ProcessingFlags,
         content: R,
     ) -> Result<Reference, PithosError> {
-        validate_candidate(&self.directory.files, entry_path, file_entry)?;
+        validate_new_candidate(&self.directory.files, entry_path, file_entry)?;
+        self.process_file_entry_prevalidated(entry_path, file_entry, processing_flags, content)
+    }
+
+    fn process_file_entry_prevalidated<R: Read>(
+        &mut self,
+        entry_path: &str,
+        file_entry: &mut FileEntry,
+        processing_flags: &ProcessingFlags,
+        content: R,
+    ) -> Result<Reference, PithosError> {
         // Directory or Symlink FileEntry are just added to Pithos directory
         let file_entry_key = Key::new(
             self.directory.next_free_file_index()?,
@@ -406,18 +416,13 @@ impl PithosWriter {
     #[tracing::instrument(level = "trace", skip(self, input))]
     pub fn process_input(&mut self, input: InputFile) -> Result<Reference, PithosError> {
         let data_check = FileEntry::new_from_content(input.file_type, &input.data)?;
-        validate_candidate(&self.directory.files, &input.inner_path, &data_check)?;
-        let mut preflight = self.directory.files.clone();
-        preflight.insert(
-            Key::new(preflight.next_free_id(false)?, input.inner_path.clone()),
-            data_check.clone(),
-        )?;
+        validate_new_candidate(&self.directory.files, &input.inner_path, &data_check)?;
         if let Some(metadata) = &input.metadata
             && !matches!(metadata, Content::Reference(_))
         {
             let metadata_check = FileEntry::new_from_content(FileType::Metadata, metadata)?;
-            validate_candidate(
-                &preflight,
+            validate_new_candidate(
+                &self.directory.files,
                 &format!("{}.meta", input.inner_path),
                 &metadata_check,
             )?;
@@ -434,7 +439,7 @@ impl PithosWriter {
                 Content::File(disk_path) => {
                     let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
                     let handle = File::open(disk_path)?;
-                    self.process_file_entry(
+                    self.process_file_entry_prevalidated(
                         meta_file_path,
                         &mut meta_file,
                         &processing_flags,
@@ -444,7 +449,7 @@ impl PithosWriter {
                 Content::Raw(raw_content) => {
                     let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
                     let handle = Cursor::new(raw_content.clone().into_bytes());
-                    self.process_file_entry(
+                    self.process_file_entry_prevalidated(
                         meta_file_path,
                         &mut meta_file,
                         &processing_flags,
@@ -463,14 +468,14 @@ impl PithosWriter {
                 if [FileType::Data, FileType::Metadata].contains(&input.file_type) =>
             {
                 let handle = File::open(disk_path)?;
-                self.process_file_entry(
+                self.process_file_entry_prevalidated(
                     &input.inner_path,
                     &mut data_file,
                     &processing_flags,
                     handle,
                 )?
             }
-            Content::File(_) => self.process_file_entry(
+            Content::File(_) => self.process_file_entry_prevalidated(
                 &input.inner_path,
                 &mut data_file,
                 &processing_flags,
@@ -478,7 +483,7 @@ impl PithosWriter {
             )?,
             Content::Raw(raw_content) => {
                 let handle = Cursor::new(raw_content.into_bytes());
-                self.process_file_entry(
+                self.process_file_entry_prevalidated(
                     &input.inner_path,
                     &mut data_file,
                     &processing_flags,

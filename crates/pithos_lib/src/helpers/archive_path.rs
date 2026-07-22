@@ -120,56 +120,90 @@ pub(crate) fn validate_entry(path: &str, entry: &FileEntry) -> Result<(), Pithos
     }
 }
 
-pub(crate) fn validate_candidate(
+fn validate_candidate_hierarchy(
+    map: &FileEntryMap,
+    path: &str,
+    entry: &FileEntry,
+) -> Result<(), PithosError> {
+    for (index, _) in path.match_indices('/') {
+        let ancestor = &path[..index];
+        if map
+            .get_by_path(ancestor)
+            .is_some_and(|existing| existing.file_type != FileType::Directory)
+        {
+            return Err(PithosError::InvalidArchivePath {
+                path: path.into(),
+                reason: format!("file entry {ancestor} is an ancestor"),
+            });
+        }
+    }
+
+    if entry.file_type != FileType::Directory
+        && let Some(successor) = map.first_path_after(path)
+        && successor.starts_with(path)
+        && successor.as_bytes().get(path.len()) == Some(&b'/')
+    {
+        return Err(PithosError::InvalidArchivePath {
+            path: path.into(),
+            reason: format!("entry is an ancestor of {successor}"),
+        });
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_existing_candidate(
     map: &FileEntryMap,
     path: &str,
     entry: &FileEntry,
 ) -> Result<(), PithosError> {
     validate_entry(path, entry)?;
-    for (_, existing, existing_entry) in map {
-        if path == existing {
-            continue;
-        }
-        if path.starts_with(existing)
-            && path.as_bytes().get(existing.len()) == Some(&b'/')
-            && existing_entry.file_type != FileType::Directory
-        {
-            return Err(PithosError::InvalidArchivePath {
-                path: path.into(),
-                reason: format!("file entry {existing} is an ancestor"),
-            });
-        }
-        if existing.starts_with(path)
-            && existing.as_bytes().get(path.len()) == Some(&b'/')
-            && entry.file_type != FileType::Directory
-        {
-            return Err(PithosError::InvalidArchivePath {
-                path: path.into(),
-                reason: format!("entry is an ancestor of {existing}"),
-            });
-        }
+    validate_candidate_hierarchy(map, path, entry)
+}
+
+pub(crate) fn validate_new_candidate(
+    map: &FileEntryMap,
+    path: &str,
+    entry: &FileEntry,
+) -> Result<(), PithosError> {
+    validate_entry(path, entry)?;
+    if map.get_by_path(path).is_some() {
+        return Err(PithosError::PathOccupied(format!(
+            "File path already occupied: {path}"
+        )));
     }
-    Ok(())
+    validate_candidate_hierarchy(map, path, entry)
 }
 
 pub(crate) fn validate_map(map: &FileEntryMap) -> Result<(), PithosError> {
     for (_, path, entry) in map {
-        validate_candidate(&FileEntryMap::new(), path, entry)?;
+        validate_entry(path, entry)?;
     }
-    for (_, path, entry) in map {
-        for (_, other, _) in map {
-            if path != other
-                && other.starts_with(path)
-                && other.as_bytes().get(path.len()) == Some(&b'/')
-                && entry.file_type != FileType::Directory
-            {
-                return Err(PithosError::InvalidArchivePath {
-                    path: path.into(),
-                    reason: format!("entry is an ancestor of {other}"),
-                });
-            }
+
+    validate_hierarchy(map)
+}
+
+pub(crate) fn validate_hierarchy(map: &FileEntryMap) -> Result<(), PithosError> {
+    let mut entries = map.iter_ordered();
+    let Some((mut previous_path, mut previous_entry)) = entries.next() else {
+        return Ok(());
+    };
+
+    for (path, entry) in entries {
+        if previous_entry.file_type != FileType::Directory
+            && path.starts_with(previous_path)
+            && path.as_bytes().get(previous_path.len()) == Some(&b'/')
+        {
+            return Err(PithosError::InvalidArchivePath {
+                path: previous_path.into(),
+                reason: format!("entry is an ancestor of {path}"),
+            });
         }
+
+        previous_path = path;
+        previous_entry = entry;
     }
+
     Ok(())
 }
 
@@ -338,5 +372,73 @@ mod tests {
             }
             assert!(validate_map(&map).is_ok());
         }
+    }
+
+    #[test]
+    fn archive_path_candidate_validation_handles_component_boundaries_and_depth() {
+        let file = entry(FileType::Data, None, BlockDataState::Decrypted(vec![]));
+        let directory = entry(FileType::Directory, None, BlockDataState::Decrypted(vec![]));
+
+        let mut map = FileEntryMap::new();
+        map.insert(Key::new(0, "a"), file.clone()).unwrap();
+        assert!(validate_new_candidate(&map, "a/child", &file).is_err());
+
+        let mut map = FileEntryMap::new();
+        map.insert(Key::new(0, "a/child"), file.clone()).unwrap();
+        assert!(validate_new_candidate(&map, "a", &file).is_err());
+
+        let mut map = FileEntryMap::new();
+        map.insert(Key::new(0, "a"), directory.clone()).unwrap();
+        assert!(validate_new_candidate(&map, "a/child", &file).is_ok());
+
+        let mut map = FileEntryMap::new();
+        for (id, path) in [(0, "ab"), (1, "a!"), (2, "a.b"), (3, "a/child")] {
+            map.insert(Key::new(id, path), file.clone()).unwrap();
+        }
+        assert!(validate_new_candidate(&map, "a", &file).is_err());
+        assert!(validate_new_candidate(&map, "a!x", &file).is_ok());
+        assert!(validate_new_candidate(&map, "a.bx", &file).is_ok());
+        assert!(validate_new_candidate(&map, "abx", &file).is_ok());
+
+        let mut map = FileEntryMap::new();
+        map.insert(Key::new(0, "ユニコード"), file.clone()).unwrap();
+        assert!(validate_new_candidate(&map, "ユニコード/子", &file).is_err());
+
+        let deep = (0..64)
+            .map(|part| format!("part{part}"))
+            .collect::<Vec<_>>();
+        let ancestor = deep.join("/");
+        let descendant = format!("{ancestor}/leaf");
+        let mut map = FileEntryMap::new();
+        map.insert(Key::new(0, descendant), file.clone()).unwrap();
+        assert!(validate_new_candidate(&map, &ancestor, &file).is_err());
+    }
+
+    #[test]
+    fn archive_path_existing_and_new_candidate_exact_path_semantics() {
+        let file = entry(FileType::Data, None, BlockDataState::Decrypted(vec![]));
+        let mut map = FileEntryMap::new();
+        map.insert(Key::new(0, "occupied"), file.clone()).unwrap();
+
+        assert!(validate_existing_candidate(&map, "occupied", &file).is_ok());
+        assert!(matches!(
+            validate_new_candidate(&map, "occupied", &file),
+            Err(PithosError::PathOccupied(message)) if message == "File path already occupied: occupied"
+        ));
+    }
+
+    #[test]
+    fn archive_path_component_order_keeps_descendants_adjacent() {
+        let file = entry(FileType::Data, None, BlockDataState::Decrypted(vec![]));
+        let mut map = FileEntryMap::new();
+        for (id, path) in [(0, "a"), (1, "a!"), (2, "a/child")] {
+            map.insert(Key::new(id, path), file.clone()).unwrap();
+        }
+
+        assert_eq!(
+            map.iter_ordered().map(|(path, _)| path).collect::<Vec<_>>(),
+            ["a", "a/child", "a!"]
+        );
+        assert!(validate_map(&map).is_err());
     }
 }

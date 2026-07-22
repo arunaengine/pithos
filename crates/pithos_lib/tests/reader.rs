@@ -6,6 +6,7 @@ use pithos_lib::helpers::chacha_poly1305::decrypt_chunk;
 use pithos_lib::helpers::crypt4gh::{
     CRYPT4GH_ENCRYPTED_BLOCK_SIZE, Crypt4GHError, Crypt4GHHeader, Packet, PacketData,
 };
+use pithos_lib::helpers::directory::DirectoryBuilder;
 use pithos_lib::helpers::file_entry_map::Key;
 use pithos_lib::helpers::ro_crate::{RoCrateSource, read_ro_crate_directory, read_ro_crate_zip};
 use pithos_lib::helpers::x25519_keys::{private_key_from_pem_bytes, public_key_from_pem_bytes};
@@ -513,6 +514,24 @@ fn test_directory_integrity_valid_terminal_archive() {
     let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
 
     assert!(reader.read_directory().is_ok());
+}
+
+#[test]
+fn test_reader_reads_directory_built_without_manual_length_update() {
+    let temp_dir = TempDir::new().unwrap();
+    let directory = DirectoryBuilder::new()
+        .set_relations(vec![])
+        .build()
+        .unwrap();
+    let archive = temp_dir.path().join("builder-directory.pith");
+    let mut bytes = FileHeader::default().serialize_to_bytes().unwrap();
+    directory.serialize(&mut bytes).unwrap();
+    write(&archive, bytes).unwrap();
+
+    let mut reader = PithosReaderSimple::new_with_key(&archive, reader_key()).unwrap();
+    let (read_directory, _) = reader.read_directory().unwrap();
+
+    assert_eq!(read_directory, directory);
 }
 
 #[test]
@@ -1093,6 +1112,53 @@ fn test_safe_extraction_rejects_caller_constructed_ancestor_conflict() {
             .is_err()
     );
     assert!(!output.join("a").exists());
+}
+
+#[test]
+fn test_reader_targeted_validation_rejects_reverse_caller_ancestor_conflict() {
+    let temp = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp, false, false);
+    let output = temp.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let (mut reader, mut directory) = caller_directory(&archive, "a/child", FileType::Data, None);
+    directory
+        .files
+        .insert(Key::new(9001, "a"), empty_entry(FileType::Data, None))
+        .unwrap();
+    assert!(
+        reader
+            .read_file("a/child", &directory, Some(&output), None)
+            .is_err()
+    );
+    assert!(!output.join("a/child").exists());
+}
+
+#[test]
+fn test_reader_reads_unrelated_entries_without_full_map_revalidation() {
+    let temp = TempDir::new().unwrap();
+    let archive = write_dummy_pithos(&temp, false, false);
+    let output = temp.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let (mut reader, mut directory) = caller_directory(&archive, "safe", FileType::Data, None);
+    directory
+        .files
+        .insert(
+            Key::new(9001, "conflict"),
+            empty_entry(FileType::Data, None),
+        )
+        .unwrap();
+    directory
+        .files
+        .insert(
+            Key::new(9002, "conflict/child"),
+            empty_entry(FileType::Data, None),
+        )
+        .unwrap();
+
+    reader
+        .read_file("safe", &directory, Some(&output), None)
+        .unwrap();
+    assert!(output.join("safe").exists());
 }
 
 #[test]
