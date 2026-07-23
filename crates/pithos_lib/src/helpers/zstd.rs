@@ -14,6 +14,8 @@ pub enum ZstdError {
     /// Compression failure
     #[error("Decompression error: {0}")]
     DecompressionError(String),
+    #[error("decompressed size does not fit platform: {0}")]
+    SizeOverflow(u64),
 }
 
 const _ZSTD_MAGIC_NUMBER: u32 = 0xFD2FB528; // 4 Bytes, little-endian format
@@ -21,6 +23,7 @@ const _ZSTD_MAGIC_NUMBER: u32 = 0xFD2FB528; // 4 Bytes, little-endian format
 #[tracing::instrument(level = "trace", skip(flags))]
 pub fn map_to_zstd_level(flags: &ProcessingFlags) -> i32 {
     match flags.get_compression_level() {
+        0 => 0,
         1 => 1,
         2 => 4,
         3 => 8,
@@ -60,6 +63,7 @@ pub fn compress_data(input: &[u8], level: Option<i32>) -> Result<Vec<u8>, ZstdEr
 
 #[tracing::instrument(level = "trace", skip(input, decompressed_size))]
 pub fn decompress_data(input: &[u8], decompressed_size: u64) -> Result<Vec<u8>, ZstdError> {
-    bulk::decompress(input, decompressed_size as usize)
-        .map_err(|e| ZstdError::DecompressionError(e.to_string()))
+    let size = usize::try_from(decompressed_size)
+        .map_err(|_| ZstdError::SizeOverflow(decompressed_size))?;
+    bulk::decompress(input, size).map_err(|e| ZstdError::DecompressionError(e.to_string()))
 }

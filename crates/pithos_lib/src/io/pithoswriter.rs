@@ -1,4 +1,5 @@
 use crate::error::PithosError;
+use crate::helpers::archive_path::{validate_map, validate_new_candidate};
 use crate::helpers::directory::DirectoryBuilder;
 use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use crate::helpers::hash::{Hasher, Hashes};
@@ -7,7 +8,7 @@ use crate::helpers::ro_crate::{
     inspect_ro_crate_zip_manifest,
 };
 use crate::helpers::zstd::{ZstdError, map_to_zstd_level};
-use crate::io::pithosreader::PithosReaderSimple;
+use crate::io::pithosreader::{PithosReaderSimple, ReaderLimits};
 use crate::io::util::{create_stream_cdc, extract_filename};
 use crate::model::serialization::SerializationError;
 use crate::model::structs::{
@@ -51,8 +52,7 @@ impl TryFrom<&PathBuf> for InputFile {
     type Error = PithosError;
 
     fn try_from(file_path: &PathBuf) -> Result<Self, Self::Error> {
-        let file = File::open(file_path)?;
-        let metadata = file.metadata()?;
+        let metadata = symlink_metadata(file_path)?;
         let file_type = FileType::try_from(&metadata)?;
         let file_path_str = file_path
             .to_str()
@@ -62,13 +62,18 @@ impl TryFrom<&PathBuf> for InputFile {
             .to_string();
         let inner_path = match &file_type {
             FileType::Directory => file_path_str.as_str(),
-            _ => extract_filename(&file_path_str).expect("Input file is missing file name."),
+            _ => extract_filename(&file_path_str).ok_or(PithosError::Conversion(
+                "Input file is missing file name.".to_string(),
+            ))?,
         };
 
         Ok(InputFile {
             file_type,
             inner_path: inner_path.to_string(),
-            data: if file_type == FileType::Data {
+            data: if file_type == FileType::Data
+                || file_type == FileType::Directory
+                || file_type == FileType::Symlink
+            {
                 Content::File(file_path_str)
             } else {
                 Content::Raw("".to_string())
@@ -167,6 +172,7 @@ pub struct PithosWriter {
 
     // Processing
     directory: Directory, // Single or merged from multiple
+    ancestor_blocks: IndexMap<[u8; 32], BlockIndexEntry>,
     written_bytes: u64,
 }
 
@@ -191,6 +197,7 @@ impl PithosWriter {
             directory: DirectoryBuilder::new()
                 .encryption(encryption_sections)
                 .build()?,
+            ancestor_blocks: IndexMap::new(),
             written_bytes: 0,
         })
     }
@@ -202,8 +209,29 @@ impl PithosWriter {
         cdc: Option<(usize, usize, usize)>,
         pithos_file: P,
     ) -> Result<Self, PithosError> {
+        Self::new_from_file_with_limits(
+            writer_key,
+            reader_keys,
+            cdc,
+            pithos_file,
+            ReaderLimits::default(),
+        )
+    }
+
+    #[tracing::instrument(
+        level = "trace",
+        skip(writer_key, reader_keys, cdc, pithos_file, limits)
+    )]
+    pub fn new_from_file_with_limits<P: AsRef<Path>>(
+        writer_key: StaticSecret,
+        reader_keys: Vec<PublicKey>,
+        cdc: Option<(usize, usize, usize)>,
+        pithos_file: P,
+        limits: ReaderLimits,
+    ) -> Result<Self, PithosError> {
         // Read existing directories
-        let mut reader = PithosReaderSimple::new_with_key(&pithos_file, writer_key.clone())?;
+        let mut reader =
+            PithosReaderSimple::new_with_key(&pithos_file, writer_key.clone())?.with_limits(limits);
         let (directory, offset) = reader.read_directory()?;
 
         // Open Pithos file in append write mode
@@ -225,6 +253,7 @@ impl PithosWriter {
                     EncryptionSection::new(&reader_keys),
                 )]))
                 .build()?,
+            ancestor_blocks: directory.blocks.clone(),
             written_bytes,
             writer_key,
             cdc,
@@ -266,6 +295,9 @@ impl PithosWriter {
             // Return already existing block entry
             return Ok((entry, hashes, true));
         }
+        if let Some(entry) = self.ancestor_blocks.get(hashes.blake3.as_bytes()) {
+            return Ok((entry.clone(), hashes, true));
+        }
 
         // Init BlockIndexEntry
         let mut block_index_entry = BlockIndexEntry {
@@ -281,7 +313,7 @@ impl PithosWriter {
         if compression_level > 0
             && probe_compression_ratio(&chunk.data, Some(compression_level))? < 0.85
         {
-            chunk.data = compress_data(chunk.data.as_slice(), None)?;
+            chunk.data = compress_data(chunk.data.as_slice(), Some(compression_level))?;
         } else {
             // No compression, as the input is likely to have high entropy
             block_index_entry.flags.set_compression_level(0);
@@ -323,9 +355,20 @@ impl PithosWriter {
         processing_flags: &ProcessingFlags,
         content: R,
     ) -> Result<Reference, PithosError> {
+        validate_new_candidate(&self.directory.files, entry_path, file_entry)?;
+        self.process_file_entry_prevalidated(entry_path, file_entry, processing_flags, content)
+    }
+
+    fn process_file_entry_prevalidated<R: Read>(
+        &mut self,
+        entry_path: &str,
+        file_entry: &mut FileEntry,
+        processing_flags: &ProcessingFlags,
+        content: R,
+    ) -> Result<Reference, PithosError> {
         // Directory or Symlink FileEntry are just added to Pithos directory
         let file_entry_key = Key::new(
-            self.directory.next_free_file_index(),
+            self.directory.next_free_file_index()?,
             entry_path.to_string(),
         );
 
@@ -372,8 +415,20 @@ impl PithosWriter {
 
     #[tracing::instrument(level = "trace", skip(self, input))]
     pub fn process_input(&mut self, input: InputFile) -> Result<Reference, PithosError> {
+        let data_check = FileEntry::new_from_content(input.file_type, &input.data)?;
+        validate_new_candidate(&self.directory.files, &input.inner_path, &data_check)?;
+        if let Some(metadata) = &input.metadata
+            && !matches!(metadata, Content::Reference(_))
+        {
+            let metadata_check = FileEntry::new_from_content(FileType::Metadata, metadata)?;
+            validate_new_candidate(
+                &self.directory.files,
+                &format!("{}.meta", input.inner_path),
+                &metadata_check,
+            )?;
+        }
         // Create FileEntry with its ProcessingFlags from data file input
-        let mut data_file = FileEntry::new_from_content(input.file_type, &input.data)?;
+        let mut data_file = data_check;
         let processing_flags = ProcessingFlags::new(input.encrypt, input.compression_level);
 
         // First process metadata to add reference
@@ -384,7 +439,7 @@ impl PithosWriter {
                 Content::File(disk_path) => {
                     let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
                     let handle = File::open(disk_path)?;
-                    self.process_file_entry(
+                    self.process_file_entry_prevalidated(
                         meta_file_path,
                         &mut meta_file,
                         &processing_flags,
@@ -394,7 +449,7 @@ impl PithosWriter {
                 Content::Raw(raw_content) => {
                     let mut meta_file = FileEntry::new_from_content(FileType::Metadata, &metadata)?;
                     let handle = Cursor::new(raw_content.clone().into_bytes());
-                    self.process_file_entry(
+                    self.process_file_entry_prevalidated(
                         meta_file_path,
                         &mut meta_file,
                         &processing_flags,
@@ -409,18 +464,26 @@ impl PithosWriter {
 
         // Process data FileEntry
         let data_reference = match input.data {
-            Content::File(disk_path) => {
+            Content::File(disk_path)
+                if [FileType::Data, FileType::Metadata].contains(&input.file_type) =>
+            {
                 let handle = File::open(disk_path)?;
-                self.process_file_entry(
+                self.process_file_entry_prevalidated(
                     &input.inner_path,
                     &mut data_file,
                     &processing_flags,
                     handle,
                 )?
             }
+            Content::File(_) => self.process_file_entry_prevalidated(
+                &input.inner_path,
+                &mut data_file,
+                &processing_flags,
+                Cursor::new(Vec::<u8>::new()),
+            )?,
             Content::Raw(raw_content) => {
                 let handle = Cursor::new(raw_content.into_bytes());
-                self.process_file_entry(
+                self.process_file_entry_prevalidated(
                     &input.inner_path,
                     &mut data_file,
                     &processing_flags,
@@ -445,7 +508,7 @@ impl PithosWriter {
                     .get_file_encryption_key(reference.target_file_id)
                 {
                     let file_entry_key =
-                        Key::new(self.directory.next_free_file_index(), &input.inner_path);
+                        Key::new(self.directory.next_free_file_index()?, &input.inner_path);
                     self.directory.add_file(&input.inner_path, &data_file)?;
                     self.directory
                         .add_file_to_all_recipients((file_entry_key.id(), enc_key));
@@ -540,6 +603,7 @@ impl PithosWriter {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn write_directory(&mut self) -> Result<(), PithosError> {
+        validate_map(&self.directory.files)?;
         // Encrypt recipients of writer section
         self.directory.encrypt_recipients(&self.writer_key)?;
 

@@ -30,6 +30,32 @@ pub enum PithosError {
     Serialization(#[from] SerializationError),
     #[error("Deserialization error: {0:?}")]
     Deserialization(#[from] DeserializationError),
+    #[error("Unsupported file version: supported {supported:#06x}, actual {actual:#06x}")]
+    UnsupportedFileVersion { supported: u16, actual: u16 },
+    #[error("Multiple reader keys are not supported")]
+    UnsupportedMultipleReaderKeys,
+    #[error("Reference content is not supported for file entry construction")]
+    UnsupportedReferenceContent,
+    #[error("Invalid directory marker: expected {expected:?}, got {actual:?}")]
+    InvalidDirectoryMarker { expected: [u8; 8], actual: [u8; 8] },
+    #[error("Directory length mismatch: expected {expected}, got {actual}")]
+    DirectoryLengthMismatch { expected: u64, actual: u64 },
+    #[error("Directory checksum mismatch: expected {expected:#010x}, got {actual:#010x}")]
+    DirectoryChecksumMismatch { expected: u32, actual: u32 },
+    #[error("Directory parser consumption mismatch: expected {expected}, got {actual}")]
+    DirectoryConsumptionMismatch { expected: u64, actual: u64 },
+    #[error("{field} exceeds limit {limit}: {actual}")]
+    LimitExceeded {
+        field: &'static str,
+        limit: u64,
+        actual: u64,
+    },
+    #[error("allocation failed for {field}: {size}")]
+    AllocationFailed { field: &'static str, size: u64 },
+    #[error("invalid directory range: {0}")]
+    InvalidDirectoryRange(String),
+    #[error("invalid directory chain: {0}")]
+    InvalidDirectoryChain(String),
     #[error("Crypt error: {0}")]
     Crypt(#[from] CryptError),
     #[error("Crypt4GH error: {0}")]
@@ -63,16 +89,49 @@ pub enum PithosError {
     UnsupportedZipEntry(String),
     #[error("Invalid block data state: {0}")]
     InvalidBlockDataState(String),
+    #[error("external block source required")]
+    ExternalBlockSourceRequired,
+    #[error("external block framing error: {0}")]
+    ExternalBlockFraming(String),
     #[error("Block hash not found: {0:?}")]
     BlockHashNotFound([u8; 32]),
+    #[error("Block size mismatch: expected {expected}, got {actual}")]
+    BlockSizeMismatch { expected: u64, actual: u64 },
+    #[error("Block hash mismatch: expected {expected:?}, got {actual:?}")]
+    BlockHashMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    #[error(
+        "Block index conflict for hash {hash:?}: existing original size {existing_original_size}, new original size {new_original_size}"
+    )]
+    BlockIndexConflict {
+        hash: [u8; 32],
+        existing_original_size: u64,
+        new_original_size: u64,
+    },
     #[error("File not found: {0}")]
     FileNotFound(String),
     #[error("File already exists: {0}")]
     DuplicateFileId(String),
+    #[error("File ID allocation is exhausted")]
+    FileIdExhausted,
     #[error("Relation id already occupied: {0}")]
     RelationIdOccupied(u64),
     #[error("Path already occupied: {0}")]
     PathOccupied(String),
+    #[error("Invalid archive path {path}: {reason}")]
+    InvalidArchivePath { path: String, reason: String },
+    #[error("Invalid symlink target {target} for {path}: {reason}")]
+    InvalidSymlinkTarget {
+        path: String,
+        target: String,
+        reason: String,
+    },
+    #[error("Invalid symlink entry {path}: {reason}")]
+    InvalidSymlinkEntry { path: String, reason: String },
+    #[error("Extraction collision at {path}: {reason}")]
+    ExtractionCollision { path: String, reason: String },
     #[error("Invalid file type: {0}")]
     InvalidFileType(String),
     #[error("No recipient section found for the provided private key")]

@@ -21,10 +21,20 @@ pub enum SerializationError {
     Other(String),
 }
 
+pub(crate) fn write_len_prefix<W: Write>(
+    writer: &mut W,
+    len: usize,
+) -> Result<(), SerializationError> {
+    let len = u64::try_from(len)
+        .map_err(|_| SerializationError::Other("length does not fit in u64".to_string()))?;
+    writer.write_varint(len)?;
+    Ok(())
+}
+
 // Helper: encode string (UTF-8 with varint length prefix)
 #[tracing::instrument(level = "trace", skip(writer, s))]
 pub fn encode_string<W: Write>(writer: &mut W, s: &str) -> Result<(), SerializationError> {
-    writer.write_varint(s.len())?;
+    write_len_prefix(writer, s.len())?;
     writer.write_all(s.as_bytes())?;
     Ok(())
 }
@@ -106,23 +116,23 @@ impl Directory {
         }
 
         // Write file entries
-        writer.write_varint(self.files.len() as u64)?;
+        write_len_prefix(writer, self.files.len())?;
         for (id, path, file) in &self.files {
             writer.write_varint::<u64>(id)?;
             encode_string(writer, path)?;
             file.serialize(writer)?;
         }
-        writer.write_varint(self.blocks.len() as u64)?;
+        write_len_prefix(writer, self.blocks.len())?;
         for (hash, block) in &self.blocks {
             writer.write_all(hash)?;
             block.serialize(writer)?;
         }
-        writer.write_varint(self.relations.len())?;
+        write_len_prefix(writer, self.relations.len())?;
         for (idx, name) in &self.relations {
             writer.write_varint(*idx)?;
             encode_string(writer, name)?;
         }
-        writer.write_varint(self.encryption.len() as u64)?;
+        write_len_prefix(writer, self.encryption.len())?;
         for (key, enc) in &self.encryption {
             writer.write_all(key)?;
             enc.serialize(writer)?;
@@ -148,12 +158,12 @@ impl BlockDataState {
         match self {
             BlockDataState::Encrypted(data) => {
                 writer.write_all(&[0u8])?;
-                writer.write_varint(data.len())?;
+                write_len_prefix(writer, data.len())?;
                 writer.write_all(data)?;
             }
             BlockDataState::Decrypted(list) => {
                 writer.write_all(&[1u8])?;
-                writer.write_varint(list.len())?;
+                write_len_prefix(writer, list.len())?;
                 for (hash, key) in list {
                     writer.write_all(hash)?;
                     writer.write_all(key)?;
@@ -180,7 +190,7 @@ impl FileEntry {
         writer.write_varint(self.modified)?;
         writer.write_varint(self.file_size)?;
         writer.write_varint(self.permissions)?;
-        writer.write_varint(self.references.len())?;
+        write_len_prefix(writer, self.references.len())?;
         for r in &self.references {
             r.serialize(writer)?;
         }
@@ -214,7 +224,7 @@ impl Reference {
 impl EncryptionSection {
     #[tracing::instrument(level = "trace", skip(self, writer))]
     pub fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializationError> {
-        writer.write_varint(self.recipients.len() as u64)?;
+        write_len_prefix(writer, self.recipients.len())?;
         for (key, recipient) in &self.recipients {
             writer.write_all(key)?;
             recipient.serialize(writer)?;
@@ -229,12 +239,12 @@ impl RecipientData {
         match self {
             RecipientData::Encrypted(data) => {
                 writer.write_all(&[0u8])?;
-                writer.write_varint(data.len())?;
+                write_len_prefix(writer, data.len())?;
                 writer.write_all(data)?;
             }
             RecipientData::Decrypted(list) => {
                 writer.write_all(&[1u8])?;
-                writer.write_varint(list.len())?;
+                write_len_prefix(writer, list.len())?;
                 for (idx, hash) in list {
                     writer.write_varint(*idx)?;
                     writer.write_all(hash)?;

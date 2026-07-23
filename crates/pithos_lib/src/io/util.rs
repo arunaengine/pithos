@@ -1,4 +1,6 @@
 use crate::error::PithosError;
+use crate::helpers::archive_path::{validate_entry_path, validate_symlink_target};
+use crate::io::extraction::ExtractionRoot;
 use fastcdc::v2020::{Normalization, StreamCDC};
 use std::env::current_dir;
 use std::io::Read;
@@ -27,15 +29,9 @@ pub fn get_symlink_target(file: &std::fs::File) -> Result<String, PithosError> {
 
 #[tracing::instrument(level = "trace", skip(path, base_dir))]
 pub fn create_dir(path: &str, base_dir: Option<&PathBuf>) -> Result<(), PithosError> {
-    // If no base dir provided create directory hierarchy in current working directory
-    let path = if let Some(base_dir) = base_dir {
-        base_dir.join(path)
-    } else {
-        current_dir()?.join(path)
-    };
-    std::fs::create_dir_all(path)?;
-
-    Ok(())
+    validate_entry_path(path)?;
+    let root = base_dir.cloned().unwrap_or(current_dir()?);
+    ExtractionRoot::open(&root, true)?.create_dir(path)
 }
 
 #[tracing::instrument(level = "trace", skip(path, target, base_dir))]
@@ -44,16 +40,10 @@ pub fn create_symlink(
     target: &str,
     base_dir: Option<&PathBuf>,
 ) -> Result<(), PithosError> {
-    // Resolve only the link location. The target is stored verbatim so relative
-    // targets remain relative to the created symlink.
-    let path = if let Some(base_dir) = base_dir {
-        base_dir.join(path)
-    } else {
-        current_dir()?.join(path)
-    };
-    std::os::unix::fs::symlink(target, path)?;
-
-    Ok(())
+    validate_entry_path(path)?;
+    validate_symlink_target(path, target)?;
+    let root = base_dir.cloned().unwrap_or(current_dir()?);
+    ExtractionRoot::open(&root, true)?.create_symlink(path, target)
 }
 
 #[tracing::instrument(level = "trace", skip(content, cdc))]
@@ -115,15 +105,11 @@ mod tests {
     }
 
     #[test]
-    fn create_dir_creates_nested_paths_with_and_without_a_base_directory() {
+    fn create_dir_creates_nested_paths_with_a_base_directory() {
         let temp_dir = TempDir::new().unwrap();
         let base_dir = temp_dir.path().join("base");
         create_dir("nested/path", Some(&base_dir)).unwrap();
         assert!(base_dir.join("nested/path").is_dir());
-
-        let absolute_path = temp_dir.path().join("absolute/path");
-        create_dir(absolute_path.to_str().unwrap(), None).unwrap();
-        assert!(absolute_path.is_dir());
     }
 
     #[test]
@@ -132,9 +118,10 @@ mod tests {
         let base_dir = temp_dir.path().join("output");
         fs::create_dir(&base_dir).unwrap();
 
-        create_symlink("link", "../target.txt", Some(&base_dir)).unwrap();
+        create_dir("nested", Some(&base_dir)).unwrap();
+        create_symlink("nested/link", "../target.txt", Some(&base_dir)).unwrap();
 
-        let link = base_dir.join("link");
+        let link = base_dir.join("nested/link");
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -145,22 +132,13 @@ mod tests {
     }
 
     #[test]
-    fn create_symlink_preserves_absolute_targets_without_creating_them() {
+    fn create_symlink_rejects_absolute_targets() {
         let temp_dir = TempDir::new().unwrap();
         let base_dir = temp_dir.path().join("output");
         let target = temp_dir.path().join("outside-target");
         fs::create_dir(&base_dir).unwrap();
 
-        create_symlink("link", target.to_str().unwrap(), Some(&base_dir)).unwrap();
-
-        let link = base_dir.join("link");
-        assert!(
-            fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(fs::read_link(link).unwrap(), target);
+        assert!(create_symlink("link", target.to_str().unwrap(), Some(&base_dir)).is_err());
         assert!(fs::symlink_metadata(temp_dir.path().join("outside-target")).is_err());
     }
 

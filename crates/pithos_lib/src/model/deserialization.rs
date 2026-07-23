@@ -7,6 +7,7 @@
 // - Error handling via DeserializationError
 
 use crate::error::PithosError;
+use crate::helpers::archive_path::{validate_entry, validate_hierarchy};
 use crate::helpers::file_entry_map::{FileEntryMap, Key};
 use crate::model::structs::*;
 use byteorder::{BigEndian, ReadBytesExt};
@@ -36,13 +37,74 @@ pub enum DeserializationError {
     /// Invalid length encountered
     #[error("Invalid length")]
     InvalidLength,
+    #[error("{field} exceeds limit {limit}: {actual}")]
+    LimitExceeded {
+        field: &'static str,
+        limit: u64,
+        actual: u64,
+    },
+    #[error("allocation failed for {field}: {size}")]
+    AllocationFailed { field: &'static str, size: u64 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DeserializationLimits {
+    pub max_string_bytes: u64,
+    pub max_opaque_bytes: u64,
+    pub max_collection_entries: u64,
+}
+
+impl Default for DeserializationLimits {
+    fn default() -> Self {
+        Self {
+            max_string_bytes: 1024 * 1024,
+            max_opaque_bytes: 64 * 1024 * 1024,
+            max_collection_entries: 1_000_000,
+        }
+    }
+}
+
+fn bounded_len(value: u64, limit: u64, field: &'static str) -> Result<usize, DeserializationError> {
+    if value > limit {
+        return Err(DeserializationError::LimitExceeded {
+            field,
+            limit,
+            actual: value,
+        });
+    }
+    usize::try_from(value).map_err(|_| DeserializationError::InvalidLength)
+}
+
+fn reserve<T>(
+    vec: &mut Vec<T>,
+    count: usize,
+    field: &'static str,
+) -> Result<(), DeserializationError> {
+    vec.try_reserve(count)
+        .map_err(|_| DeserializationError::AllocationFailed {
+            field,
+            size: count as u64,
+        })
 }
 
 // Helper: decode string (UTF-8 with varint length prefix)
 #[tracing::instrument(level = "trace", skip(reader))]
 pub fn decode_string<R: Read>(reader: &mut R) -> Result<String, DeserializationError> {
-    let len = reader.read_varint()?;
-    let mut buf = vec![0u8; len];
+    decode_string_with_limits(reader, &DeserializationLimits::default())
+}
+
+pub fn decode_string_with_limits<R: Read>(
+    reader: &mut R,
+    limits: &DeserializationLimits,
+) -> Result<String, DeserializationError> {
+    let len = bounded_len(
+        reader.read_varint::<u64>()?,
+        limits.max_string_bytes,
+        "string",
+    )?;
+    let mut buf = Vec::new();
+    reserve(&mut buf, len, "string")?;
+    buf.resize(len, 0);
     reader.read_exact(&mut buf)?;
     Ok(String::from_utf8(buf)?)
 }
@@ -104,12 +166,19 @@ impl ProcessingFlags {
 impl BlockLocation {
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
+        Self::deserialize_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_with_limits<R: Read>(
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Self, DeserializationError> {
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag)?;
         match tag[0] {
             0 => Ok(BlockLocation::Local),
             1 => {
-                let url = decode_string(reader)?;
+                let url = decode_string_with_limits(reader, limits)?;
                 Ok(BlockLocation::External { url })
             }
             v => Err(DeserializationError::InvalidEnumValue(v)),
@@ -121,11 +190,18 @@ impl BlockLocation {
 impl BlockIndexEntry {
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
+        Self::deserialize_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_with_limits<R: Read>(
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Self, DeserializationError> {
         let offset: u64 = reader.read_varint()?;
         let stored_size: u64 = reader.read_varint()?;
         let original_size: u64 = reader.read_varint()?;
         let flags = ProcessingFlags::deserialize(reader)?;
-        let location = BlockLocation::deserialize(reader)?;
+        let location = BlockLocation::deserialize_with_limits(reader, limits)?;
         Ok(BlockIndexEntry {
             offset,
             stored_size,
@@ -138,11 +214,26 @@ impl BlockIndexEntry {
 
 // Directory
 impl Directory {
+    pub(crate) const DIRECTORY_MARKER: [u8; 8] = *b"PITHOSDR";
+
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, PithosError> {
+        Self::deserialize_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_with_limits<R: Read>(
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Self, PithosError> {
         // Read static directory identifier
         let mut identifier = [0u8; 8];
         reader.read_exact(&mut identifier)?;
+        if identifier != Self::DIRECTORY_MARKER {
+            return Err(PithosError::InvalidDirectoryMarker {
+                expected: Self::DIRECTORY_MARKER,
+                actual: identifier,
+            });
+        }
 
         // Read parent directory offset
         let mut tag = [0u8; 1];
@@ -159,36 +250,59 @@ impl Directory {
 
         // Read file entries
         let mut files = FileEntryMap::new();
-        let files_len = reader.read_varint::<u64>()?;
+        let files_len = bounded_len(
+            reader.read_varint::<u64>()?,
+            limits.max_collection_entries,
+            "files",
+        )?;
         for _ in 0..files_len {
             let id = reader.read_varint::<u64>()?;
-            let path = decode_string(reader)?;
-            files.insert(Key::new(id, path), FileEntry::deserialize(reader)?)?;
+            let path = decode_string_with_limits(reader, limits)?;
+            let entry = FileEntry::deserialize_with_limits(reader, limits)?;
+            validate_entry(&path, &entry)?;
+            files.insert(Key::new(id, path), entry)?;
         }
+        validate_hierarchy(&files)?;
 
-        let blocks_len = reader.read_varint::<u64>()?;
+        let blocks_len = bounded_len(
+            reader.read_varint::<u64>()?,
+            limits.max_collection_entries,
+            "blocks",
+        )?;
         let mut blocks = IndexMap::new();
         for _ in 0..blocks_len {
             let mut hash = [0u8; 32];
             reader.read_exact(&mut hash)?;
-            let block = BlockIndexEntry::deserialize(reader)?;
+            let block = BlockIndexEntry::deserialize_with_limits(reader, limits)?;
             blocks.insert(hash, block);
         }
 
-        let relations_len = reader.read_varint()?;
-        let mut relations = Vec::with_capacity(relations_len);
+        let relations_len = bounded_len(
+            reader.read_varint::<u64>()?,
+            limits.max_collection_entries,
+            "relations",
+        )?;
+        let mut relations = Vec::new();
+        reserve(&mut relations, relations_len, "relations")?;
         for _ in 0..relations_len {
             let idx = reader.read_varint::<u64>()?;
-            let name = decode_string(reader)?;
+            let name = decode_string_with_limits(reader, limits)?;
             relations.push((idx, name));
         }
 
-        let encryption_len = reader.read_varint::<u64>()?;
+        let encryption_len = bounded_len(
+            reader.read_varint::<u64>()?,
+            limits.max_collection_entries,
+            "encryption",
+        )?;
         let mut encryption = IndexMap::new();
         for _ in 0..encryption_len {
             let mut key = [0u8; 32];
             reader.read_exact(&mut key)?;
-            encryption.insert(key, EncryptionSection::deserialize(reader)?);
+            encryption.insert(
+                key,
+                EncryptionSection::deserialize_with_limits(reader, limits)?,
+            );
         }
 
         let dir_len = reader.read_u64::<BigEndian>()?;
@@ -227,18 +341,36 @@ impl FileType {
 impl BlockDataState {
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
+        Self::deserialize_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_with_limits<R: Read>(
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Self, DeserializationError> {
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag)?;
         match tag[0] {
             0 => {
-                let len = reader.read_varint()?;
-                let mut buf = vec![0u8; len];
+                let len = bounded_len(
+                    reader.read_varint::<u64>()?,
+                    limits.max_opaque_bytes,
+                    "encrypted block",
+                )?;
+                let mut buf = Vec::new();
+                reserve(&mut buf, len, "encrypted block")?;
+                buf.resize(len, 0);
                 reader.read_exact(&mut buf)?;
                 Ok(BlockDataState::Encrypted(buf))
             }
             1 => {
-                let list_len = reader.read_varint()?;
-                let mut list = Vec::with_capacity(list_len);
+                let list_len = bounded_len(
+                    reader.read_varint::<u64>()?,
+                    limits.max_collection_entries,
+                    "block keys",
+                )?;
+                let mut list = Vec::new();
+                reserve(&mut list, list_len, "block keys")?;
                 for _ in 0..list_len {
                     let mut hash = [0u8; 32];
                     reader.read_exact(&mut hash)?;
@@ -257,8 +389,21 @@ impl BlockDataState {
         &self,
         reader: &mut R,
     ) -> Result<Vec<BlockDataEntry>, DeserializationError> {
-        let list_len = reader.read_varint()?;
-        let mut list = Vec::with_capacity(list_len);
+        self.deserialize_block_index_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_block_index_with_limits<R: Read>(
+        &self,
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Vec<BlockDataEntry>, DeserializationError> {
+        let list_len = bounded_len(
+            reader.read_varint::<u64>()?,
+            limits.max_collection_entries,
+            "block index",
+        )?;
+        let mut list = Vec::new();
+        reserve(&mut list, list_len, "block index")?;
         for _ in 0..list_len {
             let mut hash = [0u8; 32];
             reader.read_exact(&mut hash)?;
@@ -274,14 +419,26 @@ impl BlockDataState {
 impl FileEntry {
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
+        Self::deserialize_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_with_limits<R: Read>(
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Self, DeserializationError> {
         let file_type = FileType::deserialize(reader)?;
-        let block_data = BlockDataState::deserialize(reader)?;
+        let block_data = BlockDataState::deserialize_with_limits(reader, limits)?;
         let created: u64 = reader.read_varint()?;
         let modified: u64 = reader.read_varint()?;
         let file_size: u64 = reader.read_varint()?;
         let permissions: u32 = reader.read_varint()?;
-        let refs_len = reader.read_varint()?;
-        let mut references = Vec::with_capacity(refs_len);
+        let refs_len = bounded_len(
+            reader.read_varint::<u64>()?,
+            limits.max_collection_entries,
+            "references",
+        )?;
+        let mut references = Vec::new();
+        reserve(&mut references, refs_len, "references")?;
         for _ in 0..refs_len {
             references.push(Reference::deserialize(reader)?);
         }
@@ -289,7 +446,7 @@ impl FileEntry {
         reader.read_exact(&mut tag)?;
         let symlink_target = match tag[0] {
             0 => None,
-            1 => Some(decode_string(reader)?),
+            1 => Some(decode_string_with_limits(reader, limits)?),
             _ => return Err(DeserializationError::InvalidOption),
         };
         Ok(FileEntry {
@@ -322,12 +479,26 @@ impl Reference {
 impl EncryptionSection {
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let recipients_len = reader.read_varint::<u64>()?;
+        Self::deserialize_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_with_limits<R: Read>(
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Self, DeserializationError> {
+        let recipients_len = bounded_len(
+            reader.read_varint::<u64>()?,
+            limits.max_collection_entries,
+            "recipients",
+        )?;
         let mut recipients = IndexMap::new();
         for _ in 0..recipients_len {
             let mut key = [0u8; 32];
             reader.read_exact(&mut key)?;
-            recipients.insert(key, RecipientSection::deserialize(reader)?);
+            recipients.insert(
+                key,
+                RecipientSection::deserialize_with_limits(reader, limits)?,
+            );
         }
         Ok(EncryptionSection { recipients })
     }
@@ -337,19 +508,37 @@ impl EncryptionSection {
 impl RecipientData {
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
+        Self::deserialize_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_with_limits<R: Read>(
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Self, DeserializationError> {
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag)?;
 
         match tag[0] {
             0 => {
-                let len = reader.read_varint()?;
-                let mut buf = vec![0u8; len];
+                let len = bounded_len(
+                    reader.read_varint::<u64>()?,
+                    limits.max_opaque_bytes,
+                    "encrypted recipient data",
+                )?;
+                let mut buf = Vec::new();
+                reserve(&mut buf, len, "encrypted recipient data")?;
+                buf.resize(len, 0);
                 reader.read_exact(&mut buf)?;
                 Ok(RecipientData::Encrypted(buf))
             }
             1 => {
-                let list_len = reader.read_varint()?;
-                let mut list = Vec::with_capacity(list_len);
+                let list_len = bounded_len(
+                    reader.read_varint::<u64>()?,
+                    limits.max_collection_entries,
+                    "recipient keys",
+                )?;
+                let mut list = Vec::new();
+                reserve(&mut list, list_len, "recipient keys")?;
                 for _ in 0..list_len {
                     let idx: u64 = reader.read_varint()?;
                     let mut key = [0u8; 32];
@@ -367,8 +556,21 @@ impl RecipientData {
         &self,
         reader: &mut R,
     ) -> Result<Vec<(u64, [u8; 32])>, DeserializationError> {
-        let list_len = reader.read_varint()?;
-        let mut list = Vec::with_capacity(list_len);
+        self.deserialize_decrypted_list_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_decrypted_list_with_limits<R: Read>(
+        &self,
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Vec<(u64, [u8; 32])>, DeserializationError> {
+        let list_len = bounded_len(
+            reader.read_varint::<u64>()?,
+            limits.max_collection_entries,
+            "recipient keys",
+        )?;
+        let mut list = Vec::new();
+        reserve(&mut list, list_len, "recipient keys")?;
         for _ in 0..list_len {
             let idx: u64 = reader.read_varint()?;
             let mut key = [0u8; 32];
@@ -384,7 +586,14 @@ impl RecipientData {
 impl RecipientSection {
     #[tracing::instrument(level = "trace", skip(reader))]
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, DeserializationError> {
-        let recipient_data = RecipientData::deserialize(reader)?;
+        Self::deserialize_with_limits(reader, &DeserializationLimits::default())
+    }
+
+    pub fn deserialize_with_limits<R: Read>(
+        reader: &mut R,
+        limits: &DeserializationLimits,
+    ) -> Result<Self, DeserializationError> {
+        let recipient_data = RecipientData::deserialize_with_limits(reader, limits)?;
         Ok(RecipientSection { recipient_data })
     }
 }

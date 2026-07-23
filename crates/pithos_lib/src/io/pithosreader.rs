@@ -1,43 +1,220 @@
 use crate::error::PithosError;
+use crate::helpers::archive_path::{validate_existing_candidate, validate_map};
 use crate::helpers::chacha_poly1305::{decrypt_chunk, encrypt_chunk};
 use crate::helpers::crypt4gh::{CRYPT4GH_BLOCK_SIZE, Crypt4GHHeader, HeaderPacket};
-use crate::helpers::file_entry_map::KeyQuery;
 use crate::helpers::x25519_keys::private_key_from_pem_bytes;
 use crate::helpers::zstd::decompress_data;
-use crate::io::util::{create_dir, create_symlink};
+use crate::io::extraction::ExtractionRoot;
+use crate::model::deserialization::DeserializationLimits;
 use crate::model::structs::{
-    BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileType,
+    BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, Directory, FileEntry, FileHeader,
+    FileType,
 };
+use crc32fast::hash;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
+
+pub trait ExternalBlockSource {
+    fn open(&self, url: &str, max_response_size: u64) -> Result<Box<dyn Read>, PithosError>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ReaderLimits {
+    pub max_directory_bytes: u64,
+    pub max_parent_directories: u64,
+    pub max_stored_block_bytes: u64,
+    pub max_decoded_block_bytes: u64,
+    pub deserialization: DeserializationLimits,
+}
+
+impl Default for ReaderLimits {
+    fn default() -> Self {
+        Self {
+            max_directory_bytes: 64 * 1024 * 1024,
+            max_parent_directories: 1024,
+            max_stored_block_bytes: 64 * 1024 * 1024,
+            max_decoded_block_bytes: 64 * 1024 * 1024,
+            deserialization: DeserializationLimits::default(),
+        }
+    }
+}
 
 pub struct PithosReaderSimple {
     /// Underlying file handle for the Pithos archive
     file: File,
     /// User's private key
     private_key: StaticSecret,
+    limits: ReaderLimits,
+    external_block_source: Option<Box<dyn ExternalBlockSource>>,
 }
 
 impl PithosReaderSimple {
+    fn open_archive<P: AsRef<Path>>(pithos_path: P) -> Result<File, PithosError> {
+        let mut file = File::open(pithos_path)?;
+        let header = FileHeader::deserialize(&mut file)?;
+        if header.version != FileHeader::SUPPORTED_VERSION {
+            return Err(PithosError::UnsupportedFileVersion {
+                supported: FileHeader::SUPPORTED_VERSION,
+                actual: header.version,
+            });
+        }
+        Ok(file)
+    }
+
+    fn decode_and_verify_block(
+        stored_bytes: Vec<u8>,
+        key: &[u8; 32],
+        expected_hash: &[u8; 32],
+        block_meta: &BlockIndexEntry,
+        limits: &ReaderLimits,
+    ) -> Result<Vec<u8>, PithosError> {
+        if block_meta.original_size > limits.max_decoded_block_bytes {
+            return Err(PithosError::LimitExceeded {
+                field: "decoded block",
+                limit: limits.max_decoded_block_bytes,
+                actual: block_meta.original_size,
+            });
+        }
+        let mut plaintext = if block_meta.flags.is_encrypted() {
+            decrypt_chunk(&stored_bytes, key)?
+        } else {
+            stored_bytes
+        };
+        if block_meta.flags.get_compression_level() > 0 {
+            plaintext = decompress_data(&plaintext, block_meta.original_size)?;
+        }
+
+        let actual_size = plaintext.len() as u64;
+        if actual_size != block_meta.original_size {
+            return Err(PithosError::BlockSizeMismatch {
+                expected: block_meta.original_size,
+                actual: actual_size,
+            });
+        }
+
+        let actual_hash = *blake3::hash(&plaintext).as_bytes();
+        if actual_hash != *expected_hash {
+            return Err(PithosError::BlockHashMismatch {
+                expected: *expected_hash,
+                actual: actual_hash,
+            });
+        }
+
+        Ok(plaintext)
+    }
+
+    fn checked_stored_size(
+        meta: &BlockIndexEntry,
+        limits: &ReaderLimits,
+    ) -> Result<usize, PithosError> {
+        if meta.stored_size > limits.max_stored_block_bytes {
+            return Err(PithosError::LimitExceeded {
+                field: "stored block",
+                limit: limits.max_stored_block_bytes,
+                actual: meta.stored_size,
+            });
+        }
+        if meta.original_size > limits.max_decoded_block_bytes {
+            return Err(PithosError::LimitExceeded {
+                field: "decoded block",
+                limit: limits.max_decoded_block_bytes,
+                actual: meta.original_size,
+            });
+        }
+        usize::try_from(meta.stored_size).map_err(|_| {
+            PithosError::InvalidDirectoryRange("stored block size does not fit platform".into())
+        })
+    }
+
+    fn zeroed_buffer(size: usize, field: &'static str) -> Result<Vec<u8>, PithosError> {
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(size)
+            .map_err(|_| PithosError::AllocationFailed {
+                field,
+                size: size as u64,
+            })?;
+        buffer.resize(size, 0);
+        Ok(buffer)
+    }
+
+    fn validate_local_block_range(&self, meta: &BlockIndexEntry) -> Result<(), PithosError> {
+        let end = meta
+            .offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(meta.stored_size))
+            .ok_or_else(|| PithosError::InvalidDirectoryRange("block range overflow".into()))?;
+        if end > self.file.metadata()?.len() {
+            return Err(PithosError::InvalidDirectoryRange(
+                "block range exceeds archive".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_directory(bytes: &[u8], limits: &ReaderLimits) -> Result<Directory, PithosError> {
+        if bytes.len() < 25 {
+            return Err(PithosError::DirectoryLengthMismatch {
+                expected: 25,
+                actual: bytes.len() as u64,
+            });
+        }
+        if bytes[..8] != Directory::DIRECTORY_MARKER {
+            return Err(PithosError::InvalidDirectoryMarker {
+                expected: Directory::DIRECTORY_MARKER,
+                actual: bytes[..8].try_into().unwrap(),
+            });
+        }
+        let expected_len =
+            u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
+        if expected_len != bytes.len() as u64 {
+            return Err(PithosError::DirectoryLengthMismatch {
+                expected: bytes.len() as u64,
+                actual: expected_len,
+            });
+        }
+        let expected_crc = u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+        let actual_crc = hash(&bytes[..bytes.len() - 4]);
+        if expected_crc != actual_crc {
+            return Err(PithosError::DirectoryChecksumMismatch {
+                expected: actual_crc,
+                actual: expected_crc,
+            });
+        }
+        let mut cursor = Cursor::new(bytes);
+        let directory = Directory::deserialize_with_limits(&mut cursor, &limits.deserialization)?;
+        if cursor.position() != bytes.len() as u64 {
+            return Err(PithosError::DirectoryConsumptionMismatch {
+                expected: bytes.len() as u64,
+                actual: cursor.position(),
+            });
+        }
+        Ok(directory)
+    }
+
     /// Open a Pithos archive and prepare for reading
     #[tracing::instrument(level = "trace", skip(pithos_path, private_key_pem_path))]
     pub fn new<P: AsRef<Path>>(
         pithos_path: P,
         private_key_pem_path: P,
     ) -> Result<Self, PithosError> {
-        // Open the Pithos file
-        let file = File::open(&pithos_path)?;
+        let file = Self::open_archive(&pithos_path)?;
 
         // Read and parse the PEM-encoded private key
         let pem_content = std::fs::read_to_string(private_key_pem_path)?;
         let private_key = private_key_from_pem_bytes(pem_content.as_bytes())?;
 
-        Ok(Self { file, private_key })
+        Ok(Self {
+            file,
+            private_key,
+            limits: ReaderLimits::default(),
+            external_block_source: None,
+        })
     }
 
     /// Init a simple Pithos reader
@@ -46,10 +223,70 @@ impl PithosReaderSimple {
         pithos_path: P,
         private_key: StaticSecret,
     ) -> Result<Self, PithosError> {
-        // Open the Pithos file
-        let file = File::open(&pithos_path)?;
+        let file = Self::open_archive(&pithos_path)?;
 
-        Ok(Self { file, private_key })
+        Ok(Self {
+            file,
+            private_key,
+            limits: ReaderLimits::default(),
+            external_block_source: None,
+        })
+    }
+
+    pub fn with_limits(mut self, limits: ReaderLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn with_external_block_source(mut self, source: Box<dyn ExternalBlockSource>) -> Self {
+        self.external_block_source = Some(source);
+        self
+    }
+
+    fn load_stored_block(&mut self, meta: &BlockIndexEntry) -> Result<Vec<u8>, PithosError> {
+        let stored_size = Self::checked_stored_size(meta, &self.limits)?;
+        let mut block_data = Self::zeroed_buffer(stored_size, "stored block")?;
+        let mut block_header = [0u8; 4];
+
+        match &meta.location {
+            BlockLocation::Local => {
+                self.validate_local_block_range(meta)?;
+                self.file.seek(SeekFrom::Start(meta.offset))?;
+                self.file.read_exact(&mut block_header)?;
+                BlockHeader::deserialize(&mut block_header.as_slice())?;
+                self.file.read_exact(&mut block_data)?;
+            }
+            BlockLocation::External { url } => {
+                let max_response_size = meta.stored_size.checked_add(5).ok_or_else(|| {
+                    PithosError::ExternalBlockFraming("response size overflow".into())
+                })?;
+                let source = self
+                    .external_block_source
+                    .as_ref()
+                    .ok_or(PithosError::ExternalBlockSourceRequired)?;
+                let mut response = source.open(url, max_response_size)?;
+                response.read_exact(&mut block_header).map_err(|error| {
+                    PithosError::ExternalBlockFraming(format!("short block marker: {error}"))
+                })?;
+                BlockHeader::deserialize(&mut block_header.as_slice()).map_err(|error| {
+                    PithosError::ExternalBlockFraming(format!("invalid block marker: {error}"))
+                })?;
+                response.read_exact(&mut block_data).map_err(|error| {
+                    PithosError::ExternalBlockFraming(format!("short block payload: {error}"))
+                })?;
+                let mut extra = [0u8; 1];
+                if response.read(&mut extra).map_err(|error| {
+                    PithosError::ExternalBlockFraming(format!("reading block boundary: {error}"))
+                })? != 0
+                {
+                    return Err(PithosError::ExternalBlockFraming(
+                        "response exceeds expected size".into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(block_data)
     }
 
     /// Init a simple Pithos reader
@@ -58,7 +295,7 @@ impl PithosReaderSimple {
         _pithos_path: P,
         _private_key: Vec<StaticSecret>,
     ) -> Result<Self, PithosError> {
-        unimplemented!("Multiple reader keys");
+        Err(PithosError::UnsupportedMultipleReaderKeys)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -77,30 +314,97 @@ impl PithosReaderSimple {
         let parent_dir_len = u64::from_be_bytes(footer[..8].try_into().map_err(|_| {
             PithosError::Conversion("Failed to convert directory length bytes to u64".to_string())
         })?);
-        let parent_dir_start = file_len - parent_dir_len;
+        if parent_dir_len < 25 {
+            return Err(PithosError::DirectoryLengthMismatch {
+                expected: 25,
+                actual: parent_dir_len,
+            });
+        }
+        if parent_dir_len > self.limits.max_directory_bytes {
+            return Err(PithosError::LimitExceeded {
+                field: "directory",
+                limit: self.limits.max_directory_bytes,
+                actual: parent_dir_len,
+            });
+        }
+        let parent_dir_start = file_len.checked_sub(parent_dir_len).ok_or_else(|| {
+            PithosError::InvalidDirectoryRange("terminal directory exceeds archive".into())
+        })?;
+        let parent_dir_len_usize = usize::try_from(parent_dir_len).map_err(|_| {
+            PithosError::InvalidDirectoryRange("directory length does not fit platform".into())
+        })?;
 
-        // Last 4 bytes: crc32, next 8 bytes: directory length (u64, BE)
-        let _crc32 = u32::from_be_bytes(footer[8..12].try_into().map_err(|_| {
-            PithosError::Conversion("Failed to convert crc32 checksum bytes to u32".to_string())
-        })?);
-
-        self.file.seek(SeekFrom::End(0 - parent_dir_len as i64))?;
-        let mut dir_buf = vec![0u8; parent_dir_len as usize];
+        self.file.seek(SeekFrom::Start(parent_dir_start))?;
+        let mut dir_buf = Vec::new();
+        dir_buf
+            .try_reserve_exact(parent_dir_len_usize)
+            .map_err(|_| PithosError::LimitExceeded {
+                field: "directory allocation",
+                limit: self.limits.max_directory_bytes,
+                actual: parent_dir_len,
+            })?;
+        dir_buf.resize(parent_dir_len_usize, 0);
         self.file.read_exact(&mut dir_buf)?;
 
         // Deserialize full directory
         let mut available_file_keys = HashMap::new();
-        let mut directory = Directory::deserialize(&mut dir_buf.as_slice())?;
-        available_file_keys.extend(directory.decrypt_recipient(&self.private_key)?);
+        let mut directory = Self::parse_directory(&dir_buf, &self.limits)?;
+        available_file_keys.extend(
+            directory
+                .decrypt_recipient_with_limits(&self.private_key, &self.limits.deserialization)?,
+        );
 
         // Merge with parent directories
+        let mut visited = std::collections::HashSet::new();
+        let mut depth = 0u64;
+        let mut child_start = parent_dir_start;
         while let Some((start, len)) = directory.parent_directory_offset {
+            depth = depth
+                .checked_add(1)
+                .ok_or_else(|| PithosError::InvalidDirectoryChain("depth overflow".into()))?;
+            if depth > self.limits.max_parent_directories {
+                return Err(PithosError::LimitExceeded {
+                    field: "parent directories",
+                    limit: self.limits.max_parent_directories,
+                    actual: depth,
+                });
+            }
+            if len < 25 || len > self.limits.max_directory_bytes {
+                return Err(PithosError::InvalidDirectoryRange(
+                    "parent length out of bounds".into(),
+                ));
+            }
+            let end = start.checked_add(len).ok_or_else(|| {
+                PithosError::InvalidDirectoryRange("parent range overflow".into())
+            })?;
+            if end > child_start || !visited.insert((start, len)) {
+                return Err(PithosError::InvalidDirectoryChain(
+                    "parent must be backward and nonoverlapping".into(),
+                ));
+            }
+            let len_usize = usize::try_from(len).map_err(|_| {
+                PithosError::InvalidDirectoryRange("parent length does not fit platform".into())
+            })?;
             // Read parent directory
             self.file.seek(SeekFrom::Start(start))?;
-            let mut dir_buf = vec![0u8; len as usize];
+            let mut dir_buf = Vec::new();
+            dir_buf
+                .try_reserve_exact(len_usize)
+                .map_err(|_| PithosError::LimitExceeded {
+                    field: "directory allocation",
+                    limit: self.limits.max_directory_bytes,
+                    actual: len,
+                })?;
+            dir_buf.resize(len_usize, 0);
             self.file.read_exact(&mut dir_buf)?;
-            let mut older_directory = Directory::deserialize(&mut dir_buf.as_slice())?;
-            available_file_keys.extend(older_directory.decrypt_recipient(&self.private_key)?);
+            let mut older_directory = Self::parse_directory(&dir_buf, &self.limits)?;
+            available_file_keys.extend(
+                older_directory.decrypt_recipient_with_limits(
+                    &self.private_key,
+                    &self.limits.deserialization,
+                )?,
+            );
+            child_start = start;
 
             // Merge directories and swap
             older_directory.merge(directory)?;
@@ -113,7 +417,10 @@ impl PithosReaderSimple {
             .retain_mut(|id, path, file| match &mut file.block_data {
                 BlockDataState::Decrypted(_) => true,
                 BlockDataState::Encrypted(_) => match available_file_keys.get(&id) {
-                    Some(block_key) => match file.block_data.decrypt(block_key) {
+                    Some(block_key) => match file
+                        .block_data
+                        .decrypt_with_limits(block_key, &self.limits.deserialization)
+                    {
                         Ok(_) => {
                             tracing::info!("Successfully decrypted {path}");
                             true
@@ -126,6 +433,7 @@ impl PithosReaderSimple {
                     None => false,
                 },
             })?;
+        validate_map(&directory.files)?;
 
         Ok((directory, (parent_dir_start, parent_dir_len)))
     }
@@ -155,24 +463,44 @@ impl PithosReaderSimple {
     ) -> Result<(), PithosError> {
         let file_entry = directory
             .files
-            .get(&KeyQuery::Path(inner_path.to_string()))
+            .get_by_path(inner_path)
             .ok_or(PithosError::FileNotFound(inner_path.to_string()))?;
+        validate_existing_candidate(&directory.files, inner_path, file_entry)?;
 
         match &file_entry.file_type {
             FileType::Data | FileType::Metadata => {
-                // Write output
-                let mut output_target: Box<dyn Write> = if let Some(dest) = output_path {
-                    let target = if dest.is_dir() {
-                        &dest.join(inner_path)
+                if output_path.is_none() {
+                    let mut output_target: Box<dyn Write> = Box::new(io::stdout());
+                    if let Some(ranges) = ranges {
+                        for range in ranges {
+                            self.read_data_range_to_sink(
+                                range,
+                                file_entry,
+                                &directory.blocks,
+                                &mut output_target,
+                            )?;
+                        }
                     } else {
-                        dest
-                    };
-
-                    Box::new(File::create(target).map_err(PithosError::Io)?)
+                        self.read_data_to_sink(file_entry, &directory.blocks, output_target)?;
+                    }
+                    return Ok(());
+                }
+                let dest = output_path.unwrap();
+                let (root_path, final_path, create_root) = if dest.is_dir() {
+                    (dest.as_path(), inner_path.to_string(), false)
                 } else {
-                    Box::new(io::stdout())
+                    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+                    let name =
+                        dest.file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| {
+                                PithosError::Conversion("Invalid output file name".into())
+                            })?;
+                    (parent, name.to_string(), false)
                 };
-
+                let root = ExtractionRoot::open(root_path, create_root)?;
+                let pending = root.pending_file(&final_path)?;
+                let mut output_target: Box<dyn Write> = Box::new(pending.writer()?);
                 if let Some(ranges) = ranges {
                     for range in ranges {
                         self.read_data_range_to_sink(
@@ -185,21 +513,25 @@ impl PithosReaderSimple {
                 } else {
                     self.read_data_to_sink(file_entry, &directory.blocks, output_target)?;
                 }
+                pending.commit()?;
             }
             FileType::Directory => {
-                // Create directory (parent?)
-                create_dir(inner_path, output_path)?;
+                let root_path = output_path
+                    .map(PathBuf::as_path)
+                    .unwrap_or_else(|| Path::new("."));
+                ExtractionRoot::open(root_path, true)?.create_dir(inner_path)?;
             }
             FileType::Symlink => {
-                // Create symlink (UNIX only)
-                create_symlink(
-                    inner_path,
-                    file_entry
-                        .symlink_target
-                        .as_ref()
-                        .expect("Symlink has no target"),
-                    output_path,
-                )?;
+                let target = file_entry.symlink_target.as_deref().ok_or_else(|| {
+                    PithosError::InvalidSymlinkEntry {
+                        path: inner_path.into(),
+                        reason: "missing target".into(),
+                    }
+                })?;
+                let root_path = output_path
+                    .map(PathBuf::as_path)
+                    .unwrap_or_else(|| Path::new("."));
+                ExtractionRoot::open(root_path, true)?.create_symlink(inner_path, target)?;
             }
         }
 
@@ -270,25 +602,15 @@ impl PithosReaderSimple {
                         .get(hash)
                         .ok_or(PithosError::BlockHashNotFound(*hash))?;
 
-                    // Jump to begin of block in file
-                    self.file.seek(SeekFrom::Start(block_meta.offset))?;
+                    let mut block_buf = self.load_stored_block(block_meta)?;
 
-                    // Read block header for block start validation
-                    let mut block_header = [0u8; 4];
-                    self.file.read_exact(&mut block_header)?;
-                    BlockHeader::deserialize(&mut block_header.as_slice())?;
-
-                    // Read block data
-                    let mut block_buf = vec![0u8; block_meta.stored_size as usize];
-                    self.file.read_exact(&mut block_buf)?;
-
-                    // Decrypt and decompress according to ProcessingFlags
-                    if block_meta.flags.is_encrypted() {
-                        block_buf = decrypt_chunk(&block_buf, key)?;
-                    }
-                    if block_meta.flags.get_compression_level() > 0 {
-                        block_buf = decompress_data(&block_buf, block_meta.original_size)?;
-                    }
+                    block_buf = Self::decode_and_verify_block(
+                        block_buf,
+                        key,
+                        hash,
+                        block_meta,
+                        &self.limits,
+                    )?;
 
                     // Write chunk data in 64KiB ChaCha20Poly1305 encrypted blocks
                     let mut chunk_offset = 0;
@@ -362,34 +684,15 @@ impl PithosReaderSimple {
                         .get(hash)
                         .ok_or(PithosError::BlockHashNotFound(*hash))?;
 
-                    let mut block_header = [0u8; 4];
-                    let mut block_data = vec![0u8; block_meta.stored_size as usize];
-                    match &block_meta.location {
-                        BlockLocation::Local => {
-                            self.file.seek(SeekFrom::Start(block_meta.offset))?;
-                            // Read block header for block start validation
-                            self.file.read_exact(&mut block_header)?;
-                            BlockHeader::deserialize(&mut block_header.as_slice())?;
-                            // Read block data
-                            self.file.read_exact(&mut block_data)?;
-                        }
-                        BlockLocation::External { url } => {
-                            let mut response = reqwest::blocking::get(url).unwrap();
-                            // Read block header for block start validation
-                            response.read_exact(&mut block_header)?;
-                            BlockHeader::deserialize(&mut block_header.as_slice())?;
-                            // Read block data
-                            self.file.read_exact(&mut block_data)?;
-                        }
-                    }
+                    let mut block_data = self.load_stored_block(block_meta)?;
 
-                    // Decrypt and decompress according to ProcessingFlags
-                    if block_meta.flags.is_encrypted() {
-                        block_data = decrypt_chunk(&block_data, key)?;
-                    }
-                    if block_meta.flags.get_compression_level() > 0 {
-                        block_data = decompress_data(&block_data, block_meta.original_size)?;
-                    }
+                    block_data = Self::decode_and_verify_block(
+                        block_data,
+                        key,
+                        hash,
+                        block_meta,
+                        &self.limits,
+                    )?;
 
                     sink.write_all(&block_data)?;
                 }
@@ -407,7 +710,7 @@ impl PithosReaderSimple {
         block_index: &IndexMap<[u8; 32], BlockIndexEntry>,
         sink: &mut Box<dyn Write>,
     ) -> Result<(), PithosError> {
-        let mut block_byte_sum = 0;
+        let mut block_byte_sum: u64 = 0;
 
         match &file_entry.block_data {
             BlockDataState::Encrypted(_) => {
@@ -422,8 +725,13 @@ impl PithosReaderSimple {
                         .get(hash)
                         .ok_or(PithosError::BlockHashNotFound(*hash))?;
 
+                    Self::checked_stored_size(block_meta, &self.limits)?;
                     let block_start = block_byte_sum;
-                    let block_end = block_byte_sum + block_meta.original_size;
+                    let block_end = block_byte_sum
+                        .checked_add(block_meta.original_size)
+                        .ok_or_else(|| {
+                            PithosError::InvalidDirectoryRange("range block size overflow".into())
+                        })?;
                     block_byte_sum = block_end;
 
                     // If block ends before start of range; Discard block
@@ -436,33 +744,32 @@ impl PithosReaderSimple {
                         break;
                     }
 
-                    // Read block header for block start validation
-                    self.file.seek(SeekFrom::Start(block_meta.offset))?;
-                    let mut block_header = [0u8; 4];
-                    self.file.read_exact(&mut block_header)?;
-                    BlockHeader::deserialize(&mut block_header.as_slice())?;
+                    let mut block_buf = self.load_stored_block(block_meta)?;
 
-                    // Read block data
-                    let mut block_buf = vec![0u8; block_meta.stored_size as usize];
-                    self.file.read_exact(&mut block_buf)?;
-
-                    // Decrypt and decompress according to ProcessingFlags
-                    if block_meta.flags.is_encrypted() {
-                        block_buf = decrypt_chunk(&block_buf, key)?;
-                    }
-
-                    if block_meta.flags.get_compression_level() > 0 {
-                        block_buf = decompress_data(&block_buf, block_meta.original_size)?;
-                    }
+                    block_buf = Self::decode_and_verify_block(
+                        block_buf,
+                        key,
+                        hash,
+                        block_meta,
+                        &self.limits,
+                    )?;
 
                     // Calculate the range within this block to write
                     let write_start = if byte_range.start > block_start {
-                        (byte_range.start - block_start) as usize
+                        usize::try_from(byte_range.start - block_start).map_err(|_| {
+                            PithosError::InvalidDirectoryRange(
+                                "range index does not fit platform".into(),
+                            )
+                        })?
                     } else {
                         0
                     };
                     let write_end = if byte_range.end < block_end {
-                        (byte_range.end - block_start) as usize
+                        usize::try_from(byte_range.end - block_start).map_err(|_| {
+                            PithosError::InvalidDirectoryRange(
+                                "range index does not fit platform".into(),
+                            )
+                        })?
                     } else {
                         block_buf.len()
                     };

@@ -5,6 +5,8 @@ use std::fmt::{Display, Formatter};
 
 use crate::error::PithosError;
 use crate::helpers::file_entry_map::{FileEntryMap, Key};
+use crate::model::deserialization::DeserializationLimits;
+use crate::model::serialization::write_len_prefix;
 use indexmap::IndexMap;
 use integer_encoding::VarIntWriter;
 use std::fs::{Metadata, symlink_metadata};
@@ -23,9 +25,13 @@ impl Default for FileHeader {
     fn default() -> Self {
         FileHeader {
             magic: *b"PITH",
-            version: 0x0100,
+            version: Self::SUPPORTED_VERSION,
         }
     }
+}
+
+impl FileHeader {
+    pub const SUPPORTED_VERSION: u16 = 0x0100;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,7 +204,7 @@ impl BlockDataState {
             }
             BlockDataState::Decrypted(entries) => {
                 let mut data_bytes = Vec::new();
-                data_bytes.write_varint(entries.len())?;
+                write_len_prefix(&mut data_bytes, entries.len())?;
                 for (hash, key) in entries {
                     data_bytes.write_all(hash)?;
                     data_bytes.write_all(key)?;
@@ -214,11 +220,20 @@ impl BlockDataState {
 
     #[tracing::instrument(level = "trace", skip(self, key))]
     pub fn decrypt(&mut self, key: &[u8; 32]) -> Result<(), PithosError> {
+        self.decrypt_with_limits(key, &DeserializationLimits::default())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, key, limits))]
+    pub fn decrypt_with_limits(
+        &mut self,
+        key: &[u8; 32],
+        limits: &DeserializationLimits,
+    ) -> Result<(), PithosError> {
         match &self {
             BlockDataState::Encrypted(data) => {
                 let decrypted_bytes = decrypt_chunk(data, key)?;
-                let block_data_entries =
-                    self.deserialize_block_index(&mut decrypted_bytes.as_slice())?;
+                let block_data_entries = self
+                    .deserialize_block_index_with_limits(&mut decrypted_bytes.as_slice(), limits)?;
 
                 *self = BlockDataState::Decrypted(block_data_entries);
             }
@@ -382,7 +397,7 @@ impl FileEntry {
                 }
             }
             Content::Reference(_) => {
-                unimplemented!("Currently FileEntry cannot be created from Content::Reference")
+                return Err(PithosError::UnsupportedReferenceContent);
             }
         })
     }
@@ -557,7 +572,7 @@ impl RecipientSection {
             }
             RecipientData::Decrypted(entries) => {
                 let mut data_bytes = Vec::new();
-                data_bytes.write_varint(entries.len())?;
+                write_len_prefix(&mut data_bytes, entries.len())?;
                 for (idx, key) in entries {
                     data_bytes.write_varint(*idx)?;
                     data_bytes.write_all(key)?;
@@ -591,7 +606,7 @@ impl RecipientData {
             }
             RecipientData::Decrypted(entries) => {
                 let mut data_bytes = Vec::new();
-                data_bytes.write_varint(entries.len())?;
+                write_len_prefix(&mut data_bytes, entries.len())?;
                 for (idx, key) in entries {
                     data_bytes.write_varint(*idx)?;
                     data_bytes.write_all(key)?;
@@ -612,11 +627,21 @@ impl RecipientData {
         &mut self,
         shared_key: &SharedSecret,
     ) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
+        self.decrypt_with_limits(shared_key, &DeserializationLimits::default())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, shared_key, limits))]
+    pub fn decrypt_with_limits(
+        &mut self,
+        shared_key: &SharedSecret,
+        limits: &DeserializationLimits,
+    ) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
         let entries = match &self {
             RecipientData::Decrypted(entries) => entries.clone(),
             RecipientData::Encrypted(enc_data) => {
                 let dec_data = decrypt_chunk(enc_data, shared_key.as_bytes())?;
-                let entries = self.deserialize_decrypted_list(&mut dec_data.as_slice())?;
+                let entries =
+                    self.deserialize_decrypted_list_with_limits(&mut dec_data.as_slice(), limits)?;
 
                 *self = RecipientData::Decrypted(entries.clone());
                 entries

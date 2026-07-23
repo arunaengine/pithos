@@ -12,8 +12,9 @@
 
 <p align="center">
      <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dca282.svg" alt="Language: Rust"></a>
-     <a href="https://github.com/ArunaStorage/aruna-file/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-brightgreen.svg" alt="License: MIT"></a>
-     <a href="#"><img src="https://github.com/ArunaStorage/aruna-file/actions/workflows/push.yaml/badge.svg" alt="License: MIT"></a>
+     <a href="https://github.com/arunaengine/aruna-file/blob/main/LICENSE-MIT"><img src="https://img.shields.io/badge/License-MIT-brightgreen.svg" alt="License: MIT"></a>
+     <a href="https://github.com/arunaengine/aruna-file/blob/main/LICENSE-APACHE"><img src="https://img.shields.io/badge/License-APACHE-brightgreen.svg" alt="License: Apache 2.0"></a>
+     <a href="https://codecov.io/gh/ArunaStorage/pithos"><img src="https://codecov.io/github/arunaengine/pithos/coverage.svg?branch=main" alt="Codecov"></a>
 </p>
 
 <p align="center">🔑 A secure, fast and versatile package file format for object storage focused data management 📦</p>

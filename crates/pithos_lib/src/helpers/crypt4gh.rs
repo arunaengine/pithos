@@ -10,6 +10,9 @@ pub const CRYPT4GH_HEADER_MAGIC: [u8; 8] = [0x63, 0x72, 0x79, 0x70, 0x74, 0x34, 
 pub const CRYPT4GH_HEADER_VERSION: u32 = 1;
 pub const CRYPT4GH_BLOCK_SIZE: usize = 65536;
 pub const CRYPT4GH_ENCRYPTED_BLOCK_SIZE: usize = 65564;
+const PACKET_LENGTH_FIELD_SIZE: usize = size_of::<u32>();
+const MIN_PACKET_BODY_LENGTH: usize = size_of::<u32>() + 32 + 12 + 16;
+const MIN_PACKET_LENGTH: usize = PACKET_LENGTH_FIELD_SIZE + MIN_PACKET_BODY_LENGTH;
 
 #[derive(Debug, Error)]
 pub enum Crypt4GHError {
@@ -84,7 +87,9 @@ impl HeaderPacket {
                 })]);
             let mac = packet_data.encrypt(session_key.as_bytes(), &nonce)?;
             let header_packet = HeaderPacket {
-                length: 4 + 4 + 32 + 12 + packet_data.get_len() as u32 + 16,
+                length: u32::try_from(MIN_PACKET_LENGTH + packet_data.get_len()).map_err(|_| {
+                    Crypt4GHError::EncryptionError("header packet length".to_string())
+                })?,
                 encryption_method: 0,
                 writers_pubkey: sender_pubkey.to_bytes(),
                 nonce: nonce.into(),
@@ -200,19 +205,55 @@ impl TryFrom<&[u8]> for Crypt4GHHeader {
         header.packet_count = cursor
             .read_u32::<LittleEndian>()
             .map_err(|_| Crypt4GHError::FromBytesError("header size".to_string()))?;
-        //dbg!(&header.packet_count, &cursor.position());
+        let packet_count = usize::try_from(header.packet_count)
+            .map_err(|_| Crypt4GHError::FromBytesError("packet count".to_string()))?;
+        let position = usize::try_from(cursor.position())
+            .map_err(|_| Crypt4GHError::FromBytesError("packet position".to_string()))?;
+        let remaining = bytes.len().saturating_sub(position);
+        let minimum_packet_bytes = packet_count
+            .checked_mul(MIN_PACKET_LENGTH)
+            .ok_or_else(|| Crypt4GHError::FromBytesError("packet count".to_string()))?;
+        if minimum_packet_bytes > remaining {
+            return Err(Crypt4GHError::FromBytesError(
+                "packet count exceeds header".to_string(),
+            ));
+        }
+        header
+            .header_packets
+            .try_reserve_exact(packet_count)
+            .map_err(|_| Crypt4GHError::FromBytesError("packet allocation".to_string()))?;
 
-        for _ in 0..header.packet_count {
-            let len = cursor
-                .read_u32::<LittleEndian>()
-                .map_err(|_| Crypt4GHError::FromBytesError("packet length".to_string()))?;
-            let mut buf = vec![0; len as usize - 4]; // u32 of length already read
+        for _ in 0..packet_count {
+            let len = usize::try_from(
+                cursor
+                    .read_u32::<LittleEndian>()
+                    .map_err(|_| Crypt4GHError::FromBytesError("packet length".to_string()))?,
+            )
+            .map_err(|_| Crypt4GHError::FromBytesError("packet length".to_string()))?;
+            if len < MIN_PACKET_LENGTH {
+                return Err(Crypt4GHError::FromBytesError(
+                    "packet length below minimum".to_string(),
+                ));
+            }
+            let packet_bytes = len - PACKET_LENGTH_FIELD_SIZE;
+            let position = usize::try_from(cursor.position())
+                .map_err(|_| Crypt4GHError::FromBytesError("packet position".to_string()))?;
+            let remaining = bytes.len().saturating_sub(position);
+            if packet_bytes > remaining {
+                return Err(Crypt4GHError::FromBytesError(
+                    "packet exceeds header".to_string(),
+                ));
+            }
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(packet_bytes)
+                .map_err(|_| Crypt4GHError::FromBytesError("packet allocation".to_string()))?;
+            buf.resize(packet_bytes, 0);
             cursor
                 .read_exact(&mut buf)
                 .map_err(|_| Crypt4GHError::FromBytesError("packet data".to_string()))?;
             header
                 .header_packets
-                .push(HeaderPacket::from_buf(buf, len as usize)?);
+                .push(HeaderPacket::from_buf(buf, len)?);
         }
 
         Ok(header)
@@ -262,6 +303,11 @@ impl HeaderPacket {
 
     #[tracing::instrument(level = "trace", skip(bytes, len))]
     pub fn from_buf(bytes: Vec<u8>, len: usize) -> Result<Self, Crypt4GHError> {
+        if len < MIN_PACKET_LENGTH || bytes.len() < MIN_PACKET_BODY_LENGTH {
+            return Err(Crypt4GHError::FromBytesError(
+                "packet is too short".to_string(),
+            ));
+        }
         let mut bytes = Cursor::new(bytes);
         let encryption_method = bytes
             .read_u32::<LittleEndian>()
@@ -279,8 +325,17 @@ impl HeaderPacket {
         bytes
             .read_to_end(&mut packet_data)
             .map_err(|_| Crypt4GHError::FromBytesError("packet data and mac".to_string()))?;
-        let (enc, mac) = packet_data.split_at(packet_data.len() - 16);
-        let encrypted_packet_data = PacketData::Encrypted(enc.to_vec());
+        let mac_start = packet_data
+            .len()
+            .checked_sub(16)
+            .ok_or_else(|| Crypt4GHError::FromBytesError("packet MAC".to_string()))?;
+        let (enc, mac) = packet_data.split_at(mac_start);
+        let mut encrypted_data = Vec::new();
+        encrypted_data
+            .try_reserve_exact(enc.len())
+            .map_err(|_| Crypt4GHError::FromBytesError("packet data allocation".to_string()))?;
+        encrypted_data.extend_from_slice(enc);
+        let encrypted_packet_data = PacketData::Encrypted(encrypted_data);
 
         Ok(HeaderPacket {
             length: u32::try_from(len)
@@ -318,7 +373,7 @@ impl HeaderPacket {
         self.mac = self.packet_data.encrypt(session_key.as_bytes(), &nonce)?;
         self.writers_pubkey = PublicKey::from(&sender_key).to_bytes();
         self.nonce = nonce.into();
-        self.length = (4 + 4 + 32 + 12 + self.packet_data.get_len() + 16)
+        self.length = (MIN_PACKET_LENGTH + self.packet_data.get_len())
             .try_into()
             .map_err(|_| Crypt4GHError::EncryptionError("header packet length".to_string()))?;
         Ok(())

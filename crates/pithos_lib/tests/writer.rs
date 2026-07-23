@@ -4,18 +4,22 @@ use crate::common::util::{
     create_pithos_writer, extract_pithos_entry, load_test_keys, minimal_ro_crate_metadata,
     read_pithos_directory, write_zip_entries,
 };
+use indexmap::IndexMap;
 use pithos_lib::error::PithosError;
+use pithos_lib::helpers::directory::DirectoryBuilder;
 use pithos_lib::helpers::file_entry_map::KeyQuery;
 use pithos_lib::helpers::ro_crate::{LoadedRoCrate, read_ro_crate_directory, read_ro_crate_zip};
 use pithos_lib::helpers::x25519_keys::private_key_from_pem_bytes;
-use pithos_lib::io::pithosreader::PithosReaderSimple;
+use pithos_lib::io::pithosreader::{PithosReaderSimple, ReaderLimits};
 use pithos_lib::io::pithoswriter::{Content, InputFile, PithosWriter};
-use pithos_lib::model::structs::{FileType, Reference};
-use std::fs::{
-    File, copy, create_dir_all, read, read_dir, read_link, read_to_string, remove_file,
-    symlink_metadata, write,
+use pithos_lib::model::structs::{
+    BlockIndexEntry, BlockLocation, FileEntry, FileType, ProcessingFlags, Reference,
 };
-use std::io::Read;
+use std::cell::Cell;
+use std::fs::{
+    File, copy, create_dir_all, read, read_dir, read_link, read_to_string, remove_file, write,
+};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use x25519_dalek::StaticSecret;
@@ -53,12 +57,165 @@ fn metadata_reference() -> Reference {
     }
 }
 
+struct CountingReader {
+    cursor: Cursor<Vec<u8>>,
+    reads: std::rc::Rc<Cell<usize>>,
+}
+
+impl Read for CountingReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.reads.set(self.reads.get() + 1);
+        self.cursor.read(buffer)
+    }
+}
+
 fn read_zip_member(path: &Path, name: &str) -> Vec<u8> {
     let mut archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
     let mut member = archive.by_name(name).unwrap();
     let mut bytes = Vec::new();
     member.read_to_end(&mut bytes).unwrap();
     bytes
+}
+
+fn assert_compression_round_trip(
+    payload: &[u8],
+    compression_level: u8,
+    encrypt: bool,
+    cdc: Option<(usize, usize, usize)>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let source_path = temp_dir.path().join("input.bin");
+    write(&source_path, payload).unwrap();
+
+    let (pithos_path, reader_key, mut writer) = create_pithos_writer(&temp_dir, cdc);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "input.bin".to_string(),
+            data: Content::File(source_path.to_string_lossy().into_owned()),
+            metadata: None,
+            encrypt,
+            compression_level: Some(compression_level),
+        })
+        .unwrap();
+    writer.write_directory().unwrap();
+
+    let (directory, _) = read_pithos_directory(&pithos_path, &reader_key).unwrap();
+    for block in directory.blocks.values() {
+        assert_eq!(block.flags.is_encrypted(), encrypt);
+        let stored_level = block.flags.get_compression_level();
+        if compression_level == 0 {
+            assert_eq!(stored_level, 0);
+            if !encrypt {
+                assert_eq!(block.stored_size, block.original_size);
+            }
+        } else {
+            assert!(stored_level == 0 || stored_level == compression_level);
+        }
+    }
+    assert_eq!(
+        extract_pithos_entry(&pithos_path, &reader_key, "input.bin", &temp_dir),
+        payload
+    );
+}
+
+fn deterministic_incompressible_payload(length: usize) -> Vec<u8> {
+    let mut state = 0x243f_6a88_u32;
+    (0..length)
+        .map(|index| {
+            state = state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223)
+                .rotate_left((index % 31) as u32);
+            (state ^ (index as u32)).to_le_bytes()[index % 4]
+        })
+        .collect()
+}
+
+#[test]
+fn test_compression_levels_round_trip() {
+    let payloads = [
+        ("repeated", vec![b'A'; 16 * 1024]),
+        (
+            "incompressible",
+            deterministic_incompressible_payload(16 * 1024),
+        ),
+    ];
+
+    for (_, payload) in payloads {
+        for compression_level in 0..=7 {
+            for encrypt in [false, true] {
+                assert_compression_round_trip(&payload, compression_level, encrypt, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_compression_empty_level_zero_round_trip() {
+    for encrypt in [false, true] {
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("empty.bin");
+        write(&source_path, []).unwrap();
+
+        let (pithos_path, reader_key, mut writer) = create_pithos_writer(&temp_dir, None);
+        writer.write_file_header().unwrap();
+        writer
+            .process_input(InputFile {
+                file_type: FileType::Data,
+                inner_path: "empty.bin".to_string(),
+                data: Content::File(source_path.to_string_lossy().into_owned()),
+                metadata: None,
+                encrypt,
+                compression_level: Some(0),
+            })
+            .unwrap();
+        writer.write_directory().unwrap();
+
+        let (directory, _) = read_pithos_directory(&pithos_path, &reader_key).unwrap();
+        assert!(directory.blocks.is_empty());
+        assert_eq!(
+            extract_pithos_entry(&pithos_path, &reader_key, "empty.bin", &temp_dir),
+            Vec::<u8>::new()
+        );
+    }
+}
+
+#[test]
+fn test_compression_multiblock_level_zero_round_trip() {
+    let payload = deterministic_incompressible_payload(16 * 1024);
+    for encrypt in [false, true] {
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("multiblock.bin");
+        write(&source_path, &payload).unwrap();
+
+        let (pithos_path, reader_key, mut writer) =
+            create_pithos_writer(&temp_dir, Some((256, 512, 1024)));
+        writer.write_file_header().unwrap();
+        writer
+            .process_input(InputFile {
+                file_type: FileType::Data,
+                inner_path: "multiblock.bin".to_string(),
+                data: Content::File(source_path.to_string_lossy().into_owned()),
+                metadata: None,
+                encrypt,
+                compression_level: Some(0),
+            })
+            .unwrap();
+        writer.write_directory().unwrap();
+
+        let (directory, _) = read_pithos_directory(&pithos_path, &reader_key).unwrap();
+        assert!(directory.blocks.len() > 1);
+        for block in directory.blocks.values() {
+            assert_eq!(block.flags.get_compression_level(), 0);
+            assert_eq!(block.flags.is_encrypted(), encrypt);
+        }
+        assert_eq!(
+            extract_pithos_entry(&pithos_path, &reader_key, "multiblock.bin", &temp_dir),
+            payload
+        );
+    }
 }
 
 fn write_raw_zip(path: &Path, entries: &[(&str, &[u8], u32)], overlap_duplicates: bool) {
@@ -235,6 +392,200 @@ fn test_append_single_file() {
     assert_eq!(key.path(), "SRR33138449.sample.fastq");
     assert_eq!(entry.file_type, FileType::Data);
     assert_eq!(entry.file_size, 342848);
+}
+
+#[test]
+fn format_006_append_reuses_ancestor_block_without_repointing() {
+    let temp_dir = TempDir::new().unwrap();
+    let payload = "format-006 ancestor block reuse\n".repeat(64).into_bytes();
+    let (path, reader_key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "base.bin".into(),
+            data: Content::Raw(String::from_utf8(payload.clone()).unwrap()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    writer.write_directory().unwrap();
+    drop(writer);
+
+    let base_bytes = read(&path).unwrap();
+    let (base_directory, _) = read_pithos_directory(&path, &reader_key).unwrap();
+    assert_eq!(base_directory.blocks.len(), 1);
+    let (hash, original_block) = base_directory.blocks.first().unwrap();
+    let hash = *hash;
+    let original_block = original_block.clone();
+
+    let (writer_key, reader_public_key, _) = load_test_keys();
+    let mut writer =
+        PithosWriter::new_from_file(writer_key, vec![reader_public_key], None, &path).unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "child.bin".into(),
+            data: Content::Raw(String::from_utf8(payload.clone()).unwrap()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        base_bytes.len() as u64
+    );
+    assert!(writer.get_directory_mut().blocks.is_empty());
+    writer.write_directory().unwrap();
+    drop(writer);
+
+    let final_bytes = read(&path).unwrap();
+    assert!(final_bytes.starts_with(&base_bytes));
+    let (directory, _) = read_pithos_directory(&path, &reader_key).unwrap();
+    assert_eq!(directory.blocks.len(), 1);
+    assert_eq!(directory.blocks.get(&hash), Some(&original_block));
+    assert!(directory.get_file_by_path("base.bin").is_some());
+    assert!(directory.get_file_by_path("child.bin").is_some());
+    assert_eq!(
+        extract_pithos_entry(&path, &reader_key, "base.bin", &temp_dir),
+        payload
+    );
+    remove_file(temp_dir.path().join("extracted-entry")).unwrap();
+    assert_eq!(
+        extract_pithos_entry(&path, &reader_key, "child.bin", &temp_dir),
+        payload
+    );
+}
+
+#[test]
+fn format_006_merge_preserves_older_compatible_block_record() {
+    let hash = [7; 32];
+    let older = BlockIndexEntry {
+        offset: 10,
+        stored_size: 20,
+        original_size: 30,
+        flags: ProcessingFlags::new(false, Some(0)),
+        location: BlockLocation::Local,
+    };
+    let newer = BlockIndexEntry {
+        offset: 40,
+        stored_size: 50,
+        original_size: 30,
+        flags: ProcessingFlags::new(true, Some(7)),
+        location: BlockLocation::External {
+            url: "https://example.invalid/block".into(),
+        },
+    };
+    let mut older_directory = DirectoryBuilder::new()
+        .blocks(IndexMap::from_iter([(hash, older.clone())]))
+        .build()
+        .unwrap();
+    let newer_directory = DirectoryBuilder::new()
+        .blocks(IndexMap::from_iter([(hash, newer)]))
+        .build()
+        .unwrap();
+
+    older_directory.merge(newer_directory).unwrap();
+
+    assert_eq!(older_directory.blocks.get(&hash), Some(&older));
+}
+
+#[test]
+fn format_006_merge_rejects_conflicting_original_size() {
+    let hash = [9; 32];
+    let mut older_directory = DirectoryBuilder::new()
+        .blocks(IndexMap::from_iter([(
+            hash,
+            BlockIndexEntry {
+                offset: 10,
+                stored_size: 20,
+                original_size: 30,
+                flags: ProcessingFlags::new(false, Some(0)),
+                location: BlockLocation::Local,
+            },
+        )]))
+        .build()
+        .unwrap();
+    let newer_directory = DirectoryBuilder::new()
+        .blocks(IndexMap::from_iter([(
+            hash,
+            BlockIndexEntry {
+                offset: 40,
+                stored_size: 50,
+                original_size: 31,
+                flags: ProcessingFlags::new(true, Some(7)),
+                location: BlockLocation::Local,
+            },
+        )]))
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        older_directory.merge(newer_directory),
+        Err(PithosError::BlockIndexConflict {
+            hash: actual_hash,
+            existing_original_size: 30,
+            new_original_size: 31,
+        }) if actual_hash == hash
+    ));
+}
+
+#[test]
+fn new_from_file_with_limits_accepts_exact_terminal_directory_length() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, sender_key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "file.txt".into(),
+            data: Content::Raw("payload".into()),
+            metadata: None,
+            encrypt: true,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    writer.write_directory().unwrap();
+
+    let bytes = read(&path).unwrap();
+    let directory_length =
+        u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
+    let limits = ReaderLimits {
+        max_directory_bytes: directory_length,
+        ..ReaderLimits::default()
+    };
+    PithosWriter::new_from_file_with_limits(sender_key, vec![], None, &path, limits).unwrap();
+}
+
+#[test]
+fn new_from_file_with_limits_rejects_smaller_terminal_directory_length() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, sender_key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer.write_directory().unwrap();
+
+    let bytes = read(&path).unwrap();
+    let directory_length =
+        u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
+    let limits = ReaderLimits {
+        max_directory_bytes: directory_length - 1,
+        ..ReaderLimits::default()
+    };
+    let error =
+        match PithosWriter::new_from_file_with_limits(sender_key, vec![], None, &path, limits) {
+            Ok(_) => panic!("directory limit should reject the archive"),
+            Err(error) => error,
+        };
+    assert!(matches!(
+        error,
+        PithosError::LimitExceeded {
+            field: "directory",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -664,8 +1015,8 @@ fn test_rocrate_zip_synthesizes_parent_directories() {
 fn test_rocrate_zip_preserves_and_extracts_symlink() {
     let temp_dir = TempDir::new().unwrap();
     let zip_path = temp_dir.path().join("symlink.zip");
-    let target = temp_dir.path().join("outside-target");
-    let target_string = target.to_string_lossy().into_owned();
+    let target = PathBuf::from("target");
+    let target_string = "target";
     let metadata = minimal_ro_crate_metadata(&[]);
     write_raw_zip(
         &zip_path,
@@ -682,10 +1033,7 @@ fn test_rocrate_zip_preserves_and_extracts_symlink() {
     let entry = directory.get_file_by_path("link").unwrap();
 
     assert_eq!(entry.file_type, FileType::Symlink);
-    assert_eq!(
-        entry.symlink_target.as_deref(),
-        Some(target_string.as_str())
-    );
+    assert_eq!(entry.symlink_target.as_deref(), Some(target_string));
     assert!(entry.references.is_empty());
 
     let output_dir = temp_dir.path().join("extracted");
@@ -697,7 +1045,340 @@ fn test_rocrate_zip_preserves_and_extracts_symlink() {
         .unwrap();
 
     assert_eq!(read_link(output_dir.join("link")).unwrap(), target);
-    assert!(symlink_metadata(temp_dir.path().join("outside-target")).is_err());
+}
+
+#[test]
+fn test_writer_rejects_unsafe_paths_before_block_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+    let result = writer.process_input(InputFile {
+        file_type: FileType::Data,
+        inner_path: "../outside".into(),
+        data: Content::Raw("payload".into()),
+        metadata: None,
+        encrypt: false,
+        compression_level: Some(0),
+    });
+    assert!(matches!(
+        result,
+        Err(PithosError::InvalidArchivePath { .. })
+    ));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+}
+
+#[test]
+fn test_writer_rejects_candidate_ancestor_before_metadata_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "a".into(),
+            data: Content::Raw("existing".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        writer
+            .process_input(InputFile {
+                file_type: FileType::Data,
+                inner_path: "a/child".into(),
+                data: Content::Raw("child".into()),
+                metadata: Some(Content::Raw("metadata".into())),
+                encrypt: false,
+                compression_level: Some(0),
+            })
+            .is_err()
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+}
+
+#[test]
+fn test_writer_duplicate_main_preflight_is_atomic() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "duplicate".into(),
+            data: Content::Raw("existing".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    let before_bytes = read(&path).unwrap();
+    let before_directory = writer.get_directory_mut().clone();
+
+    let error = writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "duplicate".into(),
+            data: Content::Raw("non-empty data".into()),
+            metadata: Some(Content::Raw("metadata".into())),
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap_err();
+
+    assert!(matches!(error, PithosError::PathOccupied(_)));
+    assert_eq!(read(&path).unwrap(), before_bytes);
+    assert_eq!(*writer.get_directory_mut(), before_directory);
+}
+
+#[test]
+fn test_writer_generated_metadata_duplicate_preflight_is_atomic() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Metadata,
+            inner_path: "generated.meta".into(),
+            data: Content::Raw("existing metadata".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    let before_bytes = read(&path).unwrap();
+    let before_directory = writer.get_directory_mut().clone();
+
+    let error = writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "generated".into(),
+            data: Content::Raw("data".into()),
+            metadata: Some(Content::Raw("new metadata".into())),
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap_err();
+
+    assert!(matches!(error, PithosError::PathOccupied(_)));
+    assert_eq!(read(&path).unwrap(), before_bytes);
+    assert_eq!(*writer.get_directory_mut(), before_directory);
+}
+
+#[test]
+fn test_writer_process_file_entry_duplicate_preflight_is_atomic() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "duplicate".into(),
+            data: Content::Raw("existing".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    let before_bytes = read(&path).unwrap();
+    let before_directory = writer.get_directory_mut().clone();
+    let mut entry =
+        FileEntry::new_from_content(FileType::Data, &Content::Raw("data".into())).unwrap();
+    let original_entry = entry.clone();
+    let reads = std::rc::Rc::new(Cell::new(0));
+
+    let error = writer
+        .process_file_entry(
+            "duplicate",
+            &mut entry,
+            &ProcessingFlags::new(false, Some(0)),
+            CountingReader {
+                cursor: Cursor::new(b"unconsumed data".to_vec()),
+                reads: reads.clone(),
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, PithosError::PathOccupied(_)));
+    assert_eq!(reads.get(), 0);
+    assert_eq!(entry, original_entry);
+    assert_eq!(read(&path).unwrap(), before_bytes);
+    assert_eq!(*writer.get_directory_mut(), before_directory);
+}
+
+#[test]
+fn test_writer_append_active_segment_duplicate_preflight_preserves_base_archive() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, reader_key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "base".into(),
+            data: Content::Raw("base data".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    writer.write_directory().unwrap();
+    drop(writer);
+
+    let before_bytes = read(&path).unwrap();
+    let (writer_key, reader_public_key, _) = load_test_keys();
+    let mut writer =
+        PithosWriter::new_from_file(writer_key, vec![reader_public_key], None, &path).unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Directory,
+            inner_path: "duplicate".into(),
+            data: Content::Raw(String::new()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    let staged_directory = writer.get_directory_mut().clone();
+
+    let error = writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "duplicate".into(),
+            data: Content::Raw("non-empty data".into()),
+            metadata: Some(Content::Raw("metadata".into())),
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap_err();
+    assert!(matches!(error, PithosError::PathOccupied(_)));
+    assert_eq!(read(&path).unwrap(), before_bytes);
+    assert_eq!(*writer.get_directory_mut(), staged_directory);
+    drop(writer);
+
+    assert_eq!(read(&path).unwrap(), before_bytes);
+    assert_eq!(
+        extract_pithos_entry(&path, &reader_key, "base", &temp_dir),
+        b"base data"
+    );
+}
+
+#[test]
+fn test_writer_rejects_reverse_ancestor_and_metadata_conflicts_before_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let (path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    writer.write_file_header().unwrap();
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "a/child".into(),
+            data: Content::Raw("child".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    let before_ancestor = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        writer
+            .process_input(InputFile {
+                file_type: FileType::Data,
+                inner_path: "a".into(),
+                data: Content::Raw("ancestor".into()),
+                metadata: None,
+                encrypt: false,
+                compression_level: Some(0),
+            })
+            .is_err()
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before_ancestor);
+
+    writer
+        .process_input(InputFile {
+            file_type: FileType::Data,
+            inner_path: "metadata.meta/child".into(),
+            data: Content::Raw("existing metadata".into()),
+            metadata: None,
+            encrypt: false,
+            compression_level: Some(0),
+        })
+        .unwrap();
+    let before_metadata = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        writer
+            .process_input(InputFile {
+                file_type: FileType::Data,
+                inner_path: "metadata".into(),
+                data: Content::Raw("data".into()),
+                metadata: Some(Content::Raw("metadata".into())),
+                encrypt: false,
+                compression_level: Some(0),
+            })
+            .is_err()
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before_metadata);
+}
+
+#[test]
+fn test_writer_rejects_unsafe_symlink_targets() {
+    let temp_dir = TempDir::new().unwrap();
+    let (_path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    let mut entry = pithos_lib::model::structs::FileEntry {
+        file_type: FileType::Symlink,
+        block_data: pithos_lib::model::structs::BlockDataState::Decrypted(vec![]),
+        created: 0,
+        modified: 0,
+        file_size: 0,
+        permissions: 0o777,
+        references: vec![],
+        symlink_target: Some("/outside".into()),
+    };
+    assert!(matches!(
+        writer.process_file_entry(
+            "link",
+            &mut entry,
+            &pithos_lib::model::structs::ProcessingFlags(0),
+            std::io::Cursor::new(Vec::<u8>::new())
+        ),
+        Err(PithosError::InvalidSymlinkTarget { .. })
+    ));
+}
+
+#[test]
+fn test_writer_rejects_unsafe_rocrate_absolute_symlink_target() {
+    let temp_dir = TempDir::new().unwrap();
+    let zip_path = temp_dir.path().join("unsafe-link.zip");
+    let metadata = minimal_ro_crate_metadata(&[]);
+    write_raw_zip(
+        &zip_path,
+        &[
+            ("ro-crate-metadata.json", metadata.as_bytes(), 0),
+            ("link", b"/outside", 0o120777),
+        ],
+        false,
+    );
+    let loaded = read_ro_crate_zip(&zip_path).unwrap();
+    let (_path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    assert!(writer.process_ro_crate(&loaded).is_err());
+}
+
+#[test]
+fn test_writer_rejects_unsafe_rocrate_root_escaping_symlink_target() {
+    let temp_dir = TempDir::new().unwrap();
+    let zip_path = temp_dir.path().join("unsafe-link.zip");
+    let metadata = minimal_ro_crate_metadata(&[]);
+    write_raw_zip(
+        &zip_path,
+        &[
+            ("ro-crate-metadata.json", metadata.as_bytes(), 0),
+            ("link", b"../outside", 0o120777),
+        ],
+        false,
+    );
+    let loaded = read_ro_crate_zip(&zip_path).unwrap();
+    let (_path, _key, mut writer) = create_pithos_writer(&temp_dir, None);
+    assert!(writer.process_ro_crate(&loaded).is_err());
 }
 
 #[test]
@@ -811,9 +1492,11 @@ fn test_rocrate_directory_zip_parity() {
 
     assert_eq!(directory_entries, zip_entries);
     for path in ["ro-crate-metadata.json", "nested/file.txt", "unlisted.txt"] {
+        let directory_output = TempDir::new().unwrap();
+        let zip_output = TempDir::new().unwrap();
         let directory_bytes =
-            extract_pithos_entry(&directory_pithos, &directory_key, path, &temp_dir);
-        let zip_bytes = extract_pithos_entry(&zip_pithos, &zip_key, path, &temp_dir);
+            extract_pithos_entry(&directory_pithos, &directory_key, path, &directory_output);
+        let zip_bytes = extract_pithos_entry(&zip_pithos, &zip_key, path, &zip_output);
         assert_eq!(directory_bytes, zip_bytes, "{path}");
     }
     assert_eq!(

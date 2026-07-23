@@ -1,16 +1,14 @@
 use crate::error::PithosError;
 use crate::helpers::file_entry_map::{FileEntryMap, Key, KeyQuery};
-use crate::model::serialization::encode_string;
 use crate::model::structs::{RecipientData, RecipientSection};
 use crate::model::{
+    deserialization::DeserializationLimits,
     serialization::SerializationError,
     structs::{BlockIndexEntry, Directory, EncryptionSection, FileEntry},
 };
 use crc32fast::Hasher;
 use indexmap::IndexMap;
 use indexmap::map::Entry;
-use integer_encoding::VarIntWriter;
-use std::io::Write;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct DirectoryBuilder {
@@ -20,7 +18,6 @@ pub struct DirectoryBuilder {
     blocks: IndexMap<[u8; 32], BlockIndexEntry>,
     relations: Vec<(u64, String)>,
     encryption: IndexMap<[u8; 32], EncryptionSection>,
-    dir_len: u64,
 }
 
 impl Default for DirectoryBuilder {
@@ -39,7 +36,6 @@ impl DirectoryBuilder {
             blocks: IndexMap::new(),
             relations: Self::default_relations(),
             encryption: IndexMap::new(),
-            dir_len: 25,
         }
     }
 
@@ -94,12 +90,6 @@ impl DirectoryBuilder {
         self
     }
 
-    #[tracing::instrument(level = "trace", skip(self, dir_len))]
-    pub fn dir_len(mut self, dir_len: u64) -> Self {
-        self.dir_len = dir_len;
-        self
-    }
-
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn build(self) -> Result<Directory, SerializationError> {
         let mut directory = Directory {
@@ -109,9 +99,10 @@ impl DirectoryBuilder {
             blocks: self.blocks,
             relations: self.relations,
             encryption: self.encryption,
-            dir_len: self.dir_len,
+            dir_len: 0,
             crc32: 0,
         };
+        directory.update_len()?;
         directory.update_crc32()?;
         Ok(directory)
     }
@@ -195,7 +186,20 @@ impl Directory {
         block_hash: [u8; 32],
         block_entry: BlockIndexEntry,
     ) -> Result<(), PithosError> {
-        self.blocks.insert(block_hash, block_entry);
+        match self.blocks.entry(block_hash) {
+            Entry::Occupied(existing) => {
+                if existing.get().original_size != block_entry.original_size {
+                    return Err(PithosError::BlockIndexConflict {
+                        hash: block_hash,
+                        existing_original_size: existing.get().original_size,
+                        new_original_size: block_entry.original_size,
+                    });
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(block_entry);
+            }
+        }
         Ok(())
     }
 
@@ -203,7 +207,7 @@ impl Directory {
     pub fn add_file(&mut self, path: &str, file_entry: &FileEntry) -> Result<(), PithosError> {
         let key = Key::new(
             self.files
-                .next_free_id(self.parent_directory_offset.is_some()),
+                .next_free_id(self.parent_directory_offset.is_some())?,
             path.to_owned(),
         );
         self.files.insert(key, file_entry.clone())
@@ -315,7 +319,7 @@ impl Directory {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub fn next_free_file_index(&self) -> u64 {
+    pub fn next_free_file_index(&self) -> Result<u64, PithosError> {
         self.files
             .next_free_id(self.parent_directory_offset.is_some())
         /*
@@ -374,6 +378,15 @@ impl Directory {
         &mut self,
         reader_key: &StaticSecret,
     ) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
+        self.decrypt_recipient_with_limits(reader_key, &DeserializationLimits::default())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, reader_key, limits))]
+    pub fn decrypt_recipient_with_limits(
+        &mut self,
+        reader_key: &StaticSecret,
+        limits: &DeserializationLimits,
+    ) -> Result<Vec<(u64, [u8; 32])>, PithosError> {
         // Store for decrypted sections
         let mut available_file_indices = Vec::<(u64, [u8; 32])>::new();
         let reader_pubkey = PublicKey::from(reader_key);
@@ -384,7 +397,9 @@ impl Directory {
                 let shared_key = reader_key.diffie_hellman(&PublicKey::from(*key));
                 match &r_section.recipient_data {
                     RecipientData::Encrypted(_) => {
-                        let entries = r_section.recipient_data.decrypt(&shared_key)?;
+                        let entries = r_section
+                            .recipient_data
+                            .decrypt_with_limits(&shared_key, limits)?;
                         available_file_indices.extend(entries);
                     }
                     RecipientData::Decrypted(entries) => {
@@ -408,7 +423,10 @@ impl Directory {
             match e_section.recipients.entry(*reader_pubkey.as_bytes()) {
                 Entry::Occupied(ref mut entry) => match &entry.get().recipient_data {
                     RecipientData::Encrypted(_) => {
-                        let entries = entry.get_mut().recipient_data.decrypt(&shared_key)?;
+                        let entries = entry
+                            .get_mut()
+                            .recipient_data
+                            .decrypt_with_limits(&shared_key, limits)?;
                         available_file_indices.extend(entries);
                     }
                     RecipientData::Decrypted(entries) => {
@@ -428,41 +446,19 @@ impl Directory {
     pub fn update_len(&mut self) -> Result<(), SerializationError> {
         let mut buf = Vec::new();
         self.serialize(&mut buf)?;
-        self.dir_len = buf.len() as u64;
+        self.dir_len = u64::try_from(buf.len())
+            .map_err(|_| SerializationError::Other("length does not fit in u64".to_string()))?;
         Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn update_crc32(&mut self) -> Result<(), SerializationError> {
         let mut buf = Vec::new();
-        if let Some((start, len)) = self.parent_directory_offset {
-            buf.extend(&[1u8]);
-            buf.write_varint(start)?;
-            buf.write_varint(len)?;
-        }
-        for (id, path, file) in &self.files {
-            buf.write_varint(id)?;
-            encode_string(&mut buf, path)?;
-            file.serialize(&mut buf)?
-        }
-        for (hash, block) in &self.blocks {
-            buf.write_all(hash)?;
-            block.serialize(&mut buf)?
-        }
-        buf.write_varint(self.relations.len() as u64)?;
-        for (idx, name) in &self.relations {
-            buf.write_varint(*idx)?;
-            encode_string(&mut buf, name)?;
-        }
-        for (key, enc) in &self.encryption {
-            buf.write_all(key)?;
-            enc.serialize(&mut buf)?
-        }
-        buf.write_varint(self.dir_len)?;
+        self.serialize(&mut buf)?;
 
         // Calculate CRC32 checksum
         let mut hasher = Hasher::new();
-        hasher.update(&buf);
+        hasher.update(&buf[..buf.len() - 4]);
         self.crc32 = hasher.finalize();
 
         Ok(())
