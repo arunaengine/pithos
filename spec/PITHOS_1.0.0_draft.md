@@ -242,15 +242,26 @@ pub struct Directory {
 | `dir_len` | Fixed-width `u64be` |
 | `crc32` | Fixed-width `u32be` |
 
-The parent option tag is `00` for no parent and `01` for a parent. Readers MUST
-reject other parent tags, duplicate relationship IDs, duplicate sender public
-keys, duplicate file IDs, duplicate file paths, or duplicate block hashes.
+The parent option tag is `00` for no parent and `01` for a parent, followed by
+the parent's zero-based start and complete length as ULEB128 values. The
+selected chain MUST have exactly one root directory, whose parent tag is `00`.
+For tag `01`, the parent range MUST be within the file, end no later than the
+child directory start, and have the same length as the parent's embedded
+`dir_len`. Readers MUST use checked arithmetic for all ranges and validate each
+parent's marker, length, CRC, and exact byte consumption before merging.
+Readers MUST reject self-links, cycles, repeated parent ranges, forward links,
+overlapping parent and child ranges, and invalid parent tags. Readers MAY
+enforce documented chain-depth and total-directory-byte limits; exceeding one
+MUST return a resource-limit error without exposing a partial archive view.
+
+Readers MUST reject duplicate relationship IDs, duplicate sender public keys,
+duplicate file IDs, duplicate file paths, or duplicate block hashes.
 
 The directory marker MUST be exactly the eight ASCII bytes `PITHOSDR`. 
 The final 12 directory bytes MUST be `dir_len:u64be || crc32:u32be`, where `dir_len` is the complete directory length from the marker through the CRC, inclusive. 
 The CRC MUST be CRC-32/ISO-HDLC with width 32, polynomial `0x04C11DB7`, initial value`0xFFFFFFFF`, reflected input and output, and final XOR `0xFFFFFFFF` (the check value for ASCII `123456789` is `0xCBF43926`). 
 It MUST cover every exact serialized byte from the marker through the fixed-width `dir_len`, excluding only the stored final CRC. 
-Readers MUST validate the marker, embedded length, CRC, and exact parser consumption for the terminal directory and independently for every parent directory before decrypting, merging, or otherwise using its metadata. Invalid directories MUST be rejected.
+Readers MUST validate the marker, embedded length, CRC, and exact parser consumption for the terminal directory before decrypting, merging, or otherwise using its metadata. Invalid directories MUST be rejected.
 
 #### 4.3.1 Terminal Directory Lookup
 
