@@ -144,7 +144,7 @@ ProcessingFlags records the compression level and whether a block is encrypted.
 bitflags::bitflags! {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ProcessingFlags: u8 {
-        // Bits 0-2: Compression level (0=none, 1-7=implementation-defined)
+        // Bits 0-2: Compression (0=none; 1-7=Zstandard)
         const COMPRESSION_LEVEL_1 = 0b0000_0001;
         const COMPRESSION_LEVEL_2 = 0b0000_0010;
         const COMPRESSION_LEVEL_3 = 0b0000_0011;
@@ -166,7 +166,7 @@ bitflags::bitflags! {
 
 | Bits | Meaning |
 | --- | --- |
-| 0-2 | Compression level: `0` is none; `1` through `7` are implementation-defined |
+| 0-2 | Compression: `0` means the stored payload is not compressed; `1` through `7` each mean the stored payload is one standard Zstandard frame |
 | 3 | Encryption enabled: `0` is disabled; `1` is enabled |
 | 4-7 | Reserved; all bits MUST be zero |
 
@@ -584,11 +584,27 @@ AAD. A redesign of any of these inputs requires a new format version.
 
 ### 5.4 Compression
 
-Implementations SHOULD support:
-- Level 0: No compression
-- Levels 1-3: Fast compression (e.g., Zstd levels 1-3)
-- Levels 4-6: Balanced compression (e.g., Zstd levels 4-9)
-- Level 7: Maximum compression (e.g., Zstd level 19+)
+The compression value in ProcessingFlags describes the stored payload actually
+written. Value `0` means the stored payload is not compressed. Each nonzero
+value from `1` through `7` means the stored payload is one standard Zstandard
+frame. Readers that support compression MUST decode any valid Zstandard frame
+and bound decompressed output by `original_size`; they do not need the writer's
+compression level.
+Readers MUST reject ProcessingFlags with any nonzero reserved bit.
+
+The current writer mapping is optional implementation guidance: `1` to Zstandard
+level `1`, `2` to `4`, `3` to `8`, `4` to `11`, `5` to `15`, `6` to `18`, and
+`7` to `22`. A writer MAY abandon unhelpful compression and store the plaintext
+payload instead, but MUST then write compression value `0`. For example, a
+writer MAY use a 4096-byte sample and a 0.85 compression-ratio threshold to
+decide whether compression is helpful; this heuristic is not a compatibility
+rule.
+
+Conforming encoders need not produce byte-identical Zstandard output. A future
+conformance appendix MUST provide decode-direction vectors containing stored
+compressed bytes, `original_size`, the expected plaintext, and its expected
+32-byte BLAKE3 hash. These vectors MUST decode to the expected plaintext with
+different supported Zstandard versions.
 
 ## 6. Operations Overview
 
