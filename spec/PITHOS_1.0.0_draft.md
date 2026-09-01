@@ -35,6 +35,9 @@ A Pithos file MUST have the following structure:
 [Directory]       // REQUIRED: File MUST end with directory
 ```
 
+Each segment ends immediately after its Directory. Encryption sections, when
+present, are items in that Directory's `encryption` vector.
+
 ### 3.1 Common Encoding Rules
 
 The following rules define the bytes stored in the file for every structure in
@@ -195,7 +198,8 @@ location in this file; the block-boundary rules are specified separately.
 
 ### 4.3 Directory Structure
 
-A Directory contains the metadata for one appended archive segment.
+A Directory contains the metadata for one appended archive segment, which ends
+after the directory.
 
 ```rust
 /// Directory - lists all files and blocks in this segment
@@ -398,7 +402,8 @@ the count. Readers MUST consume both fields for every reference.
 
 ### 4.5 Encryption Section
 
-Encryption sections carry per-sender recipient data.
+Encryption sections are items in `Directory.encryption` and carry per-sender
+recipient data.
 
 #### 4.5.1 EncryptionSection
 
@@ -546,7 +551,7 @@ Implementations SHOULD support:
 2. Process files in correct directory order
 3. Chunk content using content-defined chunking
 4. Deduplicate blocks by hash
-5. Write directory and encryption sections
+5. Write a directory, including its encryption sections when present
 6. Validate complete structure
 
 ### 6.3 Directory Tree Operations
@@ -561,7 +566,7 @@ When archiving directory trees:
 
 1. Implementations MUST verify the complete plaintext block size and hash after authenticated
    decryption and decompression, and before releasing output derived from the block
-2. CRC32 values MUST be validated for directories and encryption sections
+2. Directory CRC32 values MUST be validated
 3. Convergent encryption reveals when identical files exist (accepted trade-off)
 4. External block URLs MUST use HTTPS in production environments
 5. Path traversal attacks MUST be prevented through validation
