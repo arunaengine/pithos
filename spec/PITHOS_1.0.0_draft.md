@@ -57,22 +57,32 @@ Section 4:
 
 ### 4.1 File Header
 
-Every Pithos file MUST begin with a FileHeader:
+A FileHeader identifies a Pithos file and its format version.
 
 ```rust
 /// File header - appears once at the beginning of every Pithos file
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
-    pub magic: [u8; 4],    // MUST be b"PITH"
-    pub version: u16,      // Format version (e.g., 0x0100 for 1.0)
+    pub magic: [u8; 4],    // b"PITH"
+    pub version: u16,      // fixed-width big-endian, 0x0100 for 1.0
 }
 ```
+
+**Encoded Form**
+
+| Field | Bytes stored in the file |
+| --- | --- |
+| `magic` | Exactly 4 bytes: ASCII `PITH` |
+| `version` | Fixed-width `u16be` |
+
+Readers MUST reject a header whose magic is not `PITH` or whose version is not
+`0x0100`. The encoded form is exactly six bytes: `PITH 01 00`.
 
 ### 4.2 Block Storage
 
 #### 4.2.1 Block Header
 
-Each block MUST be preceded by a minimal header for emergency scanning:
+A BlockHeader marks the beginning of locally stored block data.
 
 ```rust
 /// Minimal block header - just for emergency scanning
@@ -82,24 +92,52 @@ pub struct BlockHeader {
 }
 ```
 
+**Encoded Form**
+
+| Field | Bytes stored in the file |
+| --- | --- |
+| `marker` | Exactly 4 bytes: ASCII `BLCK` |
+
+Readers MUST reject a block header whose marker is not `BLCK`.
+
 #### 4.2.2 Block Index Entry
 
-Complete block metadata MUST be stored in the directory:
+The hash-keyed block descriptor describes one block stored or referenced by a directory.
 
 ```rust
-/// Block index entry - single source of truth for block hashes
+/// Block descriptor body; its hash is the key in Directory::blocks
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockIndexEntry {
-    pub index: u64,              // Unique sequential identifier (varint encoded)
-    pub hash: [u8; 32],          // Full Blake3 hash of original content
     pub offset: u64,             // Byte offset in file (varint encoded)
     pub stored_size: u64,        // Size as stored (compressed/encrypted) (varint)
     pub original_size: u64,      // Original uncompressed size (varint)
     pub flags: ProcessingFlags,  // Compression, encryption settings
     pub location: BlockLocation, // Where block data resides
 }
+```
 
-/// Processing flags packed into single byte
+**Encoded Form**
+
+The directory block sequence is a vector. Each item is encoded as follows:
+
+| Field | Bytes stored in the file |
+| --- | --- |
+| `block_hash` | Exactly 32 bytes: BLAKE3 hash of the original block content |
+| `offset` | ULEB128 `u64` |
+| `stored_size` | ULEB128 `u64` |
+| `original_size` | ULEB128 `u64` |
+| `flags` | One ProcessingFlags byte: bits 0-2 compression level, bit 3 encryption enabled, bits 4-7 zero |
+| `location` | One tag byte: `00` local, or `01` followed by a URL string for external |
+
+Readers MUST reject duplicate block hashes in one directory and MUST use the
+32-byte hash as the block's only identity.
+
+#### 4.2.3 Processing Flags
+
+ProcessingFlags records the compression level and whether a block is encrypted.
+
+```rust
+/// Processing flags packed into one byte
 bitflags::bitflags! {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ProcessingFlags: u8 {
@@ -119,7 +157,24 @@ bitflags::bitflags! {
         // Bits 4-7: Reserved for future use (MUST be zero)
     }
 }
+```
 
+**Encoded Form**
+
+| Bits | Meaning |
+| --- | --- |
+| 0-2 | Compression level: `0` is none; `1` through `7` are implementation-defined |
+| 3 | Encryption enabled: `0` is disabled; `1` is enabled |
+| 4-7 | Reserved; all bits MUST be zero |
+
+ProcessingFlags is stored as exactly one byte. Readers MUST reject a value with
+any reserved bit set.
+
+#### 4.2.4 Block Location
+
+BlockLocation states where the bytes for a block can be obtained.
+
+```rust
 /// Block storage location
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockLocation {
@@ -128,9 +183,19 @@ pub enum BlockLocation {
 }
 ```
 
+**Encoded Form**
+
+| Tag | Variant | Bytes after the tag |
+| --- | --- | --- |
+| `00` | `Local` | None |
+| `01` | `External` | `url` as a string |
+
+Readers MUST reject unknown tags. A local block's offset and size describe its
+location in this file; the block-boundary rules are specified separately.
+
 ### 4.3 Directory Structure
 
-The directory MUST contain all file and block metadata:
+A Directory contains the metadata for one appended archive segment.
 
 ```rust
 /// Directory - lists all files and blocks in this segment
@@ -138,14 +203,31 @@ The directory MUST contain all file and block metadata:
 pub struct Directory {
     pub identifier: [u8; 8],                            // MUST be exactly ASCII b"PITHOSDR"
     pub parent_directory_offset: Option<(u64, u64)>,    // Previous directory (start, len) (varint, backwards chain)
-    pub files: Vec<FileEntry>,                          // Files in this segment
-    pub blocks: Vec<BlockIndexEntry>,                   // Blocks in this segment
+    pub files: Vec<(u64, String, FileEntry)>,           // File ID, path, and body
+    pub blocks: Vec<([u8; 32], BlockIndexEntry)>,       // Block hash and body
     pub relations: Vec<(u64, String)>,                  // Relation idx, relationname / id
-    pub encryption: Vec<EncryptionSection>,
+    pub encryption: Vec<([u8; 32], EncryptionSection)>, // Sender key and body
     pub dir_len: u64,
     pub crc32: u32,                                     // CRC-32/ISO-HDLC of serialized bytes through dir_len
 }
 ```
+
+**Encoded Form**
+
+| Field | Bytes stored in the file |
+| --- | --- |
+| `identifier` | Exactly 8 bytes: ASCII `PITHOSDR` |
+| `parent_directory_offset` | Option tag, then, for tag `01`, tuple of ULEB128 `start` and ULEB128 `len` |
+| `files` | Vector of records: ULEB128 `file_id`, path string, then FileEntry body |
+| `blocks` | Vector of items: `block_hash[32]`, then ULEB128 `offset`, ULEB128 `stored_size`, ULEB128 `original_size`, one flags byte, and location |
+| `relations` | Vector of tuples: ULEB128 relationship ID followed by relationship-name string |
+| `encryption` | Vector, which MAY be empty, of items: `sender_public_key[32]`, then a recipient-record vector |
+| `dir_len` | Fixed-width `u64be` |
+| `crc32` | Fixed-width `u32be` |
+
+The parent option tag is `00` for no parent and `01` for a parent. Readers MUST
+reject other parent tags, duplicate relationship IDs, duplicate sender public
+keys, duplicate file IDs, duplicate file paths, or duplicate block hashes.
 
 The directory marker MUST be exactly the eight ASCII bytes `PITHOSDR`. 
 The final 12 directory bytes MUST be `dir_len:u64be || crc32:u32be`, where `dir_len` is the complete directory length from the marker through the CRC, inclusive. 
@@ -185,54 +267,102 @@ data/                    (too late - subdirectory already referenced this)
 
 #### 4.4.1 File Types
 
-Files MUST be classified by type:
+FileType identifies the kind of a directory file record.
 
 ```rust
 /// File types (u8 representation for efficiency)
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
-    Data = 0,        // Regular data file (default)
-    Metadata = 1,    // Metadata file (RO-Crate, DataCite, etc.)
-    Directory = 2,   // Directory entry
+    Directory = 0,   // Directory entry
+    Data = 1,        // Regular data file
+    Metadata = 2,    // Metadata file (RO-Crate, DataCite, etc.)
     Symlink = 3,     // Symbolic link
     // Values 4-255 reserved for future use
 }
 ```
 
-#### 4.4.2 File Entry
+**Encoded Form**
 
-Each file MUST be represented by a FileEntry:
+| Byte | Variant |
+| --- | --- |
+| `00` | `Directory` |
+| `01` | `Data` |
+| `02` | `Metadata` |
+| `03` | `Symlink` |
+
+FileType is stored as exactly one byte. Readers MUST reject values from `04`
+through `ff`.
+
+#### 4.4.2 Block Data State
+
+BlockDataState stores either encrypted file block data or a decrypted block list.
 
 ```rust
-
-
 pub enum BlockDataState {
     Encrypted(Vec<u8>),             // Nonce + ChaCha20Poly1305
-    Decrypted(Vec<(u64, [u8; 32])>) // Index / SHAKE256 hash
+    Decrypted(Vec<([u8; 32], [u8; 32])>), // Block hash and block key
 }
+```
 
+**Encoded Form**
 
+| Tag | Variant | Bytes after the tag |
+| --- | --- | --- |
+| `00` | `Encrypted` | Vector of bytes |
+| `01` | `Decrypted` | Vector of tuples, each `block_hash[32] || block_key[32]` |
+
+Readers MUST reject unknown tags. The block hash is the only block identity in a
+decrypted block-list entry.
+
+#### 4.4.3 File Entry
+
+Each directory file record identifies and names one file, then stores its FileEntry body.
+
+```rust
 
 /// File entry - describes a single file, directory, or symlink
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
-    pub file_id: u64,                    // Sequential unique identifier (varint)
-    pub path: String,                    // Full path from archive root (UTF-8)
     pub file_type: FileType,             // Type of entry
     pub block_data: BlockDataState,
     pub created: u64,                    // Unix timestamp (seconds since epoch)
     pub modified: u64,                   // Unix timestamp (seconds since epoch)
     pub file_size: u64,                  // Total size in bytes (varint)
     pub permissions: u32,                // Unix-style permissions
-    pub references: Vec<Reference>,      // Data->Metadata references only
+    pub references: Vec<Reference>,      // References from this file
     pub symlink_target: Option<String>,  // Target path for symlinks
 }
 ```
 
-#### 4.4.3 File References
+**Encoded Form**
 
-References MUST be one-way from metadata to data files:
+The directory file sequence is a vector. Each record is encoded as follows:
+
+| Field | Bytes stored in the file |
+| --- | --- |
+| `file_id` | ULEB128 `u64` |
+| `path` | String |
+| `FileEntry` body | Fields in the following table |
+
+| FileEntry body field | Bytes stored in the file |
+| --- | --- |
+| `file_type` | FileType encoded form above |
+| `block_data` | Tag `00` and byte vector, or tag `01` and vector of `block_hash[32] || block_key[32]` tuples |
+| `created` | ULEB128 `u64` |
+| `modified` | ULEB128 `u64` |
+| `file_size` | ULEB128 `u64` |
+| `permissions` | ULEB128 `u32` |
+| `references` | Vector of tuples: ULEB128 `target_file_id` followed by ULEB128 `relationship` |
+| `symlink_target` | Option tag, then, for tag `01`, a target string |
+
+The `symlink_target` option tag is `00` for no target and `01` for a target.
+Readers MUST reject other tags. File IDs and paths are record fields, not fields
+of the FileEntry body.
+
+#### 4.4.4 File References
+
+A Reference identifies a target file and the relationship from the containing file to it.
 
 ```rust
 /// Simplified reference structure
@@ -242,6 +372,16 @@ pub struct Reference {
     pub relationship: u64,      // Relationship type (varint)
 }
 ```
+
+**Encoded Form**
+
+| Field | Bytes stored in the file |
+| --- | --- |
+| `target_file_id` | ULEB128 `u64` |
+| `relationship` | ULEB128 `u64` |
+
+References have no tag or length of their own; their containing vector provides
+the count. Readers MUST consume both fields for every reference.
 
 **Standard relationship types:**
 - `DESCRIBES = 0`:        Metadata describing target
@@ -258,29 +398,76 @@ pub struct Reference {
 
 ### 4.5 Encryption Section
 
-Encryption sections MUST follow each directory:
+Encryption sections carry per-sender recipient data.
+
+#### 4.5.1 EncryptionSection
+
+An EncryptionSection contains the recipient records associated with one sender public key.
 
 ```rust
 /// Encryption section - privacy-preserving access control
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptionSection {
-    pub sender_public_key: [u8; 32],       // X25519 public key
-    pub recipients: Vec<RecipientSection>, // Per-recipient data
+    pub recipients: Vec<([u8; 32], RecipientSection)>, // Recipient key and body
 }
+```
 
-pub enum RecipientData {
-    Encrypted(Vec<u8>),             // Chacha + nonce
-    Decrypted(Vec<(u64, [u8; 32])>) // Fileindex / Shake256 hash
-}
+**Encoded Form**
 
+The Directory `encryption` vector stores each sender public key as the leading
+32 bytes of its item, followed by this EncryptionSection body:
 
+| Field | Bytes stored in the file |
+| --- | --- |
+| `recipients` | Vector of records: `recipient_public_key[32]` followed by RecipientSection body |
+
+Sender public keys are exactly 32 bytes. Readers MUST reject a duplicate sender
+key within a directory.
+
+#### 4.5.2 RecipientSection
+
+A RecipientSection contains the data associated with one recipient public key.
+
+```rust
 /// Per-recipient encrypted data
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecipientSection {
-    pub recipient_public_key: [u8; 32],  // Recipient's X25519 public key
     pub recipient_data: RecipientData,   // Encrypted FileKeyEntry list
 }
 ```
+
+**Encoded Form**
+
+Each recipient record stores its recipient public key as the leading 32 bytes,
+followed by this RecipientSection body:
+
+| Field | Bytes stored in the file |
+| --- | --- |
+| `recipient_data` | Tag `00` and byte vector, or tag `01` and vector of ULEB128 `file_id` plus `file_key[32]` tuples |
+
+Recipient public keys are exactly 32 bytes. Readers MUST reject a duplicate
+recipient key within an EncryptionSection.
+
+#### 4.5.3 RecipientData
+
+RecipientData stores either encrypted recipient data or a decrypted file-key list.
+
+```rust
+pub enum RecipientData {
+    Encrypted(Vec<u8>),             // Chacha + nonce
+    Decrypted(Vec<(u64, [u8; 32])>) // File ID and file key
+}
+```
+
+**Encoded Form**
+
+| Tag | Variant | Bytes after the tag |
+| --- | --- | --- |
+| `00` | `Encrypted` | Vector of bytes |
+| `01` | `Decrypted` | Vector of tuples, each ULEB128 `file_id` followed by `file_key[32]` |
+
+Readers MUST reject unknown tags and duplicate file IDs in a decrypted
+recipient-data list.
 
 ### 4.6 Error Types
 
