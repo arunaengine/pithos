@@ -296,10 +296,12 @@ relationship ID are invalid. Exact repeated recipient grants are allowed;
 conflicting grants for the same sender public key and recipient public key are
 invalid.
 
-The root directory MUST contain these ten standard relationship definitions:
-`DESCRIBES`, `ANNOTATES`, `DERIVED_FROM`, `SOURCE_OF`, `PREVIOUS_VERSION`,
-`NEXT_VERSION`, `PART_OF`, `CONTAINS`, `INPUT_TO`, and `OUTPUT_FROM`.
-Appended directories inherit these definitions and MAY repeat them exactly.
+The root directory MUST store these ten standard relationship definitions in its
+`relations` vector, in ascending relationship-ID order: `0 DESCRIBES`,
+`1 ANNOTATES`, `2 DERIVED_FROM`, `3 SOURCE_OF`, `4 PREVIOUS_VERSION`,
+`5 NEXT_VERSION`, `6 PART_OF`, `7 CONTAINS`, `8 INPUT_TO`, and
+`9 OUTPUT_FROM`. Appended directories inherit these definitions and MAY repeat
+one only when its relationship ID and stored name match exactly.
 
 For example, three segments with parent order `root <- append-1 <- append-2`
 merge as follows:
@@ -440,7 +442,9 @@ of the FileEntry body.
 
 #### 4.4.4 File References
 
-A Reference identifies a target file and the relationship from the containing file to it.
+A Reference identifies a target file and a relationship. The file containing the
+Reference is the source, and `target_file_id` identifies the target. Any file
+type MAY be a source or target.
 
 ```rust
 /// Simplified reference structure
@@ -459,20 +463,35 @@ pub struct Reference {
 | `relationship` | ULEB128 `u64` |
 
 References have no tag or length of their own; their containing vector provides
-the count. Readers MUST consume both fields for every reference.
+the count. Readers MUST consume both fields for every reference. The target file
+ID and relationship ID MUST each exist in the effective archive.
 
 **Standard relationship types:**
-- `DESCRIBES = 0`:        Metadata describing target
-- `ANNOTATES = 1`:        Additional annotations
-- `DERIVED_FROM = 2`:     Derived from target
-- `SOURCE_OF = 3`:        Source of target
-- `PREVIOUS_VERSION = 4`: Previous version
-- `NEXT_VERSION = 5`:     Next version
-- `PART_OF = 6`:          Part of collection
-- `CONTAINS = 7`:         Contains target
-- `INPUT_TO = 8`:         Input to process
-- `OUTPUT_FROM = 9`:      Output from process
-- Custom relationships start at `1000`
+
+| ID | Stored name | Meaning |
+| --- | --- | --- |
+| 0 | `DESCRIBES` | The source describes the target. |
+| 1 | `ANNOTATES` | The source annotates the target. |
+| 2 | `DERIVED_FROM` | The source is derived from the target. |
+| 3 | `SOURCE_OF` | The source is a source of the target. |
+| 4 | `PREVIOUS_VERSION` | The source is the previous version of the target. |
+| 5 | `NEXT_VERSION` | The source is the next version of the target. |
+| 6 | `PART_OF` | The source is part of the target. |
+| 7 | `CONTAINS` | The source contains the target. |
+| 8 | `INPUT_TO` | The source is an input to the target. |
+| 9 | `OUTPUT_FROM` | The source is an output from the target. |
+
+Custom relationship IDs MUST be at least `1000`; their stored names MUST be
+non-empty UTF-8 strings.
+
+For example, a reference from `normalized.csv` to `raw.csv` with
+`DERIVED_FROM` means `normalized.csv` is derived from `raw.csv`; reversing the
+reference means `raw.csv` is derived from `normalized.csv`. A reference from
+`raw.csv` to `normalized.csv` with `SOURCE_OF` means `raw.csv` is a source of
+`normalized.csv`. A reference from `report-v1.pdf` to `report-v2.pdf` with
+`PREVIOUS_VERSION` means `report-v1.pdf` is the previous version of
+`report-v2.pdf`; reversing it with `NEXT_VERSION` means `report-v2.pdf` is the
+next version of `report-v1.pdf`.
 
 ### 4.5 Encryption Section
 
