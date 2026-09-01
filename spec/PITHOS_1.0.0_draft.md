@@ -103,14 +103,14 @@ pub struct BlockHeader {
 
 Readers MUST reject a block header whose marker is not `BLCK`.
 
-#### 4.2.2 Block Index Entry
+#### 4.2.2 Block Descriptor
 
 The hash-keyed block descriptor describes one block stored or referenced by a directory.
 
 ```rust
 /// Block descriptor body; its hash is the key in Directory::blocks
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockIndexEntry {
+pub struct BlockDescriptor {
     pub offset: u64,             // Byte offset in file (varint encoded)
     pub stored_size: u64,        // Size as stored (compressed/encrypted) (varint)
     pub original_size: u64,      // Original uncompressed size (varint)
@@ -125,7 +125,7 @@ The directory block sequence is a vector. Each item is encoded as follows:
 
 | Field | Bytes stored in the file |
 | --- | --- |
-| `block_hash` | Exactly 32 bytes: BLAKE3 hash of the original block content |
+| `block_hash` | Exactly 32 bytes: block hash as defined in Section 5.2 |
 | `offset` | ULEB128 `u64` |
 | `stored_size` | ULEB128 `u64` |
 | `original_size` | ULEB128 `u64` |
@@ -221,7 +221,7 @@ pub struct Directory {
     pub identifier: [u8; 8],                            // MUST be exactly ASCII b"PITHOSDR"
     pub parent_directory_offset: Option<(u64, u64)>,    // Previous directory (start, len) (varint, backwards chain)
     pub files: Vec<(u64, String, FileEntry)>,           // File ID, path, and body
-    pub blocks: Vec<([u8; 32], BlockIndexEntry)>,       // Block hash and body
+    pub blocks: Vec<([u8; 32], BlockDescriptor)>,       // Block hash and body
     pub relations: Vec<(u64, String)>,                  // Relation idx, relationname / id
     pub encryption: Vec<([u8; 32], EncryptionSection)>, // Sender key and body
     pub dir_len: u64,
@@ -389,11 +389,9 @@ pub enum BlockDataState {
 | `00` | `Encrypted` | Vector of bytes |
 | `01` | `Decrypted` | Vector of tuples, each `block_hash[32] || block_key[32]` |
 
-Readers MUST reject unknown tags. The block hash is the only block identity in a
-decrypted block-list entry. A decrypted block list is a ULEB128 count followed
-by that many `block_hash[32] || block_key[32]` pairs. A repeated block hash is
-valid only when it has the same block key; readers MUST reject a conflicting
-duplicate hash and block key.
+Readers MUST reject unknown tags. A decrypted block list is a ULEB128 count
+followed by that many `block_hash[32] || block_key[32]` pairs. Block-list
+identity, reuse, and validation are defined in Section 5.2.
 
 #### 4.4.3 File Entry
 
@@ -612,12 +610,39 @@ Implementations SHOULD use content-defined chunking with recommended parameters:
 
 ### 5.2 Block Hashing
 
-Each block identifier MUST be the full 32-byte default unkeyed BLAKE3 digest of the exact
-plaintext chunk before compression or encryption. Readers MUST retrieve the stored block,
-authenticate and decrypt it when encrypted, decompress it when compressed using the recorded
-original size as the output bound, require the resulting plaintext length to equal the recorded
-original size, compute the complete plaintext digest, and compare it with the block identifier
-before releasing any output derived from that block.
+The block hash is the full 32-byte default unkeyed BLAKE3 digest of the exact
+plaintext chunk before compression or encryption. It is a block's only
+identity. The Directory `blocks` vector is keyed by block hash, and each file's
+block list is an ordered sequence of `(block_hash, block_key)` pairs. That order
+reconstructs the file.
+
+Every block hash referenced by a file MUST resolve to exactly one effective
+descriptor after the directory chain is merged. A repeated hash in one file is
+valid only if every occurrence carries the same block key; otherwise readers
+MUST reject the file. Two files MAY reference the same hash and effective
+descriptor. Deduplication is a writer choice: a writer MAY store the same
+plaintext again, provided the directory conflict rules in Section 4.3.2 are
+satisfied.
+
+Using checked arithmetic, readers MUST sum the `original_size` of each
+referenced effective descriptor and require the result to equal `file_size`. An
+empty file has `file_size` zero and an empty block list.
+
+Readers MUST retrieve each stored block, authenticate and decrypt it when
+encrypted, decompress it when compressed using the recorded original size as
+the output bound, require the resulting plaintext length to equal the recorded
+original size, compute the complete plaintext digest, and compare it with the
+block hash before releasing any output derived from that block.
+
+Examples, where `H` and `J` are distinct block hashes and `K` and `L` are block
+keys:
+
+| Case | Block lists or directory records | Validity and reconstruction result |
+| --- | --- | --- |
+| Reuse by two files | `a: [(H, K)]`; `b: [(H, K)]` | Valid. Both files reconstruct from the effective descriptor for `H`. |
+| Repetition in one file | `a: [(H, K), (H, K)]` | Valid. `a` reconstructs as the plaintext for `H` followed by itself. |
+| Conflicting key | `a: [(H, K), (H, L)]` | Invalid. The file is rejected. |
+| Later-segment size conflict | Root has `H` with `original_size: 4`; an appended directory has `H` with `original_size: 5` | Invalid. The appended directory is rejected; no effective descriptor is selected from it. |
 
 ### 5.3 Convergent Encryption
 
@@ -679,7 +704,7 @@ different supported Zstandard versions.
 1. Read and validate file header
 2. Locate and validate the terminal directory using the direct lookup in Section 4.3.1
 3. Validate directory ordering
-4. Build block index
+4. Build the effective block-descriptor mapping
 5. Extract files by reading referenced blocks
 
 ### 6.2 Writing Operations
