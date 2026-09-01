@@ -586,6 +586,7 @@ pub enum PithosError {
     Crypt4GH(#[from] Crypt4GHError),
     Cipher(#[from] ChaChaPoly1305Error),
     Compression(#[from] ZstdError),
+    UnsupportedFeature(String),
     InvalidBlockDataState(String),
     BlockHashNotFound([u8; 32]),
     FileNotFound(String),
@@ -709,25 +710,62 @@ When archiving directory trees:
 
 ## 8. Implementation Requirements
 
-### 8.1 Mandatory Features
+### 8.1 Base Reader and Writer
 
-Implementations MUST support:
-- Reading and writing base format (version 1.0)
-- Blake3 hashing
-- ULEB128 encoding/decoding
-- CRC32 calculation
-- UTF-8 string handling
-- All four file types (Data, Metadata, Directory, Symlink)
-- Directory ordering validation (parents before children)
-- Path format validation (relative paths only)
+A base reader supports the version 1.0 structure, including its required
+validation, and can read local blocks whose ProcessingFlags have compression
+value `0` and encryption bit `0`. It supports decrypted BlockDataState lists.
+A base writer can create an archive containing only such local blocks and an
+empty Directory `encryption` vector.
 
-### 8.2 Optional Features
+The following table defines the optional capabilities. A reader discovers a
+needed capability from the stored fields; it does not use a profile or a
+negotiation record.
 
-Implementations MAY support:
-- Compression (levels 1-7)
-- Encryption (ChaCha20-Poly1305)
-- External block storage
-- Content-defined chunking
+| Capability | Stored indication |
+| --- | --- |
+| Block compression | ProcessingFlags compression bits are `1` through `7` |
+| Block encryption | ProcessingFlags encryption bit is `1` |
+| Encrypted block lists | BlockDataState tag is `00` (`Encrypted`) |
+| Encrypted recipient lists | RecipientData tag is `00` (`Encrypted`) |
+| External storage | BlockLocation tag is `01` (`External`) |
+
+Compression, block encryption, encrypted block lists, encrypted recipient
+lists, and external storage are optional capabilities. An implementation that
+supports an optional capability MUST process it according to its definition in
+this specification.
+
+### 8.2 Unavailable Content
+
+A reader MUST validate and list an archive whose known-version, known-tag
+structure contains content requiring an unsupported optional capability. It
+MUST mark only the affected content unavailable; unaffected entries remain
+readable. Attempting to read unavailable content MUST return
+`UnsupportedFeature` before releasing any output derived from that content.
+The reader MUST NOT reinterpret bytes requiring an unsupported capability as
+uncompressed or unencrypted bytes.
+
+| Block form | Listing result | Content-read result |
+| --- | --- | --- |
+| Plain local: local, compression `0`, encryption `0` | Listed | Readable by a base reader |
+| Compressed local: local, compression `1` through `7`, encryption `0` | Listed | Readable only with block-compression capability; otherwise unavailable |
+| Encrypted local: local, compression `0`, encryption `1` | Listed | Readable only with block-encryption capability and any encrypted-list capability needed to obtain its block key; otherwise unavailable |
+| External: BlockLocation `External` | Listed | Readable only with external-storage capability and every capability required by its flags and data states; otherwise unavailable |
+| Combined: compression and encryption, at either location | Listed | Readable only when every indicated capability is supported; otherwise unavailable |
+
+For the table, an encrypted BlockDataState requires encrypted-block-list
+capability, and an encrypted RecipientData required to obtain its file key
+requires encrypted-recipient-list capability. A content read that needs either
+unsupported list form is unavailable even when its block flags themselves are
+otherwise supported.
+
+Readers MUST reject an unsupported header version and any unknown tag rather
+than list the archive, because the structure of such input is not known.
+
+Pithos 1.0 intentionally permits decrypted block and recipient list variants
+and an empty Directory `encryption` vector. This differs from the current 0.8
+writer, which requires encrypted file block lists and encrypted recipient
+lists, although it can disable block-payload encryption.
 
 ### 8.3 Platform-Specific Considerations
 
