@@ -264,7 +264,42 @@ To locate the terminal directory during normal reading:
 
 Normal reading MUST reject trailing bytes, truncation, underflow, a false marker, and a torn final append. It MUST NOT fall back to an older directory. Salvage is a separate mode; if it locates an older directory, it MUST label the result incomplete.
 
-#### 4.3.2 Directory Entry and Path Ordering
+#### 4.3.2 Append Chains
+
+Each Directory contains the entries introduced by its segment. To construct the
+effective archive, readers merge the selected directory chain from its oldest
+directory to its newest directory. An append adds file entries, block
+descriptors, relationship definitions, and recipient grants. Version 1.0 has
+no deletion, replacement, or tombstone.
+
+File IDs and paths MUST be unique across the chain. Writers assign file ID 0
+to the first file and assign each later file ID as the current maximum ID plus
+1. Readers MUST accept unused file-ID gaps. A rename adds a file record with a
+new file ID and path; the old record remains in the effective archive.
+
+A repeated block hash in one directory is invalid. Across directories, a block
+hash MAY reappear only when its `original_size` is the same. The descriptor in
+the oldest directory remains the effective descriptor. Exact repeated
+relationship definitions are allowed; conflicting definitions of one
+relationship ID are invalid. Exact repeated recipient grants are allowed;
+conflicting grants for the same sender public key and recipient public key are
+invalid.
+
+The root directory MUST contain these ten standard relationship definitions:
+`DESCRIBES`, `ANNOTATES`, `DERIVED_FROM`, `SOURCE_OF`, `PREVIOUS_VERSION`,
+`NEXT_VERSION`, `PART_OF`, `CONTAINS`, `INPUT_TO`, and `OUTPUT_FROM`.
+Appended directories inherit these definitions and MAY repeat them exactly.
+
+For example, three segments with parent order `root <- append-1 <- append-2`
+merge as follows:
+
+| Segment | Entries introduced | Final visible entries after `append-2` |
+| --- | --- | --- |
+| `root` | file ID 0, `data/a`; block `H` with `original_size` 4; the ten standard relationships | file ID 0, `data/a`; file ID 1, `data/b`; file ID 2, `results/a`; block `H` from `root`; block `J` |
+| `append-1` | file ID 1, `data/b`; exact repeat of block `H` with `original_size` 4; recipient grant `G` | |
+| `append-2` | file ID 2, `results/a`; block `J`; exact repeat of recipient grant `G` | |
+
+#### 4.3.3 Directory Entry and Path Ordering
 
 Directory entries MUST follow these ordering and path rules:
 
