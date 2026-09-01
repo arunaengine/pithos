@@ -23,7 +23,7 @@ The code examples in this document are only intended to illustrate the architect
 6. **Emergency recovery**: Block markers MUST enable reconstruction even with corrupted directories
 7. **Hierarchical organization**: Files use full paths from archive root; directories MUST be declared before their contents
 
-## 3. File Structure
+## 3. File Structure and Encoding
 
 A Pithos file MUST have the following structure:
 
@@ -34,6 +34,24 @@ A Pithos file MUST have the following structure:
 [Block Data...]   // Zero or more additional blocks
 [Directory]       // REQUIRED: File MUST end with directory
 ```
+
+### 3.1 Common Encoding Rules
+
+The following rules define the bytes stored in the file for every structure in
+Section 4:
+
+1. Fixed byte arrays are stored exactly as shown, with no length prefix.
+2. `u16`, `u32`, and `u64` fields explicitly marked fixed-width are big-endian.
+3. Other unsigned integers use the shortest valid ULEB128 form. Readers MUST
+   reject truncated, overlong, and overflowing encodings.
+4. A string is a ULEB128 byte length followed by that many UTF-8 bytes.
+5. A vector is a ULEB128 item count followed by the items in order.
+6. A tuple stores its members in the stated order.
+7. Options and enum variants use a one-byte tag followed by the selected value,
+   if any. Each Section 4 tag table defines the allowed tags.
+8. Structures have no alignment bytes or implicit padding.
+9. A reader MUST consume exactly the bytes assigned to a structure and reject
+   unknown tags.
 
 ## 4. Core Data Structures
 
@@ -134,6 +152,34 @@ The final 12 directory bytes MUST be `dir_len:u64be || crc32:u32be`, where `dir_
 The CRC MUST be CRC-32/ISO-HDLC with width 32, polynomial `0x04C11DB7`, initial value`0xFFFFFFFF`, reflected input and output, and final XOR `0xFFFFFFFF` (the check value for ASCII `123456789` is `0xCBF43926`). 
 It MUST cover every exact serialized byte from the marker through the fixed-width `dir_len`, excluding only the stored final CRC. 
 Readers MUST validate the marker, embedded length, CRC, and exact parser consumption for the terminal directory and independently for every parent directory before decrypting, merging, or otherwise using its metadata. Invalid directories MUST be rejected.
+
+#### 4.3.1 Directory Entry and Path Ordering
+
+Directory entries MUST follow these ordering and path rules:
+
+1. A directory entry MUST appear before entries for files or subdirectories within it.
+2. Paths MUST be relative, have no leading `/`, and use forward slashes as separators.
+3. The root directory is implicit and MUST NOT have an entry.
+4. Readers and writers MUST validate this ordering.
+
+**Example of valid ordering:**
+```
+data/                    (directory)
+data/raw/                (directory - parent "data/" already exists)
+data/raw/file1.csv       (file - parent "data/raw/" already exists)
+data/processed/          (directory - parent "data/" already exists)
+data/processed/file2.csv (file - parent "data/processed/" already exists)
+docs/                    (directory)
+docs/README.md           (file - parent "docs/" already exists)
+data/raw/file1_v2.csv    (file - parent "data/raw/" already exists) -> Newer version of file1.csv
+```
+
+**Example of invalid ordering:**
+```
+data/raw/file1.csv       (ERROR: parent "data/raw/" not yet declared)
+data/raw/                (too late - file already referenced this directory)
+data/                    (too late - subdirectory already referenced this)
+```
 
 ### 4.4 File Representation
 
@@ -266,51 +312,9 @@ pub enum PithosError {
 }
 ```
 
-## 5. Encoding Specifications
+## 5. Content Processing
 
-### 5.1 Integer Encoding
-
-All integer fields marked as "varint" MUST use unsigned LEB128 encoding.
-
-### 5.2 String Encoding
-
-All strings MUST be encoded as UTF-8 with a varint length prefix.
-
-### 5.3 Byte Order
-
-All multi-byte values not using varint encoding MUST use big-endian byte order.
-
-### 5.4 Directory Entry Ordering Requirements
-
-**CRITICAL**: Directory entries MUST follow strict ordering rules to ensure proper extraction:
-
-1. **Parent Before Child Rule**: A directory entry MUST appear before any entries for files or subdirectories within it
-2. **Path Format**: All paths MUST be relative (no leading `/`) and use forward slashes as separators
-3. **Root Directory**: The root directory is implicit and MUST NOT have an entry
-4. **Validation**: Implementations MUST validate ordering during both writing and reading
-
-**Example of valid ordering:**
-```
-data/                    (directory)
-data/raw/                (directory - parent "data/" already exists)
-data/raw/file1.csv       (file - parent "data/raw/" already exists)
-data/processed/          (directory - parent "data/" already exists)
-data/processed/file2.csv (file - parent "data/processed/" already exists)
-docs/                    (directory)
-docs/README.md           (file - parent "docs/" already exists)
-data/raw/file1_v2.csv    (file - parent "data/raw/" already exists) -> Newer version of file1.csv
-```
-
-**Example of INVALID ordering:**
-```
-data/raw/file1.csv       (ERROR: parent "data/raw/" not yet declared)
-data/raw/                (too late - file already referenced this directory)
-data/                    (too late - subdirectory already referenced this)
-```
-
-## 6. Content Processing
-
-### 6.1 Content-Defined Chunking
+### 5.1 Content-Defined Chunking
 
 Implementations SHOULD use content-defined chunking with recommended parameters:
 - **min_size**: 64 KB
@@ -318,7 +322,7 @@ Implementations SHOULD use content-defined chunking with recommended parameters:
 - **max_size**: 512 KB
 - **window_size**: 48 bytes
 
-### 6.2 Block Hashing
+### 5.2 Block Hashing
 
 Each block identifier MUST be the full 32-byte default unkeyed BLAKE3 digest of the exact
 plaintext chunk before compression or encryption. Readers MUST retrieve the stored block,
@@ -327,11 +331,11 @@ original size as the output bound, require the resulting plaintext length to equ
 original size, compute the complete plaintext digest, and compare it with the block identifier
 before releasing any output derived from that block.
 
-### 6.3 Convergent Encryption
+### 5.3 Convergent Encryption
 
 Content keys MUST be derived deterministically using SHAKE256.
 
-### 6.4 Compression
+### 5.4 Compression
 
 Implementations SHOULD support:
 - Level 0: No compression
@@ -339,9 +343,9 @@ Implementations SHOULD support:
 - Levels 4-6: Balanced compression (e.g., Zstd levels 4-9)
 - Level 7: Maximum compression (e.g., Zstd level 19+)
 
-## 7. Operations Overview
+## 6. Operations Overview
 
-### 7.1 Reading Operations
+### 6.1 Reading Operations
 
 1. Read and validate file header
 2. Find last directory by scanning from end
@@ -349,7 +353,7 @@ Implementations SHOULD support:
 4. Build block index
 5. Extract files by reading referenced blocks
 
-### 7.2 Writing Operations
+### 6.2 Writing Operations
 
 1. Write file header
 2. Process files in correct directory order
@@ -358,7 +362,7 @@ Implementations SHOULD support:
 5. Write directory and encryption sections
 6. Validate complete structure
 
-### 7.3 Directory Tree Operations
+### 6.3 Directory Tree Operations
 
 When archiving directory trees:
 1. Process directories before their contents
@@ -366,7 +370,7 @@ When archiving directory trees:
 3. Preserve file metadata (permissions, timestamps)
 4. Handle symlinks appropriately per platform
 
-## 8. Security Considerations
+## 7. Security Considerations
 
 1. Implementations MUST verify the complete plaintext block size and hash after authenticated
    decryption and decompression, and before releasing output derived from the block
@@ -375,21 +379,21 @@ When archiving directory trees:
 4. External block URLs MUST use HTTPS in production environments
 5. Path traversal attacks MUST be prevented through validation
 
-## 9. Implementation Requirements
+## 8. Implementation Requirements
 
-### 9.1 Mandatory Features
+### 8.1 Mandatory Features
 
 Implementations MUST support:
 - Reading and writing base format (version 1.0)
 - Blake3 hashing
-- Varint encoding/decoding
+- ULEB128 encoding/decoding
 - CRC32 calculation
 - UTF-8 string handling
 - All four file types (Data, Metadata, Directory, Symlink)
 - Directory ordering validation (parents before children)
 - Path format validation (relative paths only)
 
-### 9.2 Optional Features
+### 8.2 Optional Features
 
 Implementations MAY support:
 - Compression (levels 1-7)
@@ -397,7 +401,7 @@ Implementations MAY support:
 - External block storage
 - Content-defined chunking
 
-### 9.3 Platform-Specific Considerations
+### 8.3 Platform-Specific Considerations
 
 #### Symlinks
 - Unix systems: Create proper symbolic links
@@ -411,7 +415,7 @@ Implementations MAY support:
 - Archives use forward slashes (`/`) internally
 - Convert to platform-appropriate separators on extraction
 
-## 10. Future Extensions
+## 9. Future Extensions
 
 The format reserves space for future extensions:
 - FileType values 4-255
@@ -420,19 +424,19 @@ The format reserves space for future extensions:
 
 Extensions MUST maintain backwards compatibility for reading.
 
-## 11. Constants and Identifiers
+## 10. Constants and Identifiers
 
-### 11.1 Magic Values
+### 10.1 Magic Values
 
 - File Header: `b"PITH"`
 - Block Header: `b"BLCK"`
 - Directory: `b"PITHOSDR"`
 
-### 11.2 Version Numbers
+### 10.2 Version Numbers
 
 - Version 1.0: `0x0100`
 
-### 11.3 Default Values
+### 10.3 Default Values
 
 - Current timestamp: Unix seconds since epoch
 - Default file permissions: `0o644`
