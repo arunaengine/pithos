@@ -329,7 +329,7 @@ BlockDataState stores either encrypted file block data or a decrypted block list
 
 ```rust
 pub enum BlockDataState {
-    Encrypted(Vec<u8>),             // Nonce + ChaCha20Poly1305
+    Encrypted(Vec<u8>),             // nonce || ciphertext || tag
     Decrypted(Vec<([u8; 32], [u8; 32])>), // Block hash and block key
 }
 ```
@@ -342,7 +342,10 @@ pub enum BlockDataState {
 | `01` | `Decrypted` | Vector of tuples, each `block_hash[32] || block_key[32]` |
 
 Readers MUST reject unknown tags. The block hash is the only block identity in a
-decrypted block-list entry.
+decrypted block-list entry. A decrypted block list is a ULEB128 count followed
+by that many `block_hash[32] || block_key[32]` pairs. A repeated block hash is
+valid only when it has the same block key; readers MUST reject a conflicting
+duplicate hash and block key.
 
 #### 4.4.3 File Entry
 
@@ -484,7 +487,7 @@ RecipientData stores either encrypted recipient data or a decrypted file-key lis
 
 ```rust
 pub enum RecipientData {
-    Encrypted(Vec<u8>),             // Chacha + nonce
+    Encrypted(Vec<u8>),             // nonce || ciphertext || tag
     Decrypted(Vec<(u64, [u8; 32])>) // File ID and file key
 }
 ```
@@ -496,8 +499,10 @@ pub enum RecipientData {
 | `00` | `Encrypted` | Vector of bytes |
 | `01` | `Decrypted` | Vector of tuples, each ULEB128 `file_id` followed by `file_key[32]` |
 
-Readers MUST reject unknown tags and duplicate file IDs in a decrypted
-recipient-data list.
+Readers MUST reject unknown tags. A decrypted recipient-data list is a ULEB128
+count followed by that many ULEB128 `file_id` and `file_key[32]` pairs. A
+repeated file ID is valid only when it has the same file key; readers MUST
+reject a conflicting duplicate file ID and file key.
 
 ### 4.6 Error Types
 
@@ -550,7 +555,32 @@ before releasing any output derived from that block.
 
 ### 5.3 Convergent Encryption
 
-Content keys MUST be derived deterministically using SHAKE256.
+Encryption is optional. An implementation that supports encryption MUST use
+X25519, SHAKE256, and ChaCha20-Poly1305 as specified here.
+
+All encryption keys are 32 bytes. ChaCha20-Poly1305 uses a 12-byte nonce and
+produces a 16-byte authentication tag. Every encrypted value is stored as
+`nonce || ciphertext || tag`; the nonce is part of the stored byte vector. The
+additional authenticated data (AAD) is empty.
+
+The block key is the first 32 output bytes of `SHAKE256(plaintext)`, where
+`plaintext` is the exact block plaintext before compression or encryption. No
+label or length prefix is included. A block payload with encryption enabled is
+encrypted with its block key.
+
+A file key is 32 random bytes. It encrypts the decrypted block list for a file.
+For each recipient record, the recipient wrapping key is the raw 32-byte X25519
+shared secret between the sender private key and recipient public key. That
+shared secret is used directly as the ChaCha20-Poly1305 key to encrypt the
+decrypted recipient list; no intermediate KDF is used. Implementations MUST
+reject non-contributory X25519 public keys.
+
+An implementation MUST use a fresh nonce for every value encrypted under a
+given key. It MUST authenticate and decrypt an encrypted value successfully
+before using its plaintext or releasing output derived from it.
+
+Version 1.0 deliberately has no SHAKE256 label, intermediate X25519 KDF, or
+AAD. A redesign of any of these inputs requires a new format version.
 
 ### 5.4 Compression
 
