@@ -20,7 +20,7 @@ The code examples in this document are only intended to illustrate the architect
 3. **Privacy-preserving sharing**: Users MUST NOT be able to see who else has access to files
 4. **Flexible metadata**: Metadata MUST be stored as regular files with special type markers
 5. **Progressive enhancement**: Implementations MUST support the base format and MAY support optional features
-6. **Emergency recovery**: Block markers MUST enable reconstruction even with corrupted directories
+6. **Limited recovery**: Recovery tools MAY treat block markers as untrusted candidates; directories provide block metadata
 7. **Hierarchical organization**: Files use full paths from archive root; directories MUST be declared before their contents
 
 ## 3. File Structure and Encoding
@@ -88,7 +88,7 @@ Readers MUST reject a header whose magic is not `PITH` or whose version is not
 A BlockHeader marks the beginning of locally stored block data.
 
 ```rust
-/// Minimal block header - just for emergency scanning
+/// Minimal block header
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHeader {
     pub marker: [u8; 4],   // MUST be b"BLCK"
@@ -195,6 +195,19 @@ pub enum BlockLocation {
 
 Readers MUST reject unknown tags. A local block's offset and size describe its
 location in this file; the block-boundary rules are specified separately.
+
+#### 4.2.5 Local Block Boundaries and Recovery
+
+A local block is `BLCK || stored_payload`. Its `offset` is the zero-based file
+offset of the first byte of `BLCK`; `stored_size` counts only `stored_payload`.
+The marker occupies bytes `offset` through `offset + 3`. The payload starts at
+`offset + 4` and occupies exactly `stored_size` bytes; when nonempty, its last
+byte is `offset + 4 + stored_size - 1`.
+
+Readers locate local blocks from directory descriptors and MUST use checked
+arithmetic for every range. Normal reading MUST NOT search payload bytes for
+`BLCK`. Recovery tools MAY treat `BLCK` as an untrusted candidate only: the
+marker alone provides no length, flags, or identity.
 
 ### 4.3 Directory Structure
 
