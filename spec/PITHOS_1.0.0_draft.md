@@ -252,7 +252,19 @@ The CRC MUST be CRC-32/ISO-HDLC with width 32, polynomial `0x04C11DB7`, initial 
 It MUST cover every exact serialized byte from the marker through the fixed-width `dir_len`, excluding only the stored final CRC. 
 Readers MUST validate the marker, embedded length, CRC, and exact parser consumption for the terminal directory and independently for every parent directory before decrypting, merging, or otherwise using its metadata. Invalid directories MUST be rejected.
 
-#### 4.3.1 Directory Entry and Path Ordering
+#### 4.3.1 Terminal Directory Lookup
+
+To locate the terminal directory during normal reading:
+
+1. Read the final 12 file bytes as `dir_len:u64be || crc32:u32be`.
+2. Compute `directory_start = file_length - dir_len` using checked subtraction.
+3. Require `dir_len` to be at least the smallest directory allowed by the finalized 1.0 encoding. The root stores ten standard relationships, so the 0.8 25-byte empty-directory minimum does not apply.
+4. Parse the directory at `directory_start` and require it to end exactly at the end of the file.
+5. Validate the marker, embedded length, CRC, and exact byte consumption before using metadata.
+
+Normal reading MUST reject trailing bytes, truncation, underflow, a false marker, and a torn final append. It MUST NOT fall back to an older directory. Salvage is a separate mode; if it locates an older directory, it MUST label the result incomplete.
+
+#### 4.3.2 Directory Entry and Path Ordering
 
 Directory entries MUST follow these ordering and path rules:
 
@@ -553,7 +565,7 @@ Implementations SHOULD support:
 ### 6.1 Reading Operations
 
 1. Read and validate file header
-2. Find last directory by scanning from end
+2. Locate and validate the terminal directory using the direct lookup in Section 4.3.1
 3. Validate directory ordering
 4. Build block index
 5. Extract files by reading referenced blocks
