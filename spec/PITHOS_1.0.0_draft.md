@@ -13,6 +13,47 @@ Pithos is an append-only archive format designed for efficient storage and shari
 
 The code examples in this document are only intended to illustrate the architecture. Optimized implementations of the individual structures may of course differ.
 
+This document defines Pithos 1.0. Where a current 0.8 implementation differs,
+this document governs.
+
+### 1.1 Reader's Guide
+
+- **Readers:** Start with the common encoding rules (Section 3.1), then follow
+  terminal Directory lookup and append-chain validation (Sections 4.3.1 and
+  4.3.2), content processing (Section 5), and capability handling (Section
+  8).
+- **Writers:** Follow the encoded forms in Section 4, content processing in
+  Section 5, and the writing operation sequence in Section 6.2.
+- **Security reviewers:** Review the cryptographic construction in Section 5.3,
+  block verification in Section 5.2, and the security considerations in
+  Section 7.
+- **Conformance-test authors:** Use the encoding rules in Section 3.1 and the
+  encoded-form tables in Section 4 as the normative byte-level rules; Sections
+  5 and 8 define processing and capability outcomes.
+
+### 1.2 Terminology
+
+- **segment:** The portion of an archive that introduces block data and ends
+  with one Directory.
+- **base Directory:** The oldest Directory in a selected chain. It has no
+  parent and defines the standard relationships required by Section 4.3.2.
+- **terminal Directory:** The newest Directory in a selected chain, located at
+  the end of the file during normal reading as specified in Section 4.3.1.
+- **selected chain:** The ordered sequence of Directories obtained by following
+  parent links from the terminal Directory to the base Directory.
+- **effective archive:** The archive view produced by merging the selected
+  chain from base Directory to terminal Directory under Section 4.3.2.
+- **effective descriptor:** The descriptor selected for a block hash after the
+  selected chain is merged, as specified in Section 4.3.2.
+- **archive root path:** The implicit root of the archive path hierarchy; it has
+  no directory entry.
+- **unavailable content:** Content that is structurally known but cannot be
+  read because it requires an unsupported optional capability, as specified in
+  Section 8.2.
+- **salvage mode:** A recovery mode that may locate an older Directory after a
+  normal terminal-Directory lookup fails; its result is incomplete and is not a
+  normal archive view.
+
 ## 2. Core Design Principles
 
 1. **Append-only architecture**: New data and metadata MUST be appended, never modifying existing content
@@ -194,7 +235,8 @@ pub enum BlockLocation {
 | `01` | `External` | `url` as a string |
 
 Readers MUST reject unknown tags. A local block's offset and size describe its
-location in this file; the block-boundary rules are specified separately.
+location in this file; [Section 4.2.5](#425-local-block-boundaries-and-recovery)
+defines its block-boundary rules.
 
 #### 4.2.5 Local Block Boundaries and Recovery
 
@@ -269,7 +311,7 @@ To locate the terminal directory during normal reading:
 
 1. Read the final 12 file bytes as `dir_len:u64be || crc32:u32be`.
 2. Compute `directory_start = file_length - dir_len` using checked subtraction.
-3. Require `dir_len` to be at least the smallest directory allowed by the finalized 1.0 encoding. The root stores ten standard relationships, so the 0.8 25-byte empty-directory minimum does not apply.
+3. Require `dir_len` to be at least the smallest directory allowed by the finalized 1.0 encoding.
 4. Parse the directory at `directory_start` and require it to end exactly at the end of the file.
 5. Validate the marker, embedded length, CRC, and exact byte consumption before using metadata.
 
@@ -788,9 +830,7 @@ Readers MUST reject an unsupported header version and any unknown tag rather
 than list the archive, because the structure of such input is not known.
 
 Pithos 1.0 intentionally permits decrypted block and recipient list variants
-and an empty Directory `encryption` vector. This differs from the current 0.8
-writer, which requires encrypted file block lists and encrypted recipient
-lists, although it can disable block-payload encryption.
+and an empty Directory `encryption` vector.
 
 ### 8.3 Platform-Specific Considerations
 
