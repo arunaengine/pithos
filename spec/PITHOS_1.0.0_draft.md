@@ -152,7 +152,7 @@ The hash-keyed block descriptor describes one block stored or referenced by a di
 /// Block descriptor body; its hash is the key in Directory::blocks
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockDescriptor {
-    pub offset: u64,             // Byte offset in file (varint encoded)
+    pub offset: u64,             // Local byte offset; zero for External (varint encoded)
     pub stored_size: u64,        // Size as stored (compressed/encrypted) (varint)
     pub original_size: u64,      // Original uncompressed size (varint)
     pub flags: ProcessingFlags,  // Compression, encryption settings
@@ -167,11 +167,11 @@ The directory block sequence is a vector. Each item is encoded as follows:
 | Field | Bytes stored in the file |
 | --- | --- |
 | `block_hash` | Exactly 32 bytes: block hash as defined in Section 5.2 |
-| `offset` | ULEB128 `u64` |
+| `offset` | ULEB128 `u64`: local block offset, or zero for `External` |
 | `stored_size` | ULEB128 `u64` |
 | `original_size` | ULEB128 `u64` |
 | `flags` | One ProcessingFlags byte: bits 0-2 compression level, bit 3 encryption enabled, bits 4-7 zero |
-| `location` | One tag byte: `00` local, or `01` followed by a URL string for external |
+| `location` | One tag byte: `00` local, or `01` followed by an external location identifier string |
 
 Readers MUST reject duplicate block hashes in one directory and MUST use the
 32-byte hash as the block's only identity.
@@ -222,8 +222,8 @@ BlockLocation states where the bytes for a block can be obtained.
 /// Block storage location
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockLocation {
-    Local,                      // Block data at specified offset in this file
-    External { url: String },   // URL to external storage
+    Local,                                // Block data at specified offset in this file
+    External { location: String },        // Opaque external location identifier
 }
 ```
 
@@ -232,11 +232,14 @@ pub enum BlockLocation {
 | Tag | Variant | Bytes after the tag |
 | --- | --- | --- |
 | `00` | `Local` | None |
-| `01` | `External` | `url` as a string |
+| `01` | `External` | External location identifier as a string |
 
 Readers MUST reject unknown tags. A local block's offset and size describe its
 location in this file; [Section 4.2.5](#425-local-block-boundaries-and-recovery)
-defines its block-boundary rules.
+defines its block-boundary rules. An external location identifier is an opaque
+string interpreted only by an enabled caller-supplied resolver. Writers MUST
+encode `offset` as zero for `External`; readers MUST ignore that field for
+`External`.
 
 #### 4.2.5 Local Block Boundaries and Recovery
 
@@ -246,10 +249,38 @@ The marker occupies bytes `offset` through `offset + 3`. The payload starts at
 `offset + 4` and occupies exactly `stored_size` bytes; when nonempty, its last
 byte is `offset + 4 + stored_size - 1`.
 
-Readers locate local blocks from directory descriptors and MUST use checked
-arithmetic for every range. Normal reading MUST NOT search payload bytes for
-`BLCK`. Recovery tools MAY treat `BLCK` as an untrusted candidate only: the
-marker alone provides no length, flags, or identity.
+The local block-data region of the base segment begins immediately after the
+six-byte FileHeader and ends at the base Directory's start. The local
+block-data region of an appended segment begins immediately after its parent
+Directory and ends at its declaring Directory's start. For every effective
+descriptor with `Local` location, its effective local extent is the half-open
+range `[offset, offset + 4 + stored_size)`; it MUST fit wholly in
+the local block-data region of its declaring segment, begin with `BLCK`, and
+not overlap another effective local extent. Readers and writers MUST use
+checked arithmetic to compute all extent and region bounds.
+
+If ProcessingFlags encryption is enabled, `stored_size` MUST be at least 28
+bytes: the 12-byte nonce plus the 16-byte authentication tag. This requirement
+does not impose a minimum stored size for an unencrypted payload.
+
+Readers locate local blocks from effective directory descriptors and MUST NOT
+search payload bytes for `BLCK`. Recovery tools MAY treat `BLCK` as an
+untrusted candidate only: the marker alone provides no length, flags, or
+identity.
+
+#### 4.2.6 External Block Resolution
+
+External resolution is an optional capability and MUST remain disabled until a
+caller supplies both a resolver and an access policy. The resolver receives the
+opaque external location identifier and MUST return exactly one framed block:
+`BLCK || stored_payload`, with total length `4 + stored_size`. The returned
+bytes have the same representation as a local block and MUST undergo the same
+marker, transform, stored-size, original-size, and hash validation.
+
+This specification does not define a network protocol or client. A resolver
+that performs network access MUST require explicit enablement, enforce
+response-size and time bounds, and apply its access policy to every network
+target and redirect.
 
 ### 4.3 Directory Structure
 
@@ -818,7 +849,8 @@ When archiving directory trees:
    decryption and decompression, and before releasing output derived from the block
 2. Directory CRC32 values MUST be validated
 3. Convergent encryption reveals when identical files exist (accepted trade-off)
-4. External block URLs MUST use HTTPS in production environments
+4. Networked external resolution can expose a caller to unsafe targets and
+   resource exhaustion; Section 4.2.6 defines the required resolver safeguards
 5. Path traversal attacks MUST be prevented through validation
 
 ## 8. Implementation Requirements
