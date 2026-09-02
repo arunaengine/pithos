@@ -42,7 +42,7 @@ this document governs.
 - **selected chain:** The ordered sequence of Directories obtained by following
   parent links from the terminal Directory to the base Directory.
 - **effective archive:** The archive view produced by merging the selected
-  chain from base Directory to terminal Directory under Section 4.3.2.
+  chain from the base Directory to the terminal Directory under Section 4.3.2.
 - **effective descriptor:** The descriptor selected for a block hash after the
   selected chain is merged, as specified in Section 4.3.2.
 - **archive root path:** The implicit root of the archive path hierarchy; it has
@@ -62,7 +62,7 @@ this document governs.
 4. **Flexible metadata**: Metadata MUST be stored as regular files with special type markers
 5. **Progressive enhancement**: Implementations MUST support the base format and MAY support optional features
 6. **Limited recovery**: Recovery tools MAY treat block markers as untrusted candidates; directories provide block metadata
-7. **Hierarchical organization**: Files use full paths from archive root; directories MUST be declared before their contents
+7. **Hierarchical organization**: Files use full paths from the archive root path; directories MUST be declared before their contents
 
 ## 3. File Structure and Encoding
 
@@ -286,7 +286,7 @@ pub struct Directory {
 
 The parent option tag is `00` for no parent and `01` for a parent, followed by
 the parent's zero-based start and complete length as ULEB128 values. The
-selected chain MUST have exactly one root directory, whose parent tag is `00`.
+selected chain MUST have exactly one base Directory, whose parent tag is `00`.
 For tag `01`, the parent range MUST be within the file, end no later than the
 child directory start, and have the same length as the parent's embedded
 `dir_len`. Readers MUST use checked arithmetic for all ranges and validate each
@@ -303,15 +303,15 @@ The directory marker MUST be exactly the eight ASCII bytes `PITHOSDR`.
 The final 12 directory bytes MUST be `dir_len:u64be || crc32:u32be`, where `dir_len` is the complete directory length from the marker through the CRC, inclusive. 
 The CRC MUST be CRC-32/ISO-HDLC with width 32, polynomial `0x04C11DB7`, initial value`0xFFFFFFFF`, reflected input and output, and final XOR `0xFFFFFFFF` (the check value for ASCII `123456789` is `0xCBF43926`). 
 It MUST cover every exact serialized byte from the marker through the fixed-width `dir_len`, excluding only the stored final CRC. 
-Readers MUST validate the marker, embedded length, CRC, and exact parser consumption for the terminal directory before decrypting, merging, or otherwise using its metadata. Invalid directories MUST be rejected.
+Readers MUST validate the marker, embedded length, CRC, and exact parser consumption for the terminal Directory before decrypting, merging, or otherwise using its metadata. Invalid Directories MUST be rejected.
 
 #### 4.3.1 Terminal Directory Lookup
 
-To locate the terminal directory during normal reading:
+To locate the terminal Directory during normal reading:
 
 1. Read the final 12 file bytes as `dir_len:u64be || crc32:u32be`.
 2. Compute `directory_start = file_length - dir_len` using checked subtraction.
-3. Require `dir_len` to be at least the smallest directory allowed by the finalized 1.0 encoding.
+3. Require `dir_len >= 25`, the syntactic framing floor for a Directory.
 4. Parse the directory at `directory_start` and require it to end exactly at the end of the file.
 5. Validate the marker, embedded length, CRC, and exact byte consumption before using metadata.
 
@@ -320,37 +320,43 @@ Normal reading MUST reject trailing bytes, truncation, underflow, a false marker
 #### 4.3.2 Append Chains
 
 Each Directory contains the entries introduced by its segment. To construct the
-effective archive, readers merge the selected directory chain from its oldest
-directory to its newest directory. An append adds file entries, block
+effective archive, readers merge the selected chain from the base Directory to
+the terminal Directory. An append adds file entries, block
 descriptors, relationship definitions, and recipient grants. Version 1.0 has
 no deletion, replacement, or tombstone.
 
-File IDs and paths MUST be unique across the chain. Writers assign file ID 0
+File IDs and paths MUST be unique across the selected chain. Writers assign file ID 0
 to the first file and assign each later file ID as the current maximum ID plus
 1. Readers MUST accept unused file-ID gaps. A rename adds a file record with a
 new file ID and path; the old record remains in the effective archive.
 
-A repeated block hash in one directory is invalid. Across directories, a block
-hash MAY reappear only when its `original_size` is the same. The descriptor in
-the oldest directory remains the effective descriptor. Exact repeated
+A repeated block hash in one Directory is invalid. Across Directories in the
+selected chain, a block hash MAY reappear only when its `original_size` is the
+same. The descriptor in the oldest Directory in the selected chain that
+contains that hash remains the effective descriptor. Exact repeated
 relationship definitions are allowed; conflicting definitions of one
 relationship ID are invalid. Exact repeated recipient grants are allowed;
 conflicting grants for the same sender public key and recipient public key are
 invalid.
 
-The root directory MUST store these ten standard relationship definitions in its
+The base Directory MUST store these ten standard relationship definitions in its
 `relations` vector, in ascending relationship-ID order: `0 DESCRIBES`,
 `1 ANNOTATES`, `2 DERIVED_FROM`, `3 SOURCE_OF`, `4 PREVIOUS_VERSION`,
 `5 NEXT_VERSION`, `6 PART_OF`, `7 CONTAINS`, `8 INPUT_TO`, and
-`9 OUTPUT_FROM`. Appended directories inherit these definitions and MAY repeat
+`9 OUTPUT_FROM`. Non-base Directories inherit these definitions and MAY repeat
 one only when its relationship ID and stored name match exactly.
 
-For example, three segments with parent order `root <- append-1 <- append-2`
+The relationship requirement is semantic validation separate from the `25`-byte
+syntactic framing floor. A valid empty base Directory is 146 bytes, and the
+minimum valid appended Directory is 28 bytes. A non-base Directory MAY have an
+empty `relations` vector.
+
+**Illustrative append-chain merge:** three segments with parent order `base <- append-1 <- append-2`
 merge as follows:
 
 | Segment | Entries introduced | Final visible entries after `append-2` |
 | --- | --- | --- |
-| `root` | file ID 0, `data/a`; block `H` with `original_size` 4; the ten standard relationships | file ID 0, `data/a`; file ID 1, `data/b`; file ID 2, `results/a`; block `H` from `root`; block `J` |
+| `base` | file ID 0, `data/a`; block `H` with `original_size` 4; the ten standard relationships | file ID 0, `data/a`; file ID 1, `data/b`; file ID 2, `results/a`; block `H` from `base`; block `J` |
 | `append-1` | file ID 1, `data/b`; exact repeat of block `H` with `original_size` 4; recipient grant `G` | |
 | `append-2` | file ID 2, `results/a`; block `J`; exact repeat of recipient grant `G` | |
 
@@ -358,28 +364,39 @@ merge as follows:
 
 Directory entries MUST follow these ordering and path rules:
 
-1. A directory entry MUST appear before entries for files or subdirectories within it.
-2. Paths MUST be relative, have no leading `/`, and use forward slashes as separators.
-3. The root directory is implicit and MUST NOT have an entry.
-4. Readers and writers MUST validate this ordering.
+1. An entry path is a non-empty UTF-8 sequence of non-empty `/`-separated
+   components. It MUST NOT start or end with `/`, contain NUL or `\`, contain a
+   `.` or `..` component, or use a drive-qualified form (a path whose second
+   byte is `:`, such as invalid `C:` or `C:/data`).
+2. The archive root path is implicit and MUST NOT have an entry.
+3. A path is a descendant of a directory only when its component sequence has
+   that directory's component sequence as a strict prefix. Every entry below the
+   archive root path MUST have each of its ancestor paths declared as a
+   `Directory` entry.
+4. Declaration order is the concatenation of the `files` vectors from the base
+   Directory through the terminal Directory, preserving each vector's stored
+   order. Each ancestor Directory MUST occur before its descendant. An ancestor
+   declared in an earlier Directory satisfies this rule for an entry in a later
+   Directory.
+5. Readers and writers MUST reject a path or declaration order that violates these rules.
 
-**Example of valid ordering:**
+**Valid ordering example:**
 ```
-data/                    (directory)
-data/raw/                (directory - parent "data/" already exists)
-data/raw/file1.csv       (file - parent "data/raw/" already exists)
-data/processed/          (directory - parent "data/" already exists)
-data/processed/file2.csv (file - parent "data/processed/" already exists)
-docs/                    (directory)
-docs/README.md           (file - parent "docs/" already exists)
-data/raw/file1_v2.csv    (file - parent "data/raw/" already exists) -> Newer version of file1.csv
+data                    (Directory)
+data/raw                (Directory; parent `data` already declared)
+data/raw/file1.csv       (Data; parent `data/raw` already declared)
+data/processed          (Directory; parent `data` already declared)
+data/processed/file2.csv (Data; parent `data/processed` already declared)
+docs                    (Directory)
+docs/README.md           (Data; parent `docs` already declared)
+data/raw/file1_v2.csv    (Data; parent `data/raw` already declared)
 ```
 
-**Example of invalid ordering:**
+**Invalid ordering example:**
 ```
-data/raw/file1.csv       (ERROR: parent "data/raw/" not yet declared)
-data/raw/                (too late - file already referenced this directory)
-data/                    (too late - subdirectory already referenced this)
+data/raw/file1.csv       (parent `data/raw` not yet declared)
+data/raw                (too late; parent `data` not yet declared)
+data                    (too late; a descendant already occurred)
 ```
 
 ### 4.4 File Representation
@@ -479,6 +496,35 @@ The directory file sequence is a vector. Each record is encoded as follows:
 The `symlink_target` option tag is `00` for no target and `01` for a target.
 Readers MUST reject other tags. File IDs and paths are record fields, not fields
 of the FileEntry body.
+
+**FileEntry validity rules:**
+
+| `file_type` | `block_data` | `file_size` | `symlink_target` |
+| --- | --- | --- | --- |
+| `Directory` | MUST be `Decrypted` with an empty list | MUST be `0` | MUST be absent (`00`) |
+| `Data` | Either state is permitted | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
+| `Metadata` | Either state is permitted | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
+| `Symlink` | MUST be `Decrypted` with an empty list | MUST be `0` | MUST be present (`01`) |
+
+Readers MUST reject a combination that violates this table. For encrypted block
+lists, the content-size validation for `Data` and `Metadata` occurs once the
+block list is available; until then, the content is unavailable as specified in
+Section 8.2.
+
+`permissions` stores the low 12 bits of a POSIX mode, in the range
+`0o0000..=0o7777`; file-type bits are not stored. Readers MUST reject a value
+with any higher bit set and retain all 12 bits as metadata. An extractor MUST
+NOT apply set-user-ID, set-group-ID, or sticky bits unless the caller explicitly
+opts in. A non-POSIX implementation MAY retain the value as metadata and need
+not map it to a platform ACL.
+
+For a `Symlink`, `symlink_target` is a non-empty UTF-8 sequence of non-empty
+`/`-separated components. It MUST NOT contain NUL or `\`, start with `/`, use a
+drive-qualified form as defined for entry paths, or contain a `.` component. A
+`..` component is permitted only when lexical interpretation of the target
+relative to the symlink's parent does not move above the archive root path. The
+target need not name an existing entry: contained dangling links and cycles are
+valid.
 
 #### 4.4.4 File References
 
@@ -659,7 +705,7 @@ block list is an ordered sequence of `(block_hash, block_key)` pairs. That order
 reconstructs the file.
 
 Every block hash referenced by a file MUST resolve to exactly one effective
-descriptor after the directory chain is merged. A repeated hash in one file is
+descriptor after the selected chain is merged. A repeated hash in one file is
 valid only if every occurrence carries the same block key; otherwise readers
 MUST reject the file. Two files MAY reference the same hash and effective
 descriptor. Deduplication is a writer choice: a writer MAY store the same
@@ -684,7 +730,7 @@ keys:
 | Reuse by two files | `a: [(H, K)]`; `b: [(H, K)]` | Valid. Both files reconstruct from the effective descriptor for `H`. |
 | Repetition in one file | `a: [(H, K), (H, K)]` | Valid. `a` reconstructs as the plaintext for `H` followed by itself. |
 | Conflicting key | `a: [(H, K), (H, L)]` | Invalid. The file is rejected. |
-| Later-segment size conflict | Root has `H` with `original_size: 4`; an appended directory has `H` with `original_size: 5` | Invalid. The appended directory is rejected; no effective descriptor is selected from it. |
+| Later-segment size conflict | Base Directory has `H` with `original_size: 4`; an appended Directory has `H` with `original_size: 5` | Invalid. The appended Directory is rejected; no effective descriptor is selected from it. |
 
 ### 5.3 Convergent Encryption
 
@@ -744,7 +790,7 @@ different supported Zstandard versions.
 ### 6.1 Reading Operations
 
 1. Read and validate file header
-2. Locate and validate the terminal directory using the direct lookup in Section 4.3.1
+2. Locate and validate the terminal Directory using the direct lookup in Section 4.3.1
 3. Validate directory ordering
 4. Build the effective block-descriptor mapping
 5. Extract files by reading referenced blocks
@@ -835,12 +881,17 @@ and an empty Directory `encryption` vector.
 ### 8.3 Platform-Specific Considerations
 
 #### Symlinks
-- Unix systems: Create proper symbolic links
-- Windows: Handle symlinks according to platform capabilities
+
+An extractor on a platform that supports symbolic links MAY create a symbolic
+link with the stored target. While creating other archive entries, it MUST NOT
+follow an archive-created or pre-existing symbolic link. On a platform that does
+not support symbolic links, an extractor MAY reject the operation or skip the
+symlink with a diagnostic, but MUST NOT silently change the entry type.
 
 #### Permissions
-- Unix: Preserve full permission bits
-- Windows: Map Unix permissions to Windows ACLs where possible
+
+Extractors apply permissions subject to the FileEntry rules in Section 4.4.3.
+Non-POSIX platforms MAY retain them as metadata without an ACL mapping.
 
 #### Path Separators
 - Archives use forward slashes (`/`) internally
