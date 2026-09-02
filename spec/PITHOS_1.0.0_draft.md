@@ -9,9 +9,11 @@
 
 This document specifies the Pithos file format using the key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
 
-Pithos is an append-only archive format designed for efficient storage and sharing of scientific data. It combines content-defined deduplication, convergent encryption, and flexible metadata support in a privacy-preserving architecture optimized for object storage systems.
+Pithos is an append-only archive format designed for efficient storage and sharing of scientific data. It combines content-defined deduplication, convergent encryption, and flexible metadata support optimized for object storage systems.
 
-The code examples in this document are only intended to illustrate the architecture. Optimized implementations of the individual structures may of course differ.
+**Illustrative data model.** Rust declarations in this document illustrate the
+data model only; implementations may use different declarations. Normative
+prose and encoded-form tables govern conformance and the bytes on disk.
 
 This document defines Pithos 1.0. Where a current 0.8 implementation differs,
 this document governs.
@@ -70,11 +72,12 @@ this document governs.
 A Pithos file MUST have the following structure:
 
 ```
-[FileHeader]      // REQUIRED: Format identifier and version
-[Block Data...]   // Zero or more data blocks with headers
-[Directory]       // REQUIRED: Can repeat (append-only)
-[Block Data...]   // Zero or more additional blocks
-[Directory]       // REQUIRED: File MUST end with directory
++-- base segment --------------------+ +-- appended terminal segment -------------------+
+| [FileHeader][Base Blocks][Base Dir] | | [Appended Blocks][Terminal Dir ... dir_len || crc32] | EOF
++-------------------------------------+ +-----------------------------------------------------+
+                                      ^                                      |
+                                      +-- parent (start, len) <-------------+
+                                                                    `dir_len || crc32` = final 12 bytes
 ```
 
 Each segment ends immediately after its Directory. Encryption sections, when
@@ -392,14 +395,18 @@ syntactic framing floor. A valid empty base Directory is 146 bytes, and the
 minimum valid appended Directory is 28 bytes. A non-base Directory MAY have an
 empty `relations` vector.
 
-**Illustrative append-chain merge:** three segments with parent order `base <- append-1 <- append-2`
-merge as follows:
+**Valid append-chain merge example:** three segments with parent order `base <-
+append-1 <- append-2` introduce the following records.
 
-| Segment | Entries introduced | Final visible entries after `append-2` |
-| --- | --- | --- |
-| `base` | file ID 0, `data/a`; block `H` with `original_size` 4; the ten standard relationships | file ID 0, `data/a`; file ID 1, `data/b`; file ID 2, `results/a`; block `H` from `base`; block `J` |
-| `append-1` | file ID 1, `data/b`; exact repeat of block `H` with `original_size` 4; recipient grant `G` | |
-| `append-2` | file ID 2, `results/a`; block `J`; exact repeat of recipient grant `G` | |
+| Segment | Entries introduced |
+| --- | --- |
+| `base` | file ID 0, `data/a`; block `H` with `original_size` 4; the ten standard relationships |
+| `append-1` | file ID 1, `data/b`; exact repeat of block `H` with `original_size` 4; recipient grant `G` |
+| `append-2` | file ID 2, `results/a`; block `J`; exact repeat of recipient grant `G` |
+
+The final effective archive contains file IDs 0 (`data/a`), 1 (`data/b`), and 2
+(`results/a`); block `H` from `base`; block `J`; the standard relationships; and
+recipient grant `G`.
 
 #### 4.3.3 Directory Entry and Path Ordering
 
@@ -538,7 +545,7 @@ The `symlink_target` option tag is `00` for no target and `01` for a target.
 Readers MUST reject other tags. File IDs and paths are record fields, not fields
 of the FileEntry body.
 
-**FileEntry validity rules:**
+**FileEntry field-combination validity:**
 
 | `file_type` | `block_data` | `file_size` | `symlink_target` |
 | --- | --- | --- | --- |
@@ -593,7 +600,7 @@ References have no tag or length of their own; their containing vector provides
 the count. Readers MUST consume both fields for every reference. The target file
 ID and relationship ID MUST each exist in the effective archive.
 
-**Standard relationship types:**
+**Standard relationship semantics:**
 
 | ID | Stored name | Meaning |
 | --- | --- | --- |
@@ -611,7 +618,7 @@ ID and relationship ID MUST each exist in the effective archive.
 Custom relationship IDs MUST be at least `1000`; their stored names MUST be
 non-empty UTF-8 strings.
 
-For example, a reference from `normalized.csv` to `raw.csv` with
+The following are valid relationship-interpretation examples. A reference from `normalized.csv` to `raw.csv` with
 `DERIVED_FROM` means `normalized.csv` is derived from `raw.csv`; reversing the
 reference means `raw.csv` is derived from `normalized.csv`. A reference from
 `raw.csv` to `normalized.csv` with `SOURCE_OF` means `raw.csv` is a source of
@@ -630,7 +637,7 @@ recipient data.
 An EncryptionSection contains the recipient records associated with one sender public key.
 
 ```rust
-/// Encryption section - privacy-preserving access control
+/// Encryption section - per-sender recipient access data
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptionSection {
     pub recipients: Vec<([u8; 32], RecipientSection)>, // Recipient key and body
@@ -696,46 +703,12 @@ count followed by that many ULEB128 `file_id` and `file_key[32]` pairs. A
 repeated file ID is valid only when it has the same file key; readers MUST
 reject a conflicting duplicate file ID and file key.
 
-### 4.6 Error Types
-
-```rust
-#[derive(Debug)]
-pub enum PithosError {
-    Io(#[from] io::Error),
-    Conversion(String),
-    SystemTimeError(#[from] SystemTimeError),
-    StripPrefix(#[from] std::path::StripPrefixError),
-    WalkDir(#[from] walkdir::Error),
-    FastCDC(#[from] fastcdc::v2020::Error),
-    Serialization(#[from] SerializationError),
-    Deserialization(#[from] DeserializationError), 
-    Crypt(#[from] CryptError),
-    Crypt4GH(#[from] Crypt4GHError),
-    Cipher(#[from] ChaChaPoly1305Error),
-    Compression(#[from] ZstdError),
-    UnsupportedFeature(String),
-    InvalidBlockDataState(String),
-    BlockHashNotFound([u8; 32]),
-    FileNotFound(String),
-    DuplicateFileId(String),
-    RelationIdOccupied(u64),
-    PathOccupied(String),
-    InvalidFileType(String),
-    NoMatchingRecipient,
-    InvalidRecipientDataState(String),
-    Other(String),
-}
-```
-
 ## 5. Content Processing
 
 ### 5.1 Content-Defined Chunking
 
-Implementations SHOULD use content-defined chunking with recommended parameters:
-- **min_size**: 64 KB
-- **avg_size**: 128 KB
-- **max_size**: 512 KB
-- **window_size**: 48 bytes
+Writers MAY use content-defined chunking. Chunking parameters are writer guidance,
+not a compatibility requirement; see Appendix A.
 
 ### 5.2 Block Hashing
 
@@ -767,8 +740,8 @@ Readers MAY use bounded memory or temporary spill-backed storage while
 performing this verification, but MUST NOT release output derived from a block
 until its required transforms, size, and hash have all been verified.
 
-Examples, where `H` and `J` are distinct block hashes and `K` and `L` are block
-keys:
+**Block-list reuse examples:** where `H` and `J` are distinct block hashes and
+`K` and `L` are block keys, each row states its explicit verdict.
 
 | Case | Block lists or directory records | Validity and reconstruction result |
 | --- | --- | --- |
@@ -817,20 +790,14 @@ frame. Readers that support compression MUST decode any valid Zstandard frame
 and bound decompressed output by `original_size`; they do not need the writer's
 compression level.
 Readers MUST reject ProcessingFlags with any nonzero reserved bit.
+A writer that stores the plaintext payload rather than compressed data MUST
+encode compression value `0`.
 
-The current writer mapping is optional implementation guidance: `1` to Zstandard
-level `1`, `2` to `4`, `3` to `8`, `4` to `11`, `5` to `15`, `6` to `18`, and
-`7` to `22`. A writer MAY abandon unhelpful compression and store the plaintext
-payload instead, but MUST then write compression value `0`. For example, a
-writer MAY use a 4096-byte sample and a 0.85 compression-ratio threshold to
-decide whether compression is helpful; this heuristic is not a compatibility
-rule.
-
-Conforming encoders need not produce byte-identical Zstandard output. A future
-conformance appendix MUST provide decode-direction vectors containing stored
-compressed bytes, `original_size`, the expected plaintext, and its expected
-32-byte BLAKE3 hash. These vectors MUST decode to the expected plaintext with
-different supported Zstandard versions.
+Conforming encoders need not produce byte-identical Zstandard output. Appendix B
+will provide decode-direction vectors containing stored compressed bytes,
+`original_size`, the expected plaintext, and its expected 32-byte BLAKE3 hash.
+Those vectors MUST decode to the expected plaintext with different supported
+Zstandard versions.
 
 ## 6. Operations Overview
 
@@ -902,7 +869,7 @@ value `0` and encryption bit `0`. It supports decrypted BlockDataState lists.
 A base writer can create an archive containing only such local blocks and an
 empty Directory `encryption` vector.
 
-The following table defines the optional capabilities. A reader discovers a
+**Optional-capability indications:** a reader discovers a
 needed capability from the stored fields; it does not use a profile or a
 negotiation record.
 
@@ -928,6 +895,8 @@ readable. Attempting to read unavailable content MUST return
 `UnsupportedFeature` before releasing any output derived from that content.
 The reader MUST NOT reinterpret bytes requiring an unsupported capability as
 uncompressed or unencrypted bytes.
+
+**Unsupported-capability outcomes:**
 
 | Block form | Listing result | Content-read result |
 | --- | --- | --- |
@@ -996,3 +965,34 @@ Extensions MUST maintain backwards compatibility for reading.
 - Default file permissions: `0o644`
 - Default directory permissions: `0o755`
 - Default symlink permissions: `0o777`
+
+## Appendix A. Writer Guidance (Non-Normative)
+
+This appendix suggests writer choices only. It does not define archive
+conformance or reader behavior.
+
+Recommended content-defined chunking parameters are a 64 KB minimum, 128 KB
+average, 512 KB maximum, and 48-byte window.
+
+**Recommended compression mapping:** a writer may map ProcessingFlags values
+`1` through `7` to Zstandard levels `1`, `4`, `8`, `11`, `15`, `18`, and `22`,
+respectively. A writer may sample 4096 bytes and require a 0.85 compression
+ratio before compressing. These suggestions are non-normative.
+
+## Appendix B. Conformance Examples and Vectors
+
+Complete canonical and mutation vectors are intentionally not included in this
+draft revision. They will be added here without duplicating the normative rules
+in the main text.
+
+**Validation index:** vector IDs are reserved for the forthcoming vector set.
+Each completed vector will cite its authoritative rule and required result.
+
+| Condition class | Authoritative section | Vector ID | Required result |
+| --- | --- | --- | --- |
+| Header and common encoding | Sections 3.1, 4.1 | Reserved | Reject archive |
+| Directory framing and chain | Sections 4.3.1, 4.3.2 | Reserved | Reject archive |
+| Entry paths and FileEntry combinations | Sections 4.3.3, 4.4.3 | Reserved | Reject archive |
+| Block descriptors and local extents | Sections 4.2.2, 4.2.5 | Reserved | Reject archive |
+| Content transforms and hashes | Sections 5.2, 5.3, 5.4 | Reserved | Reject archive |
+| Unsupported optional capability | Section 8.2 | Reserved | Content unavailable |
