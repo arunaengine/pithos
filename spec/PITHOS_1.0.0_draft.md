@@ -58,7 +58,8 @@ this document governs.
 
 1. **Append-only architecture**: New data and metadata MUST be appended, never modifying existing content
 2. **Content-addressed storage**: All blocks MUST be identified by Blake3 hashes enabling deduplication
-3. **Privacy-preserving sharing**: Users MUST NOT be able to see who else has access to files
+3. **Encrypted recipient grants**: Encrypted recipient data protects its file-key
+   grants from parties that cannot decrypt it
 4. **Flexible metadata**: Metadata MUST be stored as regular files with special type markers
 5. **Progressive enhancement**: Implementations MUST support the base format and MAY support optional features
 6. **Limited recovery**: Recovery tools MAY treat block markers as untrusted candidates; directories provide block metadata
@@ -96,6 +97,15 @@ Section 4:
 8. Structures have no alignment bytes or implicit padding.
 9. A reader MUST consume exactly the bytes assigned to a structure and reject
    unknown tags.
+
+### 3.2 Resource Safety
+
+Readers MUST treat every encoded length and count as untrusted, use checked
+arithmetic and checked conversion to host sizes before indexing or allocating,
+and fail on allocation failure. Implementations MAY enforce documented,
+configured resource limits on input sizes, counts, and derived work; they MUST
+fail before an applicable limit is exceeded and MUST NOT expose a partial archive
+view after a resource or conversion failure.
 
 ## 4. Core Data Structures
 
@@ -753,6 +763,10 @@ the output bound, require the resulting plaintext length to equal the recorded
 original size, compute the complete plaintext digest, and compare it with the
 block hash before releasing any output derived from that block.
 
+Readers MAY use bounded memory or temporary spill-backed storage while
+performing this verification, but MUST NOT release output derived from a block
+until its required transforms, size, and hash have all been verified.
+
 Examples, where `H` and `J` are distinct block hashes and `K` and `L` are block
 keys:
 
@@ -785,9 +799,11 @@ shared secret is used directly as the ChaCha20-Poly1305 key to encrypt the
 decrypted recipient list; no intermediate KDF is used. Implementations MUST
 reject non-contributory X25519 public keys.
 
-An implementation MUST use a fresh nonce for every value encrypted under a
-given key. It MUST authenticate and decrypt an encrypted value successfully
-before using its plaintext or releasing output derived from it.
+An implementation MUST generate every nonce independently and uniformly at
+random with a cryptographically secure random number generator and MUST NOT
+deliberately reuse a nonce under the same key. It MUST authenticate and decrypt
+an encrypted value successfully before using its plaintext or releasing output
+derived from it.
 
 Version 1.0 deliberately has no SHAKE256 label, intermediate X25519 KDF, or
 AAD. A redesign of any of these inputs requires a new format version.
@@ -845,13 +861,36 @@ When archiving directory trees:
 
 ## 7. Security Considerations
 
-1. Implementations MUST verify the complete plaintext block size and hash after authenticated
-   decryption and decompression, and before releasing output derived from the block
-2. Directory CRC32 values MUST be validated
-3. Convergent encryption reveals when identical files exist (accepted trade-off)
-4. Networked external resolution can expose a caller to unsafe targets and
-   resource exhaustion; Section 4.2.6 defines the required resolver safeguards
-5. Path traversal attacks MUST be prevented through validation
+Directory CRC-32 detects accidental corruption of the serialized Directory bytes
+it covers; it is not authentication. Pithos 1.0 provides no archive-wide origin
+authentication or metadata integrity: an unauthenticated Directory can replace
+both a block hash and its referenced content. AEAD authenticates each encrypted
+value's ciphertext, but its empty AAD does not bind that value to its surrounding
+Directory, file, or recipient context. BLAKE3 verifies a recovered plaintext
+against the hash supplied by the Directory; without authenticated metadata, it
+does not authenticate archive origin.
+
+Encrypted `RecipientData` protects file-key grants only when its `Encrypted`
+form is used. Sender and recipient public keys, encryption-section and
+recipient counts, ciphertext lengths, and the segment timing of grants are
+visible. `RecipientData::Decrypted` exposes its file-key grants and provides no
+grant confidentiality.
+
+Recipient wrapping uses a raw static X25519 shared secret directly as its AEAD
+key, with no KDF, label, or AAD. Consequently, the construction has no domain
+separation, and each static sender-recipient key pair has one nonce-collision
+scope across all archives that use it; uniformly random CSPRNG nonces reduce but
+cannot eliminate collision risk. The plaintext-derived Directory block hash
+exposes block equality, and equal plaintext also derives the same convergent
+block key.
+
+Readers must verify each block as required by Section 5.2 before releasing its
+output. Networked external resolution can expose a caller to unsafe targets and
+resource exhaustion; Section 4.2.6 defines the required resolver safeguards.
+Extraction safety requires that archive paths are created without traversing
+archive-created or pre-existing symlinks, existing entries are not clobbered by
+default, and special permission bits are not applied without explicit caller
+policy; Sections 8.3 and 4.4.3 define these requirements.
 
 ## 8. Implementation Requirements
 
@@ -916,9 +955,10 @@ and an empty Directory `encryption` vector.
 
 An extractor on a platform that supports symbolic links MAY create a symbolic
 link with the stored target. While creating other archive entries, it MUST NOT
-follow an archive-created or pre-existing symbolic link. On a platform that does
-not support symbolic links, an extractor MAY reject the operation or skip the
-symlink with a diagnostic, but MUST NOT silently change the entry type.
+traverse an archive-created or pre-existing symbolic link. An extractor MUST
+NOT clobber an existing entry by default. On a platform that does not support
+symbolic links, an extractor MAY reject the operation or skip the symlink with a
+diagnostic, but MUST NOT silently change the entry type.
 
 #### Permissions
 
