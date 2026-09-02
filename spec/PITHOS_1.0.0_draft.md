@@ -981,18 +981,207 @@ ratio before compressing. These suggestions are non-normative.
 
 ## Appendix B. Conformance Examples and Vectors
 
-Complete canonical and mutation vectors are intentionally not included in this
-draft revision. They will be added here without duplicating the normative rules
-in the main text.
+This appendix is informative. The cited sections remain authoritative. Complete
+archives appear only here so that an implementation can use these bytes directly
+as test input.
 
-**Validation index:** vector IDs are reserved for the forthcoming vector set.
-Each completed vector will cite its authoritative rule and required result.
+### B.1 Notation and Byte Anchors
+
+Hex offsets are zero-based file offsets. Each hex line contains at most 16 bytes;
+`0000:` is an offset, not encoded data. Integers without a fixed-width suffix use
+shortest ULEB128. `u64be` and `u32be` are big-endian. The header is always
+`50 49 54 48 01 00` (`PITH`, version `0x0100`); the other magic values are
+`42 4c 43 4b` (`BLCK`) and `50 49 54 48 4f 53 44 52` (`PITHOSDR`).
+
+CRC values use Section 4.3's CRC-32/ISO-HDLC definition. As a check on an
+implementation, CRC-32 of ASCII `123456789` is `cb f4 39 26`.
+
+### B.2 Canonical Archives
+
+#### CV-BASE-EMPTY-146
+
+| Item | Value |
+| --- | --- |
+| Purpose | Minimal valid base archive with its ten required relationships |
+| Required capability | Base reader |
+| Total length | 152 bytes (6-byte header plus 146-byte Directory) |
+| Expected result | Valid empty archive |
+
+```text
+0000: 50 49 54 48 01 00 50 49 54 48 4f 53 44 52 00 00
+0010: 00 0a 00 09 44 45 53 43 52 49 42 45 53 01 09 41
+0020: 4e 4e 4f 54 41 54 45 53 02 0c 44 45 52 49 56 45
+0030: 44 5f 46 52 4f 4d 03 09 53 4f 55 52 43 45 5f 4f
+0040: 46 04 10 50 52 45 56 49 4f 55 53 5f 56 45 52 53
+0050: 49 4f 4e 05 0c 4e 45 58 54 5f 56 45 52 53 49 4f
+0060: 4e 06 07 50 41 52 54 5f 4f 46 07 08 43 4f 4e 54
+0070: 41 49 4e 53 08 08 49 4e 50 55 54 5f 54 4f 09 0b
+0080: 4f 55 54 50 55 54 5f 46 52 4f 4d 00 00 00 00 00
+0090: 00 00 00 92 a0 cf 03 d2
+```
+
+| Offset range | Bytes | Field | Decoded value | Meaning |
+| --- | --- | --- | --- | --- |
+| `00..05` | `50 49 54 48 01 00` | header | Pithos 1.0 | File header |
+| `06..0d` | `50 49 54 48 4f 53 44 52` | identifier | `PITHOSDR` | Directory marker |
+| `0e..11` | `00 00 00 0a` | parent, files, blocks, relations count | none, 0, 0, 10 | Empty base records |
+| `12..8a` | shown | relations | IDs 0 through 9 | Required standard definitions in order |
+| `8b` | `00` | encryption count | 0 | No grants |
+| `8c..93` | `00 00 00 00 00 00 00 92` | `dir_len` | 146 | Complete Directory length |
+| `94..97` | `a0 cf 03 d2` | CRC | `0xa0cf03d2` | Stored CRC |
+
+The Directory starts at `0x06`; `dir_len = 146`; its CRC-covered range is
+`0x06..0x93` inclusive (142 bytes), and its stored CRC is at `0x94..0x97`.
+Length arithmetic is `8 + 1 + 1 + 1 + 1 + 121 + 1 + 8 + 4 = 146`.
+The output has no entries or blocks and has the ten Section 4.3.2 relationships.
+
+#### CV-APPEND-EMPTY-28
+
+| Item | Value |
+| --- | --- |
+| Purpose | Valid base Directory followed by the smallest valid appended terminal Directory |
+| Required capability | Base reader with append-chain support |
+| Total length | 180 bytes |
+| Expected result | Valid empty archive; terminal parent is the base Directory |
+
+```text
+0000: 50 49 54 48 01 00 50 49 54 48 4f 53 44 52 00 00
+0010: 00 0a 00 09 44 45 53 43 52 49 42 45 53 01 09 41
+0020: 4e 4e 4f 54 41 54 45 53 02 0c 44 45 52 49 56 45
+0030: 44 5f 46 52 4f 4d 03 09 53 4f 55 52 43 45 5f 4f
+0040: 46 04 10 50 52 45 56 49 4f 55 53 5f 56 45 52 53
+0050: 49 4f 4e 05 0c 4e 45 58 54 5f 56 45 52 53 49 4f
+0060: 4e 06 07 50 41 52 54 5f 4f 46 07 08 43 4f 4e 54
+0070: 41 49 4e 53 08 08 49 4e 50 55 54 5f 54 4f 09 0b
+0080: 4f 55 54 50 55 54 5f 46 52 4f 4d 00 00 00 00 00
+0090: 00 00 00 92 a0 cf 03 d2 50 49 54 48 4f 53 44 52
+00a0: 01 06 92 01 00 00 00 00 00 00 00 00 00 00 00 1c
+00b0: 50 a2 dc 75
+```
+
+| Offset range | Bytes | Field | Decoded value | Meaning |
+| --- | --- | --- | --- | --- |
+| `00..97` | same as CV-BASE-EMPTY-146 | base segment | 146-byte Directory | Valid base |
+| `98..9f` | `50 49 54 48 4f 53 44 52` | identifier | `PITHOSDR` | Terminal marker |
+| `a0..a3` | `01 06 92 01` | parent | start 6, length 146 | Backward parent range |
+| `a4..a7` | `00 00 00 00` | vector counts | 0, 0, 0, 0 | Empty files, blocks, relations, encryption |
+| `a8..af` | `00 00 00 00 00 00 00 1c` | `dir_len` | 28 | Terminal length |
+| `b0..b3` | `50 a2 dc 75` | CRC | `0x50a2dc75` | Stored CRC |
+
+The terminal Directory starts at `0x98`; `dir_len = 28`; its CRC-covered range
+is `0x98..0xaf`; CRC is `0x50a2dc75` at `0xb0..0xb3`. Its arithmetic is
+`8 + (1 + 1 + 2) + 4 + 8 + 4 = 28`. Expected output is the same
+empty entry set and inherited ten relationships as the base.
+
+#### CV-LOCAL-HELLO-279
+
+| Item | Value |
+| --- | --- |
+| Purpose | Plain local block and one `Data` entry named `hello` |
+| Required capability | Base reader |
+| Total length | 279 bytes |
+| Expected result | Valid archive; read `hello` as ASCII `hello` |
+
+```text
+0000: 50 49 54 48 01 00 42 4c 43 4b 68 65 6c 6c 6f 50
+0010: 49 54 48 4f 53 44 52 00 01 00 05 68 65 6c 6c 6f
+0020: 01 01 01 ea 8f 16 3d b3 86 82 92 5e 44 91 c5 e5
+0030: 8d 4b b3 50 6e f8 c1 4e b7 8a 86 e9 08 c5 62 4a
+0040: 67 20 0f 12 34 07 5a e4 a1 e7 73 16 cf 2d 80 00
+0050: 97 45 81 a3 43 b9 eb bc a7 e3 d1 db 83 39 4c 30
+0060: f2 21 62 00 00 05 a4 03 00 00 01 ea 8f 16 3d b3
+0070: 86 82 92 5e 44 91 c5 e5 8d 4b b3 50 6e f8 c1 4e
+0080: b7 8a 86 e9 08 c5 62 4a 67 20 0f 06 05 05 00 00
+0090: 0a 00 09 44 45 53 43 52 49 42 45 53 01 09 41 4e
+00a0: 4e 4f 54 41 54 45 53 02 0c 44 45 52 49 56 45 44
+00b0: 5f 46 52 4f 4d 03 09 53 4f 55 52 43 45 5f 4f 46
+00c0: 04 10 50 52 45 56 49 4f 55 53 5f 56 45 52 53 49
+00d0: 4f 4e 05 0c 4e 45 58 54 5f 56 45 52 53 49 4f 4e
+00e0: 06 07 50 41 52 54 5f 4f 46 07 08 43 4f 4e 54 41
+00f0: 49 4e 53 08 08 49 4e 50 55 54 5f 54 4f 09 0b 4f
+0100: 55 54 50 55 54 5f 46 52 4f 4d 00 00 00 00 00 00
+0110: 00 01 08 7c 05 e6 a2
+```
+
+| Offset range | Bytes | Field | Decoded value | Meaning |
+| --- | --- | --- | --- | --- |
+| `00..0e` | header, `42 4c 43 4b 68 65 6c 6c 6f` | header and block | `BLCK || hello` | Local extent `[6, 15)` |
+| `0f..16` | `PITHOSDR` | identifier | Directory | Directory start |
+| `17..1f` | `00 01 00 05 68 65 6c 6c 6f` | parent, files, ID, path | base; one record; ID 0; path `hello` | No trailing slash |
+| `20..69` | shown | FileEntry | Data, decrypted list of one pair, times 0, size 5, permissions `0o644`, no references/target | Valid Data combination |
+| `6a..8f` | shown | blocks count and record | one hash; offset 6 at `8b`; stored/original size 5; flags 0 at `8e`; Local at `8f` | Plain local descriptor |
+| `90..109` | shown | relations count and records | IDs 0 through 9 | Required base definitions |
+| `10a` | `00` | encryption count | 0 | No grants |
+| `10b..112` | `00 00 00 00 00 00 01 08` | `dir_len` | 264 | Complete Directory length |
+| `113..116` | `7c 05 e6 a2` | CRC | `0x7c05e6a2` | Stored CRC |
+
+The Directory starts at `0x0f`; `dir_len = 264`; its CRC-covered range is
+`0x0f..0x112`; CRC is `0x7c05e6a2` at `0x113..0x116`; `15 + 264 = 279`.
+The decoded entry is ID 0, path `hello`, type Data, size 5, mode `0o644`.
+Its sole block plaintext is `68 65 6c 6c 6f`; its BLAKE3 hash is
+`ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f`; its
+block key in the decrypted pair is SHAKE256(`hello`)[0..32],
+`1234075ae4a1e77316cf2d8000974581a343b9ebbca7e3d1db83394c30f22162`.
+
+### B.3 Processing Vectors
+
+| Vector ID | Stored bytes | `original_size` | Expected plaintext | BLAKE3 |
+| --- | --- | --- | --- | --- |
+| PV-ZSTD-HELLO | `28 b5 2f fd 04 48 29 00 00 68 65 6c 6c 6f a3 6d 9f 88` | 5 | `68 65 6c 6c 6f` | `ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f` |
+| PV-ZSTD-TEXT | `28 b5 2f fd 04 58 c1 00 00 50 69 74 68 6f 73 20 5a 73 74 61 6e 64 61 72 64 20 76 65 63 74 6f 72 0a 41 f2 4f db` | 24 | ASCII `Pithos Zstandard vector\n` | `453c33f042159bc7dca06dcc08111d69c53fe167f329e084a85d950b70d84560` |
+
+`PV-RECIPIENT-WRAP-01` is a known-answer test for Section 5.3, not a
+production nonce choice. Alice private key
+`77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a` and
+Bob public key `de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f`
+produce raw X25519 shared secret
+`4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742`.
+With empty AAD, nonce `000102030405060708090a0b`, and decrypted
+RecipientData `01 07` followed by bytes `00` through `1f` (one record,
+file ID 7, 32-byte file key), the stored `nonce || ciphertext || tag` is:
+
+```text
+0000: 00 01 02 03 04 05 06 07 08 09 0a 0b e7 f1 ee 41
+0010: ba 83 3f 09 8e d2 9f ec a3 de f9 c9 62 fc 8d c0
+0020: cf 87 24 1b ff 58 9b 33 26 6a 0d fa f4 a5 eb a0
+0030: 83 d4 2e 52 db 61 81 9d 09 53 81 70 aa e7
+```
+
+Successful decryption yields exactly the stated 34-byte RecipientData
+plaintext. Fixed nonces are permitted here only as test inputs; writers use
+random nonces as required by Section 5.3.
+
+### B.4 Rejection Mutations
+
+Each `RV-*` vector is a mutation of the named canonical vector. “Re-encode”
+means update all affected vector lengths, `dir_len`, and the CRC so parsing
+reaches the cited semantic rule; it does not describe a separate archive.
+
+| Vector ID | Base and mutation | Clause | Required result |
+| --- | --- | --- | --- |
+| RV-ULEB | CV-BASE-EMPTY-146: replace relations count at `11` `0a` with `80`, leaving following `00`, to make an overlong ULEB128 zero; replace CRC at `94..97` with `d8 1f 68 18` | 3.1 | Reject archive |
+| RV-FLAGS | CV-LOCAL-HELLO-279: replace flags at `8e` `00` with `10` and CRC `7c 05 e6 a2` with `7b d3 b1 03` | 4.2.3 | Reject archive |
+| RV-UNKNOWN-TAG | CV-LOCAL-HELLO-279: replace Local tag at `8f` `00` with `02` and CRC with `86 cf 12 82` | 3.1, 4.2.4 | Reject archive |
+| RV-DUPLICATES | CV-LOCAL-HELLO-279: append a second file record, block record, or relationship with the same ID, path, hash, or relationship ID; re-encode | 4.2.2, 4.3 | Reject archive |
+| RV-PATH | CV-LOCAL-HELLO-279: replace path bytes `hello` at `1b..1f` with `/hell`, `hell/`, `a\\b`, `.`, or `C:` and adjust length if needed; re-encode | 4.3.3 | Reject archive |
+| RV-SYMLINK | Re-encode the file as Symlink with nonempty block list, nonzero size, absent target, absolute target, or target escaping root | 4.4.3 | Reject archive |
+| RV-FILETYPE | CV-LOCAL-HELLO-279: replace FileType at `20` `01` with `04` and CRC with `50 f4 25 95` | 4.4.1 | Reject archive |
+| RV-PERMISSIONS | CV-LOCAL-HELLO-279: replace permissions at `66..67` `a4 03` with `80 20` (ULEB128 `0x1000`) and CRC with `9f 6a f3 6e` | 4.4.3 | Reject archive |
+| RV-PARENT | CV-APPEND-EMPTY-28: change parent start at `a1` from `06` to `98` (self-link) and CRC `50 a2 dc 75` to `b7 34 ab f4`, or change parent length at `a2..a3` from `92 01` to `1c` and re-encode | 4.3 | Reject archive |
+| RV-UNDERFLOW | CV-BASE-EMPTY-146: replace terminal `dir_len` at `8c..93` with `00 00 00 00 00 00 00 99` and CRC with `37 1d da 5a` | 4.3.1 | Reject archive |
+| RV-TRAILING | CV-BASE-EMPTY-146: append `00` after `d2` | 4.3.1 | Reject archive |
+| RV-CRC | CV-BASE-EMPTY-146: replace CRC byte at `97` `d2` with `d3` | 4.3 | Reject archive |
+| RV-EXTENT | CV-LOCAL-HELLO-279: change descriptor offset at `8b` from `06` to `0f` and CRC to `62 3c 8b 49`, or add a second overlapping Local descriptor; re-encode | 4.2.5 | Reject archive |
+| RV-SHORT-ENCRYPTED | CV-LOCAL-HELLO-279: set flags `8e` to `08`, retain stored size `05`, and CRC to `92 56 4e 52` | 4.2.5 | Reject archive |
+| RV-EXTERNAL | Re-encode the hello descriptor as External (offset zero and location identifier). The archive is valid and listable; when an enabled resolver returns `BLCK ||` four payload bytes while `stored_size` is 5, its content read fails before output. Without external capability, content is unavailable. | 4.2.6, 8.2 | Content read fails before output / content unavailable |
+| RV-CROSS-SIZE | CV-LOCAL-HELLO-279: append a new terminal Directory whose parent is its 264-byte Directory at start `0x0f`, repeats the existing hello hash with `original_size` 6, and has re-encoded parent, footer, and CRC | 4.3.2 | Reject archive |
+
+### B.5 Validation Index
 
 | Condition class | Authoritative section | Vector ID | Required result |
 | --- | --- | --- | --- |
-| Header and common encoding | Sections 3.1, 4.1 | Reserved | Reject archive |
-| Directory framing and chain | Sections 4.3.1, 4.3.2 | Reserved | Reject archive |
-| Entry paths and FileEntry combinations | Sections 4.3.3, 4.4.3 | Reserved | Reject archive |
-| Block descriptors and local extents | Sections 4.2.2, 4.2.5 | Reserved | Reject archive |
-| Content transforms and hashes | Sections 5.2, 5.3, 5.4 | Reserved | Reject archive |
-| Unsupported optional capability | Section 8.2 | Reserved | Content unavailable |
+| Header, integer, tags, and flags | 3.1, 4.1, 4.2.3-4.2.4 | RV-ULEB, RV-FLAGS, RV-UNKNOWN-TAG | Reject archive |
+| Directory framing, CRC, and chain | 4.3, 4.3.1, 4.3.2 | CV-BASE-EMPTY-146, CV-APPEND-EMPTY-28, RV-PARENT, RV-UNDERFLOW, RV-TRAILING, RV-CRC, RV-CROSS-SIZE | Valid archive or reject archive as stated |
+| Entries and paths | 4.3.3, 4.4.1, 4.4.3 | CV-LOCAL-HELLO-279, RV-DUPLICATES, RV-PATH, RV-SYMLINK, RV-FILETYPE, RV-PERMISSIONS | Valid archive or reject archive as stated |
+| Block locations and extents | 4.2.2, 4.2.5, 4.2.6, 8.2 | CV-LOCAL-HELLO-279, RV-EXTENT, RV-SHORT-ENCRYPTED, RV-EXTERNAL | Valid archive, reject archive, content read fails before output, or content unavailable as stated |
+| Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01 | Decode/decrypt to stated output |
