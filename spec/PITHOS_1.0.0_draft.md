@@ -90,8 +90,13 @@ Section 4:
 
 1. Fixed byte arrays are stored exactly as shown, with no length prefix.
 2. `u16`, `u32`, and `u64` fields explicitly marked fixed-width are big-endian.
-3. Other unsigned integers use the shortest valid ULEB128 form. Readers MUST
-   reject truncated, overlong, and overflowing encodings.
+3. Other unsigned integers use ULEB128. For a field of width `N`, an encoding is
+   valid when it terminates within `ceil(N / 7)` bytes and decodes to a value
+   representable by that field. Non-minimal encodings within that bound are
+   valid. Writers SHOULD use the shortest valid encoding. Readers MUST accept
+   valid non-minimal encodings and MUST reject truncated, unterminated, or
+   overflowing encodings. ULEB128 string-length and vector-count prefixes have
+   `u64` width.
 4. A string is a ULEB128 byte length followed by that many UTF-8 bytes.
 5. A vector is a ULEB128 item count followed by the items in order.
 6. A tuple stores its members in the stated order.
@@ -382,6 +387,13 @@ relationship definitions are allowed; conflicting definitions of one
 relationship ID are invalid. Exact repeated recipient grants are allowed;
 conflicting grants for the same sender public key and recipient public key are
 invalid.
+
+Recipient-grant equality is structural after ULEB128 decoding. Two grants are
+equal when their sender public key, recipient public key, `RecipientData`
+variant, and decoded body are equal. Encrypted bodies compare their complete
+encrypted byte vectors. Decrypted bodies compare their ordered `(file_id,
+file_key)` records. Different valid ULEB128 encodings of the same count, length,
+or file ID do not make otherwise equal grants conflict.
 
 The base Directory MUST store these ten standard relationship definitions in its
 `relations` vector, in ascending relationship-ID order: `0 DESCRIBES`,
@@ -989,7 +1001,9 @@ as test input.
 
 Hex offsets are zero-based file offsets. Each hex line contains at most 16 bytes;
 `0000:` is an offset, not encoded data. Integers without a fixed-width suffix use
-shortest ULEB128. `u64be` and `u32be` are big-endian. The header is always
+shortest ULEB128 in these deterministic vectors, although Section 3.1 also
+permits bounded non-minimal forms. `u64be` and `u32be` are big-endian. The header
+is always
 `50 49 54 48 01 00` (`PITH`, version `0x0100`); the other magic values are
 `42 4c 43 4b` (`BLCK`) and `50 49 54 48 4f 53 44 52` (`PITHOSDR`).
 
@@ -1151,15 +1165,17 @@ Successful decryption yields exactly the stated 34-byte RecipientData
 plaintext. Fixed nonces are permitted here only as test inputs; writers use
 random nonces as required by Section 5.3.
 
-### B.4 Rejection Mutations
+### B.4 Acceptance and Rejection Mutations
 
-Each `RV-*` vector is a mutation of the named canonical vector. “Re-encode”
-means update all affected vector lengths, `dir_len`, and the CRC so parsing
-reaches the cited semantic rule; it does not describe a separate archive.
+Each `AV-*` or `RV-*` vector is a mutation of the named canonical vector.
+“Re-encode” means update all affected vector lengths, `dir_len`, and the CRC so
+parsing reaches the cited semantic rule; it does not describe a separate
+archive.
 
 | Vector ID | Base and mutation | Clause | Required result |
 | --- | --- | --- | --- |
-| RV-ULEB | CV-BASE-EMPTY-146: replace relations count at `11` `0a` with `80`, leaving following `00`, to make an overlong ULEB128 zero; replace CRC at `94..97` with `d8 1f 68 18` | 3.1 | Reject archive |
+| AV-ULEB-NONMINIMAL | CV-BASE-EMPTY-146: replace relations count at `11` `0a` with `8a 00`, then re-encode framing | 3.1 | Accept archive as the same empty archive |
+| RV-ULEB | CV-BASE-EMPTY-146: replace relations count at `11` `0a` with the overflowing ten-byte `ff ff ff ff ff ff ff ff ff 02`, then re-encode framing | 3.1 | Reject archive |
 | RV-FLAGS | CV-LOCAL-HELLO-279: replace flags at `8e` `00` with `10` and CRC `7c 05 e6 a2` with `7b d3 b1 03` | 4.2.3 | Reject archive |
 | RV-UNKNOWN-TAG | CV-LOCAL-HELLO-279: replace Local tag at `8f` `00` with `02` and CRC with `86 cf 12 82` | 3.1, 4.2.4 | Reject archive |
 | RV-DUPLICATES | CV-LOCAL-HELLO-279: append a second file record, block record, or relationship with the same ID, path, hash, or relationship ID; re-encode | 4.2.2, 4.3 | Reject archive |
@@ -1180,7 +1196,7 @@ reaches the cited semantic rule; it does not describe a separate archive.
 
 | Condition class | Authoritative section | Vector ID | Required result |
 | --- | --- | --- | --- |
-| Header, integer, tags, and flags | 3.1, 4.1, 4.2.3-4.2.4 | RV-ULEB, RV-FLAGS, RV-UNKNOWN-TAG | Reject archive |
+| Header, integer, tags, and flags | 3.1, 4.1, 4.2.3-4.2.4 | AV-ULEB-NONMINIMAL, RV-ULEB, RV-FLAGS, RV-UNKNOWN-TAG | Accept or reject archive as stated |
 | Directory framing, CRC, and chain | 4.3, 4.3.1, 4.3.2 | CV-BASE-EMPTY-146, CV-APPEND-EMPTY-28, RV-PARENT, RV-UNDERFLOW, RV-TRAILING, RV-CRC, RV-CROSS-SIZE | Valid archive or reject archive as stated |
 | Entries and paths | 4.3.3, 4.4.1, 4.4.3 | CV-LOCAL-HELLO-279, RV-DUPLICATES, RV-PATH, RV-SYMLINK, RV-FILETYPE, RV-PERMISSIONS | Valid archive or reject archive as stated |
 | Block locations and extents | 4.2.2, 4.2.5, 4.2.6, 8.2 | CV-LOCAL-HELLO-279, RV-EXTENT, RV-SHORT-ENCRYPTED, RV-EXTERNAL | Valid archive, reject archive, content read fails before output, or content unavailable as stated |
