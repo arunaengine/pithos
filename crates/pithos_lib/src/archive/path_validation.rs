@@ -90,34 +90,62 @@ pub(crate) fn validate_symlink_target(path: &str, target: &str) -> Result<(), Pi
 
 pub(crate) fn validate_entry(path: &str, entry: &FileEntry) -> Result<(), PithosError> {
     validate_entry_path(path)?;
-    match (&entry.file_type, &entry.symlink_target, &entry.block_data) {
-        (FileType::Symlink, Some(target), BlockDataState::Decrypted(blocks))
-            if blocks.is_empty() =>
-        {
-            validate_symlink_target(path, target)
-        }
-        (FileType::Symlink, None, _) => Err(PithosError::InvalidSymlinkEntry {
-            path: path.into(),
-            reason: "missing target".into(),
-        }),
-        (FileType::Symlink, Some(_), BlockDataState::Decrypted(blocks)) if !blocks.is_empty() => {
-            Err(PithosError::InvalidSymlinkEntry {
-                path: path.into(),
-                reason: "symlink has block references".into(),
-            })
-        }
-        (FileType::Symlink, Some(_), BlockDataState::Encrypted(_)) => {
-            Err(PithosError::InvalidSymlinkEntry {
-                path: path.into(),
-                reason: "encrypted symlink block data".into(),
-            })
-        }
-        (_, Some(_), _) => Err(PithosError::InvalidSymlinkEntry {
-            path: path.into(),
-            reason: "non-symlink has a target".into(),
-        }),
-        _ => Ok(()),
+    if entry.permissions & !0o7777 != 0 {
+        return Err(PithosError::InvalidPermissions(entry.permissions));
     }
+    match entry.file_type {
+        FileType::Data | FileType::Metadata => {
+            if entry.symlink_target.is_some() {
+                return Err(PithosError::InvalidSymlinkEntry {
+                    path: path.into(),
+                    reason: "non-symlink has a target".into(),
+                });
+            }
+        }
+        FileType::Directory => {
+            if entry.file_size != 0 {
+                return Err(PithosError::InvalidEntryCombination {
+                    path: path.into(),
+                    reason: "directory has nonzero file size".into(),
+                });
+            }
+            if entry.symlink_target.is_some() {
+                return Err(PithosError::InvalidSymlinkEntry {
+                    path: path.into(),
+                    reason: "non-symlink has a target".into(),
+                });
+            }
+            if !matches!(&entry.block_data, BlockDataState::Decrypted(blocks) if blocks.is_empty())
+            {
+                return Err(PithosError::InvalidBlockDataState(
+                    "directory has block material".into(),
+                ));
+            }
+        }
+        FileType::Symlink => {
+            if entry.file_size != 0 {
+                return Err(PithosError::InvalidEntryCombination {
+                    path: path.into(),
+                    reason: "symlink has nonzero file size".into(),
+                });
+            }
+            let target = entry.symlink_target.as_deref().ok_or_else(|| {
+                PithosError::InvalidSymlinkEntry {
+                    path: path.into(),
+                    reason: "missing target".into(),
+                }
+            })?;
+            if !matches!(&entry.block_data, BlockDataState::Decrypted(blocks) if blocks.is_empty())
+            {
+                return Err(PithosError::InvalidSymlinkEntry {
+                    path: path.into(),
+                    reason: "symlink has block material".into(),
+                });
+            }
+            validate_symlink_target(path, target)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_candidate_hierarchy(
@@ -213,13 +241,23 @@ mod tests {
     use super::*;
 
     fn entry(file_type: FileType, target: Option<&str>, blocks: BlockDataState) -> FileEntry {
+        configured_entry(file_type, target, blocks, 0, 0o644)
+    }
+
+    fn configured_entry(
+        file_type: FileType,
+        target: Option<&str>,
+        blocks: BlockDataState,
+        file_size: u64,
+        permissions: u32,
+    ) -> FileEntry {
         FileEntry {
             file_type,
             block_data: blocks,
             created: 0,
             modified: 0,
-            file_size: 0,
-            permissions: 0o644,
+            file_size,
+            permissions,
             references: vec![],
             symlink_target: target.map(str::to_owned),
         }
@@ -325,6 +363,141 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn entry_semantics_cover_every_file_type_combination() {
+        for valid in [
+            configured_entry(
+                FileType::Data,
+                None,
+                BlockDataState::Encrypted(vec![1]),
+                12,
+                0o644,
+            ),
+            configured_entry(
+                FileType::Metadata,
+                None,
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o600,
+            ),
+            configured_entry(
+                FileType::Directory,
+                None,
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                Some("target"),
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o777,
+            ),
+        ] {
+            assert!(validate_entry("entry", &valid).is_ok(), "{valid:?}");
+        }
+
+        for invalid in [
+            configured_entry(
+                FileType::Data,
+                Some("target"),
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o644,
+            ),
+            configured_entry(
+                FileType::Metadata,
+                Some("target"),
+                BlockDataState::Encrypted(vec![]),
+                0,
+                0o644,
+            ),
+            configured_entry(
+                FileType::Directory,
+                None,
+                BlockDataState::Encrypted(vec![]),
+                0,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Directory,
+                None,
+                BlockDataState::Decrypted(vec![([1; 32], [2; 32])].into()),
+                0,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Directory,
+                Some("target"),
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Directory,
+                None,
+                BlockDataState::Decrypted(vec![].into()),
+                1,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                None,
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o777,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                Some("target"),
+                BlockDataState::Encrypted(vec![]),
+                0,
+                0o777,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                Some("target"),
+                BlockDataState::Decrypted(vec![([1; 32], [2; 32])].into()),
+                0,
+                0o777,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                Some("target"),
+                BlockDataState::Decrypted(vec![].into()),
+                1,
+                0o777,
+            ),
+        ] {
+            assert!(validate_entry("entry", &invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn entry_permissions_accept_only_the_defined_twelve_bits() {
+        for permissions in [0, 0o7777] {
+            let entry = configured_entry(
+                FileType::Data,
+                None,
+                BlockDataState::Encrypted(vec![]),
+                0,
+                permissions,
+            );
+            assert!(validate_entry("entry", &entry).is_ok(), "{permissions:#o}");
+        }
+        for permissions in [0o10000, u32::MAX] {
+            let entry = configured_entry(
+                FileType::Data,
+                None,
+                BlockDataState::Encrypted(vec![]),
+                0,
+                permissions,
+            );
+            assert!(validate_entry("entry", &entry).is_err(), "{permissions:#o}");
+        }
     }
 
     #[test]

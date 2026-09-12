@@ -51,6 +51,8 @@ pub enum PithosError {
     },
     #[error("Invalid block data state: {0}")]
     InvalidBlockDataState(String),
+    #[error("invalid entry combination for {path}: {reason}")]
+    InvalidEntryCombination { path: String, reason: String },
     #[error("content is unavailable with the supplied access keys")]
     ContentUnavailable,
     #[error("append snapshot does not contain file id {0}")]
@@ -81,6 +83,10 @@ pub enum PithosError {
     ReservedProcessingBits(u8),
     #[error("conflicting relationship definition for id {0}")]
     ConflictingRelationshipDefinition(u64),
+    #[error("invalid relationship definition for id {id}: {reason}")]
+    InvalidRelationshipDefinition { id: u64, reason: String },
+    #[error("invalid permissions: {0:#o}")]
+    InvalidPermissions(u32),
     #[error("unknown relationship id {0}")]
     UnknownRelationshipId(u64),
     #[error("missing reference target file id {0}")]

@@ -603,17 +603,18 @@ mod tests {
         std::fs::write(&archive_path, &bytes).unwrap();
         let original = bytes;
 
-        assert!(matches!(
-            append_files(
-                &archive_path,
-                AppendOptions::new(sender, vec![recipient]),
-                &[input_path],
-            ),
-            Err(FsError::Core {
-                source: PithosError::ConflictingRelationshipDefinition(0),
-                ..
-            })
-        ));
+        let error = append_files(
+            &archive_path,
+            AppendOptions::new(sender, vec![recipient]),
+            &[input_path],
+        )
+        .unwrap_err();
+        assert!(matches!(error, FsError::Core { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid relationship definition")
+        );
         assert_eq!(std::fs::read(&archive_path).unwrap(), original);
     }
 

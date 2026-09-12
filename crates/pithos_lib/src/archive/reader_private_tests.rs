@@ -8,7 +8,8 @@ use crate::crypto::{self, PrivateKey, PublicKey};
 use crate::error::PithosError;
 use crate::format::limits::DeserializationLimits;
 use crate::format::wire::{
-    BlockDataState, BlockLocation, Directory, EncryptionSection, RecipientData, RecipientSection,
+    BlockDataState, BlockLocation, Directory, EncryptionSection, FileType, RecipientData,
+    RecipientSection,
 };
 use crate::source::{ArchiveSource, MemorySource, SourceError};
 use indexmap::IndexMap;
@@ -133,6 +134,40 @@ fn rewrite_terminal_directory(path: &Path, mutate: impl FnOnce(&mut Directory)) 
     std::fs::write(path, archive).unwrap();
 }
 
+fn decode_terminal_directory(path: &Path) -> Directory {
+    let archive = std::fs::read(path).unwrap();
+    let (start, _) = directory_bounds(&archive);
+    crate::format::codec::decode_directory(
+        &mut Cursor::new(&archive[start..]),
+        &DeserializationLimits::default(),
+    )
+    .unwrap()
+}
+
+fn append_empty_directory(path: &Path, relations: Option<Vec<(u64, String)>>) {
+    let mut archive = std::fs::read(path).unwrap();
+    let (parent_start, parent_len) = directory_bounds(&archive);
+    let mut directory = Directory::new(
+        Some((parent_start as u64, parent_len as u64)),
+        crate::format::entries::WireEntries::new(),
+        IndexMap::new(),
+    );
+    if let Some(relations) = relations {
+        directory.relations = relations;
+    }
+    crate::format::codec::update_directory_len(&mut directory).unwrap();
+    crate::format::codec::update_directory_crc(&mut directory).unwrap();
+    crate::format::codec::encode_directory(&directory, &mut archive).unwrap();
+    std::fs::write(path, archive).unwrap();
+}
+
+fn open_without_keys(path: &Path) -> Result<Archive<MemorySource>, PithosError> {
+    Archive::open(
+        MemorySource::new(Arc::<[u8]>::from(std::fs::read(path).unwrap())),
+        OpenOptions::default(),
+    )
+}
+
 fn first_block(path: &Path) -> (u64, u64) {
     let bytes = std::fs::read(path).unwrap();
     let (start, _) = directory_bounds(&bytes);
@@ -169,6 +204,109 @@ impl Write for RecordingSink {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[test]
+fn writers_emit_only_the_required_standard_relationship_table() {
+    let (_temporary, path) = fixture();
+    let expected = [
+        (0, "DESCRIBES"),
+        (1, "ANNOTATES"),
+        (2, "DERIVED_FROM"),
+        (3, "SOURCE_OF"),
+        (4, "PREVIOUS_VERSION"),
+        (5, "NEXT_VERSION"),
+        (6, "PART_OF"),
+        (7, "CONTAINS"),
+        (8, "INPUT_TO"),
+        (9, "OUTPUT_FROM"),
+    ];
+    assert_eq!(
+        decode_terminal_directory(&path)
+            .relations
+            .iter()
+            .map(|(id, name)| (*id, name.as_str()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    append_empty_directory(&path, None);
+    assert!(decode_terminal_directory(&path).relations.is_empty());
+    open_without_keys(&path).unwrap();
+}
+
+#[test]
+fn archive_rejects_invalid_base_standard_relationship_tables() {
+    let mutations: [fn(&mut Directory); 3] = [
+        |directory| directory.relations.clear(),
+        |directory| directory.relations[0].1 = "describes".into(),
+        |directory| directory.relations.swap(0, 1),
+    ];
+    for mutate in mutations {
+        let (_temporary, path) = fixture();
+        rewrite_terminal_directory(&path, mutate);
+        assert!(open_without_keys(&path).is_err());
+    }
+}
+
+#[test]
+fn archive_validates_custom_relationship_ids_and_names() {
+    for relation in [(10, "CUSTOM"), (999, "CUSTOM"), (1000, "")] {
+        let (_temporary, path) = fixture();
+        rewrite_terminal_directory(&path, |directory| {
+            directory.relations.push((relation.0, relation.1.into()));
+        });
+        assert!(open_without_keys(&path).is_err(), "{relation:?}");
+    }
+
+    let (_temporary, path) = fixture();
+    rewrite_terminal_directory(&path, |directory| {
+        directory.relations.push((1000, "CUSTOM".into()));
+    });
+    open_without_keys(&path).unwrap();
+}
+
+#[test]
+fn appended_standard_relationship_repeats_must_match() {
+    let (_temporary, exact) = fixture();
+    append_empty_directory(&exact, Some(vec![(0, "DESCRIBES".into())]));
+    open_without_keys(&exact).unwrap();
+
+    let (_temporary, conflicting) = fixture();
+    append_empty_directory(&conflicting, Some(vec![(0, "describes".into())]));
+    assert!(open_without_keys(&conflicting).is_err());
+}
+
+#[test]
+fn archive_rejects_no_content_sizes_and_undefined_permission_bits() {
+    let mutations: [fn(&mut crate::format::wire::FileEntry); 3] = [
+        |entry| {
+            entry.file_type = FileType::Directory;
+            entry.block_data = BlockDataState::Decrypted(Vec::new().into());
+            entry.file_size = 1;
+            entry.symlink_target = None;
+        },
+        |entry| {
+            entry.file_type = FileType::Symlink;
+            entry.block_data = BlockDataState::Decrypted(Vec::new().into());
+            entry.file_size = 1;
+            entry.symlink_target = Some("target".into());
+        },
+        |entry| entry.permissions = 0x1000,
+    ];
+    for mutate in mutations {
+        let (_temporary, path) = fixture();
+        rewrite_terminal_directory(&path, |directory| {
+            directory
+                .files
+                .try_for_each_mut(|_, entry| {
+                    mutate(entry);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+        });
+        assert!(open_without_keys(&path).is_err());
     }
 }
 

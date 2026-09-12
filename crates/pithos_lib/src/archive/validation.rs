@@ -4,6 +4,7 @@ use crate::archive::types::{
     ValidatedSegment,
 };
 use crate::error::PithosError;
+use crate::format::directory::STANDARD_RELATIONSHIPS;
 use crate::format::wire::{
     BlockDataState, BlockLocation as WireBlockLocation, Directory, FileType,
 };
@@ -44,12 +45,15 @@ pub(crate) fn segment_from_wire(
                 "File id already occupied: {id}"
             )));
         }
+        let path = ArchivePath::new(path)?;
+        let entry = entry_from_wire(path.as_str(), wire)?;
         entries.push(SegmentEntry {
             id: FileId(id),
-            path: ArchivePath::new(path)?,
-            entry: entry_from_wire(wire)?,
+            path,
+            entry,
         });
     }
+    validate_relationships(directory)?;
     let mut descriptors = Vec::new();
     for (hash, wire) in &directory.blocks {
         let stored_size_with_marker =
@@ -99,7 +103,11 @@ pub(crate) fn segment_from_wire(
     })
 }
 
-fn entry_from_wire(wire: &crate::format::wire::FileEntry) -> Result<Entry, PithosError> {
+fn entry_from_wire(
+    path: &str,
+    wire: &crate::format::wire::FileEntry,
+) -> Result<Entry, PithosError> {
+    crate::archive::path_validation::validate_entry(path, wire)?;
     let metadata = EntryMetadata {
         created: wire.created,
         modified: wire.modified,
@@ -132,25 +140,12 @@ fn entry_from_wire(wire: &crate::format::wire::FileEntry) -> Result<Entry, Pitho
             size: wire.file_size,
             content: content(),
         })),
-        FileType::Directory => {
-            require_no_content(wire, "directory")?;
-            if wire.symlink_target.is_some() {
-                return Err(PithosError::InvalidSymlinkEntry {
-                    path: "directory".into(),
-                    reason: "non-symlink has a target".into(),
-                });
-            }
-            Ok(Entry::Directory(metadata))
-        }
+        FileType::Directory => Ok(Entry::Directory(metadata)),
         FileType::Symlink => {
-            require_no_content(wire, "symlink")?;
-            let target =
-                wire.symlink_target
-                    .as_deref()
-                    .ok_or_else(|| PithosError::InvalidSymlinkEntry {
-                        path: "symlink".into(),
-                        reason: "missing target".into(),
-                    })?;
+            let target = wire
+                .symlink_target
+                .as_deref()
+                .expect("validated symlink entry has a target");
             Ok(Entry::Symlink {
                 metadata,
                 target: Arc::from(target),
@@ -159,19 +154,49 @@ fn entry_from_wire(wire: &crate::format::wire::FileEntry) -> Result<Entry, Pitho
     }
 }
 
-fn require_no_content(
-    entry: &crate::format::wire::FileEntry,
-    kind: &str,
-) -> Result<(), PithosError> {
-    match &entry.block_data {
-        BlockDataState::Decrypted(blocks) if blocks.is_empty() => Ok(()),
-        BlockDataState::Decrypted(_) => Err(PithosError::InvalidBlockDataState(format!(
-            "{kind} has block references"
-        ))),
-        BlockDataState::Encrypted(_) => Err(PithosError::InvalidBlockDataState(format!(
-            "{kind} has encrypted content"
-        ))),
+pub(crate) fn validate_relationships(directory: &Directory) -> Result<(), PithosError> {
+    let mut next_standard = 0usize;
+    for (id, name) in &directory.relations {
+        match *id {
+            0..=9 => {
+                let expected = STANDARD_RELATIONSHIPS[*id as usize].1;
+                if name != expected {
+                    return Err(PithosError::InvalidRelationshipDefinition {
+                        id: *id,
+                        reason: format!("expected standard name {expected:?}"),
+                    });
+                }
+                if directory.parent_directory_offset.is_none() && *id != next_standard as u64 {
+                    return Err(PithosError::InvalidRelationshipDefinition {
+                        id: *id,
+                        reason: "standard definitions are out of order".into(),
+                    });
+                }
+                next_standard += 1;
+            }
+            10..=999 => {
+                return Err(PithosError::InvalidRelationshipDefinition {
+                    id: *id,
+                    reason: "relationship id is reserved".into(),
+                });
+            }
+            _ if name.is_empty() => {
+                return Err(PithosError::InvalidRelationshipDefinition {
+                    id: *id,
+                    reason: "custom relationship name is empty".into(),
+                });
+            }
+            _ => {}
+        }
     }
+    if directory.parent_directory_offset.is_none() && next_standard != 10 {
+        let id = next_standard as u64;
+        return Err(PithosError::InvalidRelationshipDefinition {
+            id,
+            reason: "base directory is missing a standard definition".into(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_entry(path: &ArchivePath, entry: &Entry) -> Result<(), PithosError> {

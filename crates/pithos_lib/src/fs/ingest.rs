@@ -254,7 +254,6 @@ impl InputManifest {
         {
             return Err(PithosError::FileIdExhausted);
         }
-        snapshot.validate_child_relationships(&DEFAULT_RELATIONSHIPS)?;
         let mut next_id = snapshot
             .maximum_id()
             .map_or(Some(0), |id| id.0.checked_add(1));
@@ -272,19 +271,6 @@ impl InputManifest {
         Ok(ids)
     }
 }
-
-const DEFAULT_RELATIONSHIPS: [(u64, &str); 10] = [
-    (0, "Describes"),
-    (1, "Annotates"),
-    (2, "Derived_From"),
-    (3, "Source_Of"),
-    (4, "Previous_Version"),
-    (5, "Next_Version"),
-    (6, "Part_of"),
-    (7, "Contains"),
-    (8, "Input_To"),
-    (9, "Output_From"),
-];
 
 fn manifest_entry(
     source: PathBuf,

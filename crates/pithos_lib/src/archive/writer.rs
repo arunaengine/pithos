@@ -1,5 +1,6 @@
 //! Streaming archive construction with a consuming publication boundary.
 
+use crate::archive::validation::validate_relationships;
 use crate::archive::{AppendSnapshot, ArchivePath, FileId, Span, segment_from_wire};
 use crate::archive::{validate_new_candidate, validate_symlink_target};
 use crate::block;
@@ -1232,6 +1233,16 @@ impl<W: Write> ArchiveWriter<W> {
 
     fn validate_publishable(&self) -> Result<(), PithosError> {
         self.validate_entry_state()?;
+        validate_relationships(&self.directory)?;
+        if let Some(snapshot) = &self.append_snapshot {
+            let relationships = self
+                .directory
+                .relations
+                .iter()
+                .map(|(id, name)| (*id, name.as_str()))
+                .collect::<Vec<_>>();
+            snapshot.validate_child_relationships(&relationships)?;
+        }
         for section in self.directory.encryption.values() {
             for recipient in section.recipients.values() {
                 if matches!(recipient.recipient_data, RecipientData::Decrypted(_)) {
@@ -1272,6 +1283,9 @@ impl<W: Write> ArchiveWriter<W> {
                 },
                 _ => {}
             }
+        }
+        for (_, path, entry) in self.directory.files.iter() {
+            crate::archive::path_validation::validate_entry(path, entry)?;
         }
         self.directory
             .validate_references_and_accessible_blocks_with(
@@ -1566,7 +1580,7 @@ mod tests {
         let archive = write();
         assert_eq!(
             blake3::hash(&archive).to_hex().as_str(),
-            "940d5acd374e614a952fadd481e6ff6961322549bb19df446f8ff4c68f8d9fa6"
+            "ed87c4bc6481475e5d1a2af8906b75728231c451e1db93fca3aa4318efcdbf49"
         );
         assert_eq!(&archive[..6], b"PITH\x01\x00");
         assert_eq!(
@@ -1633,6 +1647,42 @@ mod tests {
             writer.validate_publishable(),
             Err(PithosError::WriterUnsealedRecipientList)
         ));
+    }
+
+    #[test]
+    fn writer_publication_revalidates_entry_and_relationship_semantics() {
+        let mut writer = ArchiveWriter::create(Vec::new(), options()).unwrap();
+        let before = writer.metadata_snapshot();
+        assert!(
+            writer
+                .add_directory(
+                    ArchivePath::new("invalid-permissions").unwrap(),
+                    EntryMetadata::new(0, 0, 0o10000),
+                )
+                .is_err()
+        );
+        assert_eq!(writer.metadata_snapshot(), before);
+
+        let mut writer = ArchiveWriter::create(Vec::new(), options()).unwrap();
+        writer
+            .add_directory(
+                ArchivePath::new("directory").unwrap(),
+                EntryMetadata::new(0, 0, 0o755),
+            )
+            .unwrap();
+        writer
+            .directory
+            .files
+            .try_for_each_mut(|_, entry| {
+                entry.file_size = 1;
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(writer.finish().is_err());
+
+        let mut writer = ArchiveWriter::create(Vec::new(), options()).unwrap();
+        writer.directory.relations[0].1 = "describes".into();
+        assert!(writer.finish().is_err());
     }
 
     #[test]

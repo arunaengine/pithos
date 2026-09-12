@@ -137,6 +137,19 @@ fn replace_base_relationship_count(replacement: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn replace_hello_bytes(range: std::ops::RangeInclusive<usize>, replacement: &[u8]) -> Vec<u8> {
+    let mut bytes = hello();
+    bytes.splice(range, replacement.iter().copied());
+    let directory_start = 15;
+    let directory_len = (bytes.len() - directory_start) as u64;
+    let footer = bytes.len() - 12;
+    bytes[footer..footer + 8].copy_from_slice(&directory_len.to_be_bytes());
+    let checksum = crc32(&bytes[directory_start..bytes.len() - 4]);
+    let crc_offset = bytes.len() - 4;
+    bytes[crc_offset..].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
 fn read_uleb(bytes: &[u8], cursor: &mut usize) -> Result<u64, &'static str> {
     let mut value = 0_u64;
     for shift in (0..64).step_by(7) {
@@ -344,6 +357,22 @@ fn production_reader_rejects_overflowing_uleb128() {
         result,
         Err(PithosError::Deserialization(DeserializationError::Io(_)))
     ));
+}
+
+#[test]
+fn production_reader_rejects_rv_symlink_and_permissions() {
+    for (id, bytes) in [
+        ("RV-SYMLINK", replace_hello_bytes(0x20..=0x20, &[3])),
+        (
+            "RV-PERMISSIONS",
+            replace_hello_bytes(0x66..=0x67, &[0x80, 0x20]),
+        ),
+    ] {
+        assert!(
+            Archive::open(MemorySource::new(bytes), OpenOptions::default()).is_err(),
+            "production reader accepted {id}"
+        );
+    }
 }
 
 #[test]

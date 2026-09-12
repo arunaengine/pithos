@@ -2,29 +2,39 @@ use crate::error::PithosError;
 use crate::format::entries::WireEntries;
 use crate::format::wire::{BlockDataState, Directory, EncryptionSection, FileEntry, FileType};
 
+pub(crate) const STANDARD_RELATIONSHIPS: [(u64, &str); 10] = [
+    (0, "DESCRIBES"),
+    (1, "ANNOTATES"),
+    (2, "DERIVED_FROM"),
+    (3, "SOURCE_OF"),
+    (4, "PREVIOUS_VERSION"),
+    (5, "NEXT_VERSION"),
+    (6, "PART_OF"),
+    (7, "CONTAINS"),
+    (8, "INPUT_TO"),
+    (9, "OUTPUT_FROM"),
+];
+
 impl Directory {
     pub(crate) fn new(
         parent_directory_offset: Option<(u64, u64)>,
         files: WireEntries,
         encryption: indexmap::IndexMap<[u8; 32], EncryptionSection>,
     ) -> Self {
+        let relations = if parent_directory_offset.is_none() {
+            STANDARD_RELATIONSHIPS
+                .iter()
+                .map(|(id, name)| (*id, (*name).to_owned()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             identifier: *b"PITHOSDR",
             parent_directory_offset,
             files,
             blocks: indexmap::IndexMap::new(),
-            relations: vec![
-                (0, "Describes".into()),
-                (1, "Annotates".into()),
-                (2, "Derived_From".into()),
-                (3, "Source_Of".into()),
-                (4, "Previous_Version".into()),
-                (5, "Next_Version".into()),
-                (6, "Part_of".into()),
-                (7, "Contains".into()),
-                (8, "Input_To".into()),
-                (9, "Output_From".into()),
-            ],
+            relations,
             encryption,
             dir_len: 0,
             crc32: 0,
