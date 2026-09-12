@@ -337,7 +337,7 @@ fn grant_multiple_ids_to_multiple_recipients_in_one_metadata_only_child() {
     assert_eq!(
         updated
             .windows(6)
-            .filter(|window| *window == b"PITH\x80\x02")
+            .filter(|window| *window == b"PITH\x01\x00")
             .count(),
         1
     );

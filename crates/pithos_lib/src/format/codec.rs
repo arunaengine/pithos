@@ -80,7 +80,7 @@ pub(crate) fn encode_header<W: Write>(
     writer: &mut W,
 ) -> Result<(), SerializationError> {
     writer.write_all(&header.magic)?;
-    writer.write_varint(header.version)?;
+    writer.write_u16::<BigEndian>(header.version)?;
     Ok(())
 }
 
@@ -89,12 +89,12 @@ pub(crate) fn decode_header<R: Read>(reader: &mut R) -> Result<FileHeader, Deser
     reader.read_exact(&mut magic)?;
     if magic != *b"PITH" {
         return Err(DeserializationError::InvalidMarker(format!(
-            "Read invalid block marker {magic:?}"
+            "Read invalid file marker {magic:?}"
         )));
     }
     Ok(FileHeader {
         magic,
-        version: reader.read_varint()?,
+        version: reader.read_u16::<BigEndian>()?,
     })
 }
 
@@ -184,9 +184,9 @@ pub(crate) fn decode_block_index_entry<R: Read>(
     limits: &DeserializationLimits,
 ) -> Result<BlockIndexEntry, DeserializationError> {
     Ok(BlockIndexEntry {
-        offset: reader.read_varint()?,
-        stored_size: reader.read_varint()?,
-        original_size: reader.read_varint()?,
+        offset: reader.read_varint::<u64>()?,
+        stored_size: reader.read_varint::<u64>()?,
+        original_size: reader.read_varint::<u64>()?,
         flags: decode_flags(reader)?,
         location: decode_location(reader, limits)?,
     })
@@ -223,8 +223,8 @@ fn encode_reference<W: Write>(
 
 fn decode_reference<R: Read>(reader: &mut R) -> Result<Reference, DeserializationError> {
     Ok(Reference {
-        target_file_id: reader.read_varint()?,
-        relationship: reader.read_varint()?,
+        target_file_id: reader.read_varint::<u64>()?,
+        relationship: reader.read_varint::<u64>()?,
     })
 }
 
@@ -259,7 +259,7 @@ fn decode_block_data<R: Read>(
     match tag[0] {
         0 => {
             let len = bounded_len(
-                reader.read_varint()?,
+                reader.read_varint::<u64>()?,
                 limits.max_opaque_bytes,
                 "encrypted block",
             )?;
@@ -307,11 +307,15 @@ fn decode_file_entry<R: Read>(
 ) -> Result<FileEntry, DeserializationError> {
     let file_type = decode_file_type(reader)?;
     let block_data = decode_block_data(reader, limits)?;
-    let created = reader.read_varint()?;
-    let modified = reader.read_varint()?;
-    let file_size = reader.read_varint()?;
-    let permissions = reader.read_varint()?;
-    let count = bounded_len(reader.read_varint()?, *remaining_references, "references")?;
+    let created = reader.read_varint::<u64>()?;
+    let modified = reader.read_varint::<u64>()?;
+    let file_size = reader.read_varint::<u64>()?;
+    let permissions = reader.read_varint::<u32>()?;
+    let count = bounded_len(
+        reader.read_varint::<u64>()?,
+        *remaining_references,
+        "references",
+    )?;
     *remaining_references -= count as u64;
     let mut references = Vec::new();
     reserve(&mut references, count, "references")?;
@@ -364,7 +368,7 @@ fn decode_recipient_data<R: Read>(
     match tag[0] {
         0 => {
             let len = bounded_len(
-                reader.read_varint()?,
+                reader.read_varint::<u64>()?,
                 limits.max_opaque_bytes,
                 "encrypted recipient data",
             )?;
@@ -398,7 +402,7 @@ fn decode_encryption_section<R: Read>(
     limits: &DeserializationLimits,
 ) -> Result<EncryptionSection, DeserializationError> {
     let count = bounded_len(
-        reader.read_varint()?,
+        reader.read_varint::<u64>()?,
         limits.max_collection_entries,
         "recipients",
     )?;
@@ -474,14 +478,29 @@ pub(crate) fn decode_directory<R: Read>(
     reader.read_exact(&mut tag)?;
     let parent_directory_offset = match tag[0] {
         0 => None,
-        1 => Some((reader.read_varint()?, reader.read_varint()?)),
+        1 => Some((
+            reader
+                .read_varint::<u64>()
+                .map_err(DeserializationError::from)?,
+            reader
+                .read_varint::<u64>()
+                .map_err(DeserializationError::from)?,
+        )),
         _ => return Err(DeserializationError::InvalidOption.into()),
     };
-    let file_count = bounded_len(reader.read_varint()?, limits.max_file_entries, "files")?;
+    let file_count = bounded_len(
+        reader
+            .read_varint::<u64>()
+            .map_err(DeserializationError::from)?,
+        limits.max_file_entries,
+        "files",
+    )?;
     let mut files = WireEntries::new();
     let mut remaining_references = limits.max_references;
     for _ in 0..file_count {
-        let id = reader.read_varint()?;
+        let id = reader
+            .read_varint::<u64>()
+            .map_err(DeserializationError::from)?;
         let path = decode_string(reader, limits)?;
         files.insert(
             id,
@@ -490,7 +509,9 @@ pub(crate) fn decode_directory<R: Read>(
         )?;
     }
     let block_count = bounded_len(
-        reader.read_varint()?,
+        reader
+            .read_varint::<u64>()
+            .map_err(DeserializationError::from)?,
         limits.max_block_descriptors,
         "blocks",
     )?;
@@ -503,12 +524,20 @@ pub(crate) fn decode_directory<R: Read>(
         }
         blocks.insert(hash, decode_block_index_entry(reader, limits)?);
     }
-    let relation_count = bounded_len(reader.read_varint()?, limits.max_relationships, "relations")?;
+    let relation_count = bounded_len(
+        reader
+            .read_varint::<u64>()
+            .map_err(DeserializationError::from)?,
+        limits.max_relationships,
+        "relations",
+    )?;
     let mut relations = Vec::new();
     reserve(&mut relations, relation_count, "relations")?;
     let mut relation_ids = HashSet::new();
     for _ in 0..relation_count {
-        let id = reader.read_varint()?;
+        let id = reader
+            .read_varint::<u64>()
+            .map_err(DeserializationError::from)?;
         let name = decode_string(reader, limits)?;
         if !relation_ids.insert(id) {
             return Err(PithosError::ConflictingRelationshipDefinition(id));
@@ -516,7 +545,9 @@ pub(crate) fn decode_directory<R: Read>(
         relations.push((id, name));
     }
     let encryption_count = bounded_len(
-        reader.read_varint()?,
+        reader
+            .read_varint::<u64>()
+            .map_err(DeserializationError::from)?,
         limits.max_collection_entries,
         "encryption",
     )?;
@@ -630,7 +661,7 @@ pub(crate) fn decode_decrypted_block_list_reader<R: Read>(
     limits: &DeserializationLimits,
 ) -> Result<Zeroizing<Vec<BlockDataEntry>>, DeserializationError> {
     let count = bounded_len(
-        reader.read_varint()?,
+        reader.read_varint::<u64>()?,
         limits.max_collection_entries,
         "block index",
     )?;
@@ -682,18 +713,19 @@ pub(crate) fn decode_decrypted_recipient_list_reader<R: Read>(
     limits: &DeserializationLimits,
 ) -> Result<RecipientKeyList, DeserializationError> {
     let count = bounded_len(
-        reader.read_varint()?,
+        reader.read_varint::<u64>()?,
         limits.max_collection_entries,
         "recipient keys",
     )?;
     let mut entries = Zeroizing::new(Vec::new());
     reserve(&mut entries, count, "recipient keys")?;
-    let mut ids = HashSet::with_capacity(count);
+    let mut keys = HashMap::with_capacity(count);
     for _ in 0..count {
-        let id = reader.read_varint()?;
+        let id = reader.read_varint::<u64>()?;
         entries.push((id, [0; 32]));
         reader.read_exact(&mut entries.last_mut().expect("just pushed file key").1)?;
-        if !ids.insert(id) {
+        let key = entries.last().expect("just pushed file key").1;
+        if keys.insert(id, key).is_some_and(|existing| existing != key) {
             return Err(DeserializationError::DuplicateRecipientFileId);
         }
     }
@@ -715,6 +747,78 @@ pub(crate) fn decode_decrypted_recipient_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_header_uses_the_fixed_width_1_0_encoding() {
+        let mut encoded = Vec::new();
+        encode_header(&FileHeader::default(), &mut encoded).unwrap();
+        assert_eq!(encoded, b"PITH\x01\x00");
+
+        let decoded = decode_header(&mut encoded.as_slice()).unwrap();
+        assert_eq!(decoded.version, 0x0100);
+
+        let error = decode_header(&mut &b"POTX\x01\x00"[..]).unwrap_err();
+        assert!(error.to_string().contains("file marker"));
+    }
+
+    #[test]
+    fn typed_uleb128_accepts_bounded_non_minimal_values() {
+        for (mut encoded, expected) in [
+            (&[0x00][..], 0_u64),
+            (&[0x7f][..], 127),
+            (&[0x80, 0x01][..], 128),
+            (&[0x80, 0x00][..], 0),
+            (&[0x81, 0x00][..], 1),
+        ] {
+            assert_eq!(encoded.read_varint::<u64>().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn typed_uleb128_rejects_truncated_and_width_overflowing_values() {
+        assert!((&[0x80][..]).read_varint::<u64>().is_err());
+        assert!(
+            (&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02][..])
+                .read_varint::<u64>()
+                .is_err()
+        );
+        assert!(
+            (&[
+                0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
+            ][..])
+                .read_varint::<u64>()
+                .is_err()
+        );
+        assert!(
+            (&[0x80, 0x80, 0x80, 0x80, 0x10][..])
+                .read_varint::<u32>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decrypted_recipient_lists_retain_exact_duplicates_but_reject_conflicts() {
+        let limits = DeserializationLimits::default();
+        let mut repeated = vec![2, 7];
+        repeated.extend_from_slice(&[3; 32]);
+        repeated.push(7);
+        repeated.extend_from_slice(&[3; 32]);
+        assert_eq!(
+            decode_decrypted_recipient_list(&repeated, &limits)
+                .unwrap()
+                .as_slice(),
+            &[(7, [3; 32]), (7, [3; 32])]
+        );
+
+        let mut conflicting = vec![2, 7];
+        conflicting.extend_from_slice(&[3; 32]);
+        conflicting.push(7);
+        conflicting.extend_from_slice(&[4; 32]);
+        assert!(matches!(
+            decode_decrypted_recipient_list(&conflicting, &limits),
+            Err(DeserializationError::DuplicateRecipientFileId)
+        ));
+    }
 
     #[test]
     fn complete_directory_rejects_bad_footer_and_trailing_bytes() {

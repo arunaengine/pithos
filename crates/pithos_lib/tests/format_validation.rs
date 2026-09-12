@@ -16,7 +16,7 @@ fn public_open_rejects_invalid_header() {
 
 #[test]
 fn public_open_rejects_a_footer_claiming_an_impossible_directory() {
-    let mut bytes = b"PITH\x80\x02".to_vec();
+    let mut bytes = b"PITH\x01\x00".to_vec();
     bytes.extend_from_slice(&u64::MAX.to_be_bytes());
     bytes.extend_from_slice(&0u32.to_be_bytes());
     assert!(matches!(
@@ -24,6 +24,20 @@ fn public_open_rejects_a_footer_claiming_an_impossible_directory() {
         Err(PithosError::LimitExceeded {
             field: "directory",
             ..
+        })
+    ));
+}
+
+#[test]
+fn public_open_rejects_the_legacy_varint_header() {
+    let (mut bytes, _) = archive_with_entries(Vec::new());
+    bytes[..6].copy_from_slice(b"PITH\x80\x02");
+
+    assert!(matches!(
+        Archive::open(MemorySource::new(bytes), OpenOptions::default()),
+        Err(PithosError::UnsupportedFileVersion {
+            supported: 0x0100,
+            actual: 0x8002,
         })
     ));
 }

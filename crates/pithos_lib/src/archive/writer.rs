@@ -1566,9 +1566,9 @@ mod tests {
         let archive = write();
         assert_eq!(
             blake3::hash(&archive).to_hex().as_str(),
-            "4831e3667b0a3565c46338516f1a1bfe8c1060b437f1fbba96cff6df2cbe72d1"
+            "940d5acd374e614a952fadd481e6ff6961322549bb19df446f8ff4c68f8d9fa6"
         );
-        assert_eq!(&archive[..6], b"PITH\x80\x02");
+        assert_eq!(&archive[..6], b"PITH\x01\x00");
         assert_eq!(
             archive
                 .windows(8)

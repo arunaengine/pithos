@@ -23,6 +23,7 @@ impl Default for FileHeader {
 }
 
 impl FileHeader {
+    pub const ENCODED_LEN: usize = 6;
     pub const SUPPORTED_VERSION: u16 = 0x0100;
 }
 

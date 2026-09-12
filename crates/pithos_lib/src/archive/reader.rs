@@ -218,7 +218,7 @@ where
     /// Opens, frames, validates, resolves access metadata, and indexes an archive.
     pub fn open(source: S, options: OpenOptions<E>) -> Result<Self, PithosError> {
         let archive_len = source.len()?;
-        let mut header = [0; 6];
+        let mut header = [0; FileHeader::ENCODED_LEN];
         source.read_exact_at(0, &mut header)?;
         let header = crate::format::codec::decode_header(&mut header.as_slice())?;
         if header.version != FileHeader::SUPPORTED_VERSION {

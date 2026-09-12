@@ -1,11 +1,12 @@
 //! Reproducible verification for the Pithos 1.0 draft vectors in Appendix B.
 //!
 //! This repository-only test model is not an alternate production codec.
-//! The current library implements the 0.8 wire format and must not be changed
-//! merely to accept the draft vectors.
 
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use crc32fast::hash as crc32;
+use pithos_lib::archive::{Archive, OpenOptions};
+use pithos_lib::error::{DeserializationError, PithosError};
+use pithos_lib::source::MemorySource;
 use std::io::Cursor;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -124,6 +125,18 @@ fn appendix_hex(id: &str) -> Vec<u8> {
         .collect()
 }
 
+fn replace_base_relationship_count(replacement: &[u8]) -> Vec<u8> {
+    let mut bytes = base();
+    bytes.splice(0x11..=0x11, replacement.iter().copied());
+    let directory_len = (bytes.len() - 6) as u64;
+    let footer = bytes.len() - 12;
+    bytes[footer..footer + 8].copy_from_slice(&directory_len.to_be_bytes());
+    let checksum = crc32(&bytes[6..bytes.len() - 4]);
+    let crc_offset = bytes.len() - 4;
+    bytes[crc_offset..].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
 fn read_uleb(bytes: &[u8], cursor: &mut usize) -> Result<u64, &'static str> {
     let mut value = 0_u64;
     for shift in (0..64).step_by(7) {
@@ -131,9 +144,6 @@ fn read_uleb(bytes: &[u8], cursor: &mut usize) -> Result<u64, &'static str> {
         *cursor += 1;
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
-            if shift > 0 && byte == 0 {
-                return Err("overlong ULEB128");
-            }
             return Ok(value);
         }
     }
@@ -306,6 +316,37 @@ fn canonical_vectors_are_generated_decoded_and_exactly_reencoded() {
 }
 
 #[test]
+fn production_reader_opens_the_step_1_canonical_vectors() {
+    for id in ["CV-BASE-EMPTY-146", "CV-APPEND-EMPTY-28"] {
+        Archive::open(MemorySource::new(appendix_hex(id)), OpenOptions::default())
+            .unwrap_or_else(|error| panic!("production reader rejected {id}: {error}"));
+    }
+}
+
+#[test]
+fn production_reader_accepts_bounded_non_minimal_uleb128() {
+    Archive::open(
+        MemorySource::new(replace_base_relationship_count(&[0x8a, 0x00])),
+        OpenOptions::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn production_reader_rejects_overflowing_uleb128() {
+    let result = Archive::open(
+        MemorySource::new(replace_base_relationship_count(&[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02,
+        ])),
+        OpenOptions::default(),
+    );
+    assert!(matches!(
+        result,
+        Err(PithosError::Deserialization(DeserializationError::Io(_)))
+    ));
+}
+
+#[test]
 fn directory_length_calculations_are_independent() {
     let base_directory = &base()[6..];
     let terminal_directory = &append()[152..];
@@ -324,7 +365,6 @@ fn directory_length_calculations_are_independent() {
 #[test]
 fn fixed_mutations_have_the_appendix_crc_and_reach_their_rule() {
     let cases = [
-        ("RV-ULEB", base(), 17, 0x80, 0xd81f6818, "overlong ULEB128"),
         ("RV-FLAGS", hello(), 142, 0x10, 0x7bd3b103, "reserved flags"),
         (
             "RV-UNKNOWN-TAG",
@@ -421,7 +461,9 @@ fn fixed_mutations_have_the_appendix_crc_and_reach_their_rule() {
 }
 
 fn assert_b4_crc(id: &str, crc: u32) {
-    let row = SPEC[SPEC.find("### B.4 Rejection Mutations").unwrap()..]
+    let row = SPEC[SPEC
+        .find("### B.4 Acceptance and Rejection Mutations")
+        .unwrap()..]
         .lines()
         .find(|line| line.contains(id))
         .unwrap();
@@ -594,7 +636,10 @@ fn structural_mutation_predicates_cover_appendix_b_groups() {
         "RV-CROSS-SIZE",
     ] {
         assert!(
-            SPEC[SPEC.find("### B.4 Rejection Mutations").unwrap()..].contains(id),
+            SPEC[SPEC
+                .find("### B.4 Acceptance and Rejection Mutations")
+                .unwrap()..]
+                .contains(id),
             "missing {id}"
         );
     }
