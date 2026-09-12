@@ -65,9 +65,17 @@ mod tests {
     }
 
     fn segment(entries: Vec<SegmentEntry>) -> ValidatedSegment {
+        segment_at(100, None, entries)
+    }
+
+    fn segment_at(
+        start: u64,
+        parent: Option<Span>,
+        entries: Vec<SegmentEntry>,
+    ) -> ValidatedSegment {
         ValidatedSegment {
-            span: Span::new(100, 10).unwrap(),
-            parent: None,
+            span: Span::new(start, 10).unwrap(),
+            parent,
             entries,
             descriptors: Vec::new(),
             relationships: Vec::new(),
@@ -338,6 +346,58 @@ mod tests {
             },
         ];
         assert!(build_effective_index(&[segment(adjacent)], 1_000, IndexLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn hierarchy_requires_earlier_directory_ancestors_across_segments() {
+        let directory = |id, path: &str| SegmentEntry {
+            id: FileId(id),
+            path: ArchivePath::new(path).unwrap(),
+            entry: Entry::Directory(metadata()),
+        };
+        let file = |id, path: &str| SegmentEntry {
+            id: FileId(id),
+            path: ArchivePath::new(path).unwrap(),
+            entry: Entry::File(ContentEntry {
+                metadata: metadata(),
+                size: 0,
+                content: ContentState::Available(BlockReferences::new(Vec::new())),
+            }),
+        };
+
+        for entries in [
+            vec![file(1, "parent/child")],
+            vec![file(1, "top/middle/child")],
+            vec![file(1, "parent"), file(2, "parent/child")],
+            vec![directory(2, "parent/child"), directory(1, "parent")],
+        ] {
+            assert!(
+                build_effective_index(&[segment(entries)], 1_000, IndexLimits::default()).is_err()
+            );
+        }
+
+        assert!(
+            build_effective_index(
+                &[segment(vec![
+                    directory(1, "parent"),
+                    file(2, "parent/child"),
+                ])],
+                1_000,
+                IndexLimits::default(),
+            )
+            .is_ok()
+        );
+
+        let base = segment_at(100, None, vec![directory(1, "parent")]);
+        let child = segment_at(200, Some(base.span), vec![file(2, "parent/child")]);
+        assert!(build_effective_index(&[base, child], 1_000, IndexLimits::default()).is_ok());
+
+        let early_child = segment_at(100, None, vec![file(2, "parent/child")]);
+        let late_parent = segment_at(200, Some(early_child.span), vec![directory(1, "parent")]);
+        assert!(
+            build_effective_index(&[early_child, late_parent], 1_000, IndexLimits::default(),)
+                .is_err()
+        );
     }
 
     proptest! {

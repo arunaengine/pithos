@@ -89,6 +89,7 @@ impl WireEntries {
             .map(|entry| (entry.id, entry.path.as_ref(), &entry.entry))
     }
 
+    #[cfg(test)]
     pub(crate) fn iter_ordered(&self) -> impl Iterator<Item = (&str, &FileEntry)> + '_ {
         self.ordered_paths
             .iter()

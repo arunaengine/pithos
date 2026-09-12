@@ -146,6 +146,12 @@ fn adversarial_wire_path_order_stays_within_open_limits() {
         WriteOptions::new(sender, vec![recipient.public_key()]),
     )
     .unwrap();
+    writer
+        .add_directory(
+            ArchivePath::new("root").unwrap(),
+            EntryMetadata::new(0, 0, 0o755),
+        )
+        .unwrap();
     for index in (0..100).rev() {
         writer
             .add_directory(
@@ -154,12 +160,6 @@ fn adversarial_wire_path_order_stays_within_open_limits() {
             )
             .unwrap();
     }
-    writer
-        .add_directory(
-            ArchivePath::new("root").unwrap(),
-            EntryMetadata::new(0, 0, 0o755),
-        )
-        .unwrap();
     let archive = Archive::open(
         MemorySource::new(writer.finish().unwrap()),
         OpenOptions::default()

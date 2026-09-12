@@ -3,9 +3,7 @@ use crate::archive::types::{
     ArchivePath, BlockDescriptor, BlockHash, ContentState, Entry, FileId, ReadRange, RelationId,
     SegmentEntry, Span, ValidatedSegment,
 };
-use crate::archive::validation::{
-    IndexLimits, validate_aggregate, validate_entry, validate_hierarchy,
-};
+use crate::archive::validation::{IndexLimits, validate_aggregate, validate_entry};
 use crate::error::PithosError;
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -101,9 +99,9 @@ pub(crate) fn build_effective_index(
     limits: IndexLimits,
 ) -> Result<ArchiveIndex, PithosError> {
     validate_aggregate(segments, limits)?;
-    let mut entries = Vec::new();
+    let mut entries: Vec<IndexedEntry> = Vec::new();
     let mut by_id = BTreeMap::new();
-    let mut by_path = HashMap::new();
+    let mut by_path: HashMap<Arc<str>, usize> = HashMap::new();
     let mut hierarchy = BTreeMap::new();
     let mut descriptors: IndexMap<BlockHash, BlockDescriptor> = IndexMap::new();
     let mut relationships: BTreeMap<RelationId, Arc<str>> = BTreeMap::new();
@@ -151,6 +149,21 @@ pub(crate) fn build_effective_index(
                     path.as_str()
                 )));
             }
+            for (offset, _) in path.as_str().match_indices('/') {
+                let ancestor = &path.as_str()[..offset];
+                let Some(ancestor_index) = by_path.get(ancestor) else {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.as_str().into(),
+                        reason: format!("missing directory ancestor {ancestor}"),
+                    });
+                };
+                if !entries[*ancestor_index].entry.is_directory() {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.as_str().into(),
+                        reason: format!("file entry {ancestor} is an ancestor"),
+                    });
+                }
+            }
             let index = entries.len();
             entries.push(IndexedEntry {
                 id: *id,
@@ -163,7 +176,6 @@ pub(crate) fn build_effective_index(
         }
     }
 
-    validate_hierarchy(&entries, &by_path)?;
     let segment_spans = segment_spans.into_iter().collect::<Vec<_>>();
     for segment in segments {
         for (_, descriptor) in &segment.descriptors {

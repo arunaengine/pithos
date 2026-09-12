@@ -1,6 +1,8 @@
+use crate::archive::{AppendSnapshot, ArchivePath};
 use crate::error::PithosError;
 use crate::format::entries::WireEntries;
 use crate::format::wire::{BlockDataState, FileEntry, FileType};
+use std::collections::HashMap;
 
 fn invalid_path(path: &str, reason: impl Into<String>) -> PithosError {
     PithosError::InvalidArchivePath {
@@ -150,19 +152,41 @@ pub(crate) fn validate_entry(path: &str, entry: &FileEntry) -> Result<(), Pithos
 
 fn validate_candidate_hierarchy(
     map: &WireEntries,
+    snapshot: Option<&AppendSnapshot>,
     path: &str,
     entry: &FileEntry,
 ) -> Result<(), PithosError> {
     for (index, _) in path.match_indices('/') {
         let ancestor = &path[..index];
-        if map
-            .get_by_path(ancestor)
-            .is_some_and(|existing| existing.file_type != FileType::Directory)
-        {
-            return Err(PithosError::InvalidArchivePath {
-                path: path.into(),
-                reason: format!("file entry {ancestor} is an ancestor"),
-            });
+        if let Some(existing) = map.get_by_path(ancestor) {
+            if existing.file_type != FileType::Directory {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("file entry {ancestor} is an ancestor"),
+                });
+            }
+            continue;
+        }
+        let ancestor_path = ArchivePath::new(ancestor)?;
+        match snapshot.and_then(|snapshot| snapshot.entry_at_path(&ancestor_path)) {
+            Some(existing)
+                if !matches!(
+                    existing.kind,
+                    crate::archive::snapshot::SnapshotEntryKind::Directory
+                ) =>
+            {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("file entry {ancestor} is an ancestor"),
+                });
+            }
+            Some(_) => {}
+            None => {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("missing directory ancestor {ancestor}"),
+                });
+            }
         }
     }
 
@@ -187,7 +211,7 @@ pub(crate) fn validate_existing_candidate(
     entry: &FileEntry,
 ) -> Result<(), PithosError> {
     validate_entry(path, entry)?;
-    validate_candidate_hierarchy(map, path, entry)
+    validate_candidate_hierarchy(map, None, path, entry)
 }
 
 pub(crate) fn validate_new_candidate(
@@ -201,7 +225,22 @@ pub(crate) fn validate_new_candidate(
             "File path already occupied: {path}"
         )));
     }
-    validate_candidate_hierarchy(map, path, entry)
+    validate_candidate_hierarchy(map, None, path, entry)
+}
+
+pub(crate) fn validate_new_candidate_with_snapshot(
+    map: &WireEntries,
+    path: &str,
+    entry: &FileEntry,
+    snapshot: &AppendSnapshot,
+) -> Result<(), PithosError> {
+    validate_entry(path, entry)?;
+    if map.get_by_path(path).is_some() {
+        return Err(PithosError::PathOccupied(format!(
+            "File path already occupied: {path}"
+        )));
+    }
+    validate_candidate_hierarchy(map, Some(snapshot), path, entry)
 }
 
 pub(crate) fn validate_wire_map(map: &WireEntries) -> Result<(), PithosError> {
@@ -213,26 +252,93 @@ pub(crate) fn validate_wire_map(map: &WireEntries) -> Result<(), PithosError> {
 }
 
 pub(crate) fn validate_wire_hierarchy(map: &WireEntries) -> Result<(), PithosError> {
-    let mut entries = map.iter_ordered();
-    let Some((mut previous_path, mut previous_entry)) = entries.next() else {
-        return Ok(());
-    };
-
-    for (path, entry) in entries {
-        if previous_entry.file_type != FileType::Directory
-            && path.starts_with(previous_path)
-            && path.as_bytes().get(previous_path.len()) == Some(&b'/')
-        {
-            return Err(PithosError::InvalidArchivePath {
-                path: previous_path.into(),
-                reason: format!("entry is an ancestor of {path}"),
-            });
+    let mut earlier: HashMap<&str, &FileEntry> = HashMap::new();
+    for (_, path, entry) in map.iter() {
+        for (offset, _) in path.match_indices('/') {
+            let ancestor = &path[..offset];
+            if let Some(existing) = earlier.get(ancestor) {
+                if existing.file_type != FileType::Directory {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.into(),
+                        reason: format!("file entry {ancestor} is an ancestor"),
+                    });
+                }
+            } else if map.get_by_path(ancestor).is_some() {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("ancestor {ancestor} is declared after its child"),
+                });
+            }
         }
-
-        previous_path = path;
-        previous_entry = entry;
+        earlier.insert(path, entry);
     }
+    Ok(())
+}
 
+pub(crate) fn validate_wire_hierarchy_complete(map: &WireEntries) -> Result<(), PithosError> {
+    let mut earlier: HashMap<&str, &FileEntry> = HashMap::new();
+    for (_, path, entry) in map.iter() {
+        for (offset, _) in path.match_indices('/') {
+            let ancestor = &path[..offset];
+            let Some(existing) = earlier.get(ancestor) else {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("missing directory ancestor {ancestor}"),
+                });
+            };
+            if existing.file_type != FileType::Directory {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("file entry {ancestor} is an ancestor"),
+                });
+            }
+        }
+        earlier.insert(path, entry);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_wire_hierarchy_with_snapshot(
+    map: &WireEntries,
+    snapshot: &AppendSnapshot,
+) -> Result<(), PithosError> {
+    let mut earlier: HashMap<&str, &FileEntry> = HashMap::new();
+    for (_, path, entry) in map.iter() {
+        for (offset, _) in path.match_indices('/') {
+            let ancestor = &path[..offset];
+            if let Some(existing) = earlier.get(ancestor) {
+                if existing.file_type != FileType::Directory {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.into(),
+                        reason: format!("file entry {ancestor} is an ancestor"),
+                    });
+                }
+                continue;
+            }
+            let ancestor_path = ArchivePath::new(ancestor)?;
+            match snapshot.entry_at_path(&ancestor_path) {
+                Some(existing)
+                    if !matches!(
+                        existing.kind,
+                        crate::archive::snapshot::SnapshotEntryKind::Directory
+                    ) =>
+                {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.into(),
+                        reason: format!("file entry {ancestor} is an ancestor"),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.into(),
+                        reason: format!("missing directory ancestor {ancestor}"),
+                    });
+                }
+            }
+        }
+        earlier.insert(path, entry);
+    }
     Ok(())
 }
 
@@ -544,17 +650,15 @@ mod tests {
             assert!(validate_wire_map(&map).is_err());
         }
 
-        for order in [0, 1] {
-            let mut map = WireEntries::new();
-            if order == 0 {
-                map.insert(0, "a", directory.clone()).unwrap();
-                map.insert(1, "a/child", file.clone()).unwrap();
-            } else {
-                map.insert(0, "a/child", file.clone()).unwrap();
-                map.insert(1, "a", directory.clone()).unwrap();
-            }
-            assert!(validate_wire_map(&map).is_ok());
-        }
+        let mut parent_first = WireEntries::new();
+        parent_first.insert(0, "a", directory.clone()).unwrap();
+        parent_first.insert(1, "a/child", file.clone()).unwrap();
+        assert!(validate_wire_map(&parent_first).is_ok());
+
+        let mut child_first = WireEntries::new();
+        child_first.insert(0, "a/child", file.clone()).unwrap();
+        child_first.insert(1, "a", directory.clone()).unwrap();
+        assert!(validate_wire_map(&child_first).is_err());
     }
 
     #[test]
@@ -581,6 +685,10 @@ mod tests {
         let mut map = WireEntries::new();
         map.insert(0, "a", directory.clone()).unwrap();
         assert!(validate_new_candidate(&map, "a/child", &file).is_ok());
+
+        let map = WireEntries::new();
+        assert!(validate_new_candidate(&map, "a/child", &file).is_err());
+        assert!(validate_new_candidate(&map, "a/b/child", &file).is_err());
 
         let mut map = WireEntries::new();
         for (id, path) in [(0, "ab"), (1, "a!"), (2, "a.b"), (3, "a/child")] {

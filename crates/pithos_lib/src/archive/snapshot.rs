@@ -152,6 +152,14 @@ impl AppendSnapshot {
                 });
             }
         }
+        self.ensure_candidate_successor(path, is_directory)
+    }
+
+    pub(crate) fn ensure_candidate_successor(
+        &self,
+        path: &ArchivePath,
+        is_directory: bool,
+    ) -> Result<(), PithosError> {
         if !is_directory
             && let Some((successor, _)) = self.hierarchy.range(path.clone()..).next()
             && path.is_ancestor_of(successor)

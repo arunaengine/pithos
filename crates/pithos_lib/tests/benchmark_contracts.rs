@@ -14,39 +14,13 @@ fn open_memory(bytes: Vec<u8>, key: PrivateKey) -> Archive<MemorySource> {
 }
 
 #[test]
-fn incremental_workloads_cover_both_orders_with_the_same_entries() {
+fn incremental_workload_declares_the_ancestor_first() {
     let sender = PrivateKey::generate();
-    let recipient = sender.public_key();
     let ancestor = open_memory(
-        workloads::build_incremental(
-            sender.duplicate(),
-            recipient,
-            1_000,
-            workloads::InsertionOrder::AncestorFirst,
-        ),
-        sender.duplicate(),
-    );
-    let descendant = open_memory(
-        workloads::build_incremental(
-            sender.duplicate(),
-            recipient,
-            1_000,
-            workloads::InsertionOrder::DescendantFirst,
-        ),
+        workloads::build_incremental(sender.duplicate(), sender.public_key(), 1_000),
         sender,
     );
-    let mut ancestor_paths = ancestor
-        .entries()
-        .map(|entry| entry.path)
-        .collect::<Vec<_>>();
-    let mut descendant_paths = descendant
-        .entries()
-        .map(|entry| entry.path)
-        .collect::<Vec<_>>();
-    ancestor_paths.sort();
-    descendant_paths.sort();
-    assert_eq!(ancestor_paths.len(), 1_001);
-    assert_eq!(ancestor_paths, descendant_paths);
+    assert_eq!(ancestor.entries().len(), 1_001);
     assert_eq!(
         ancestor.entry("root").unwrap().unwrap().kind,
         EntryKind::Directory
@@ -90,7 +64,7 @@ fn conflicts_are_hierarchy_conflicts_against_one_thousand_entries() {
     let sender = PrivateKey::generate();
     for direction in [
         workloads::ConflictDirection::ExistingAncestor,
-        workloads::ConflictDirection::ExistingDescendants,
+        workloads::ConflictDirection::MissingAncestor,
     ] {
         let mut fixture = workloads::build_conflict_fixture(
             sender.duplicate(),

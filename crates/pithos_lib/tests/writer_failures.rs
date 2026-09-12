@@ -133,6 +133,59 @@ impl Read for FailingReader {
         Err(io::Error::other("source failure"))
     }
 }
+
+struct PanicOnRead;
+impl Read for PanicOnRead {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        panic!("hierarchy validation read content")
+    }
+}
+
+#[test]
+fn missing_parent_fails_before_content_read_and_leaves_writer_usable() {
+    let sender = PrivateKey::generate();
+    let reader = sender.duplicate();
+    let mut writer = ArchiveWriter::create(
+        Vec::new(),
+        WriteOptions::new(sender, vec![reader.public_key()]),
+    )
+    .unwrap();
+
+    assert!(
+        writer
+            .add_file(
+                ArchivePath::new("parent/child").unwrap(),
+                EntryMetadata::new(0, 0, 0o644),
+                ProcessingOptions::new(false, 0).unwrap(),
+                None,
+                PanicOnRead,
+            )
+            .is_err()
+    );
+    writer
+        .add_directory(
+            ArchivePath::new("parent").unwrap(),
+            EntryMetadata::new(0, 0, 0o755),
+        )
+        .unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("parent/child").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(false, 0).unwrap(),
+            Some(2),
+            Cursor::new(b"ok"),
+        )
+        .unwrap();
+    let archive = Archive::open(
+        MemorySource::new(writer.finish().unwrap()),
+        OpenOptions::default().with_access_keys(AccessKeys::new().with_key(reader)),
+    )
+    .unwrap();
+    let mut output = Vec::new();
+    archive.copy_to("parent/child", &mut output).unwrap();
+    assert_eq!(output, b"ok");
+}
 struct ReaderAfterBytes {
     bytes: Vec<u8>,
     served: bool,

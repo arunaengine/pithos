@@ -1,5 +1,9 @@
 //! Streaming archive construction with a consuming publication boundary.
 
+use crate::archive::path_validation::{
+    validate_new_candidate_with_snapshot, validate_wire_hierarchy_complete,
+    validate_wire_hierarchy_with_snapshot,
+};
 use crate::archive::validation::validate_relationships;
 use crate::archive::{AppendSnapshot, ArchivePath, FileId, Span, segment_from_wire};
 use crate::archive::{validate_new_candidate, validate_symlink_target};
@@ -967,9 +971,16 @@ impl<W: Write> ArchiveWriter<W> {
     fn validate_candidate(&self, path: &ArchivePath, entry: &FileEntry) -> Result<(), PithosError> {
         if let Some(snapshot) = &self.append_snapshot {
             snapshot.ensure_path_available(path)?;
-            snapshot.ensure_candidate_hierarchy(path, entry.file_type == FileType::Directory)?;
+            snapshot.ensure_candidate_successor(path, entry.file_type == FileType::Directory)?;
+            validate_new_candidate_with_snapshot(
+                &self.directory.files,
+                path.as_str(),
+                entry,
+                snapshot,
+            )?;
+        } else {
+            validate_new_candidate(&self.directory.files, path.as_str(), entry)?;
         }
-        validate_new_candidate(&self.directory.files, path.as_str(), entry)?;
         for reference in &entry.references {
             let child_has_relationship = self
                 .directory
@@ -1286,6 +1297,11 @@ impl<W: Write> ArchiveWriter<W> {
         }
         for (_, path, entry) in self.directory.files.iter() {
             crate::archive::path_validation::validate_entry(path, entry)?;
+        }
+        if let Some(snapshot) = &self.append_snapshot {
+            validate_wire_hierarchy_with_snapshot(&self.directory.files, snapshot)?;
+        } else {
+            validate_wire_hierarchy_complete(&self.directory.files)?;
         }
         self.directory
             .validate_references_and_accessible_blocks_with(
@@ -1683,6 +1699,77 @@ mod tests {
         let mut writer = ArchiveWriter::create(Vec::new(), options()).unwrap();
         writer.directory.relations[0].1 = "describes".into();
         assert!(writer.finish().is_err());
+    }
+
+    #[test]
+    fn writer_publication_revalidates_stored_hierarchy_order() {
+        let mut writer = ArchiveWriter::create(Vec::new(), options()).unwrap();
+        let child = writer.entry(
+            FileType::Directory,
+            EntryMetadata::new(0, 0, 0o755),
+            0,
+            None,
+        );
+        let parent = writer.entry(
+            FileType::Directory,
+            EntryMetadata::new(0, 0, 0o755),
+            0,
+            None,
+        );
+        writer
+            .directory
+            .files
+            .insert(0, "parent/child", child)
+            .unwrap();
+        writer.directory.files.insert(1, "parent", parent).unwrap();
+        assert!(writer.finish().is_err());
+    }
+
+    #[test]
+    fn append_writer_accepts_an_inherited_directory_ancestor() {
+        let sender = PrivateKey::generate();
+        let mut parent = ArchiveWriter::create(
+            Vec::new(),
+            WriteOptions::new(sender.duplicate(), vec![sender.public_key()]),
+        )
+        .unwrap();
+        parent
+            .add_directory(
+                ArchivePath::new("parent").unwrap(),
+                EntryMetadata::new(0, 0, 0o755),
+            )
+            .unwrap();
+        let mut bytes = parent.finish().unwrap();
+        let snapshot = Archive::open(
+            MemorySource::new(Arc::<[u8]>::from(bytes.clone())),
+            OpenOptions::default().with_access_keys(AccessKeys::new().with_key(sender.duplicate())),
+        )
+        .unwrap()
+        .into_append_snapshot();
+        let mut child = ArchiveWriter::append(
+            Vec::new(),
+            sender.duplicate(),
+            vec![sender.public_key()],
+            CdcConfig::default(),
+            snapshot,
+        )
+        .unwrap();
+        child
+            .add_file(
+                ArchivePath::new("parent/child").unwrap(),
+                EntryMetadata::new(0, 0, 0o644),
+                ProcessingOptions::new(false, 0).unwrap(),
+                Some(0),
+                Cursor::new([]),
+            )
+            .unwrap();
+        bytes.extend(child.finish().unwrap());
+        let archive = Archive::open(
+            MemorySource::new(Arc::<[u8]>::from(bytes)),
+            OpenOptions::default().with_access_keys(AccessKeys::new().with_key(sender)),
+        )
+        .unwrap();
+        assert!(archive.entries().any(|entry| entry.path == "parent/child"));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::format::directory::STANDARD_RELATIONSHIPS;
 use crate::format::wire::{
     BlockDataState, BlockLocation as WireBlockLocation, Directory, FileType,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -238,29 +238,6 @@ fn invalid_target(path: &ArchivePath, target: &str, reason: &str) -> PithosError
         target: target.into(),
         reason: reason.into(),
     }
-}
-
-pub(crate) fn validate_hierarchy(
-    entries: &[crate::archive::index::IndexedEntry],
-    exact_paths: &HashMap<Arc<str>, usize>,
-) -> Result<(), PithosError> {
-    for entry in entries {
-        let path = entry.path.as_str();
-        // Every hierarchy conflict has a direct slash-delimited ancestor. Looking
-        // up only those prefixes avoids scanning lexically preceding siblings.
-        for (offset, _) in path.match_indices('/') {
-            let ancestor = &path[..offset];
-            if let Some(ancestor_index) = exact_paths.get(ancestor)
-                && !entries[*ancestor_index].entry.is_directory()
-            {
-                return Err(PithosError::InvalidArchivePath {
-                    path: path.into(),
-                    reason: format!("file entry {ancestor} is an ancestor"),
-                });
-            }
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn validate_aggregate(

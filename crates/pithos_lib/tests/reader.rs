@@ -120,6 +120,12 @@ fn extraction_is_no_clobber_no_follow_and_staged() {
         WriteOptions::new(sender, vec![public_key("recipient1")]),
     )
     .unwrap();
+    writer
+        .add_directory(
+            ArchivePath::new("nested").unwrap(),
+            EntryMetadata::new(0, 0, 0o755),
+        )
+        .unwrap();
     for (path, content) in [
         ("data", b"payload".as_slice()),
         ("nested/data", b"nested payload"),

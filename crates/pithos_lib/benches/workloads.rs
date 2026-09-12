@@ -20,18 +20,11 @@ const METADATA_JSON: &[u8] = br#"{"type":"benchmark-metadata"}"#;
 #[allow(dead_code)] // Extraction workloads use this fixed payload when they include this module.
 const EXTRACTION_PAYLOAD: [u8; EXTRACTION_PAYLOAD_BYTES] = [b'e'; EXTRACTION_PAYLOAD_BYTES];
 
-#[allow(dead_code)] // Only archive-path benchmarks incremental insertion ordering.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InsertionOrder {
-    AncestorFirst,
-    DescendantFirst,
-}
-
 #[allow(dead_code)] // Only archive-path benchmarks hierarchy-conflict directions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConflictDirection {
     ExistingAncestor,
-    ExistingDescendants,
+    MissingAncestor,
 }
 
 #[allow(dead_code)] // Shared fixture builders use this only in targets that create archives.
@@ -58,24 +51,14 @@ fn add_file(
 }
 
 #[allow(dead_code)] // Only archive-path benchmarks incremental insertion.
-pub fn build_incremental(
-    sender: PrivateKey,
-    recipient: PublicKey,
-    count: usize,
-    order: InsertionOrder,
-) -> Vec<u8> {
+pub fn build_incremental(sender: PrivateKey, recipient: PublicKey, count: usize) -> Vec<u8> {
     let mut writer = writer(sender, recipient);
-    let add_ancestor = |writer: &mut ArchiveWriter<Vec<u8>>| {
-        writer
-            .add_directory(
-                ArchivePath::new("root").unwrap(),
-                EntryMetadata::new(0, 0, 0o755),
-            )
-            .unwrap();
-    };
-    if order == InsertionOrder::AncestorFirst {
-        add_ancestor(&mut writer);
-    }
+    writer
+        .add_directory(
+            ArchivePath::new("root").unwrap(),
+            EntryMetadata::new(0, 0, 0o755),
+        )
+        .unwrap();
     for index in 0..count {
         add_file(
             &mut writer,
@@ -83,9 +66,6 @@ pub fn build_incremental(
             EntryMetadata::new(0, 0, 0o644),
             &EMPTY,
         );
-    }
-    if order == InsertionOrder::DescendantFirst {
-        add_ancestor(&mut writer);
     }
     writer.finish().unwrap()
 }
@@ -151,16 +131,16 @@ pub fn build_conflict_fixture(
             }
             "root/child".into()
         }
-        ConflictDirection::ExistingDescendants => {
+        ConflictDirection::MissingAncestor => {
             for index in 0..count {
                 add_file(
                     &mut writer,
-                    format!("root/child-{index:06}"),
+                    format!("filler-{index:06}"),
                     EntryMetadata::new(0, 0, 0o644),
                     &EMPTY,
                 );
             }
-            "root".into()
+            "root/child".into()
         }
     };
     ConflictFixture { writer, candidate }
