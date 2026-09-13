@@ -1,5 +1,6 @@
 use super::reader::{
-    AccessKeys, Archive, EntryKind, ExternalBlockResolver, OpenLimits, OpenOptions,
+    AccessKeys, Archive, ArchiveFeature, EntryKind, ExternalBlockAccessPolicy,
+    ExternalBlockResolver, OpenLimits, OpenOptions,
 };
 use crate::archive::{
     ArchivePath, ArchiveWriter, CdcConfig, EntryMetadata, ProcessingOptions, WriteOptions,
@@ -485,18 +486,69 @@ struct CountingResolver {
     expected: Arc<Mutex<Vec<(u64, u64)>>>,
 }
 
+const INITIAL_TARGET: &str = "https://storage.test/initial";
+const REDIRECT_TARGET: &str = "https://storage.test/redirect";
+
+#[derive(Clone)]
+struct RecordingPolicy {
+    checks: Arc<Mutex<Vec<String>>>,
+    denied: Option<&'static str>,
+}
+
+impl ExternalBlockAccessPolicy for RecordingPolicy {
+    fn allows(&self, target: &str) -> bool {
+        self.checks.lock().unwrap().push(target.to_owned());
+        self.denied != Some(target)
+    }
+}
+
+fn allowing_policy() -> Arc<dyn ExternalBlockAccessPolicy> {
+    Arc::new(RecordingPolicy {
+        checks: Arc::new(Mutex::new(Vec::new())),
+        denied: None,
+    })
+}
+
 impl ExternalBlockResolver for CountingResolver {
     fn resolve(
         &self,
+        policy: &dyn ExternalBlockAccessPolicy,
         _location: &super::types::ExternalLocation,
         expected_len: u64,
         max_response_size: u64,
     ) -> Result<Vec<u8>, PithosError> {
+        if !policy.allows(INITIAL_TARGET) {
+            return Err(PithosError::ExternalBlockAccessDenied);
+        }
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.expected
             .lock()
             .unwrap()
             .push((expected_len, max_response_size));
+        Ok(self.response.to_vec())
+    }
+}
+
+#[derive(Clone)]
+struct RedirectingResolver {
+    response: Arc<[u8]>,
+    accessed: Arc<Mutex<Vec<String>>>,
+}
+
+impl ExternalBlockResolver for RedirectingResolver {
+    fn resolve(
+        &self,
+        policy: &dyn ExternalBlockAccessPolicy,
+        _location: &super::types::ExternalLocation,
+        _expected_len: u64,
+        _max_response_size: u64,
+    ) -> Result<Vec<u8>, PithosError> {
+        for target in [INITIAL_TARGET, REDIRECT_TARGET] {
+            if !policy.allows(target) {
+                return Err(PithosError::ExternalBlockAccessDenied);
+            }
+            self.accessed.lock().unwrap().push(target.to_owned());
+        }
         Ok(self.response.to_vec())
     }
 }
@@ -507,6 +559,22 @@ fn as_external(path: &Path) -> Vec<u8> {
     let response = bytes[offset as usize..offset as usize + 4 + stored as usize].to_vec();
     rewrite_terminal_directory(path, |directory| {
         let block = directory.blocks.first_mut().unwrap().1;
+        block.location = BlockLocation::External {
+            url: "test:external".into(),
+        };
+        block.offset = u64::MAX;
+    });
+    response
+}
+
+fn last_block_as_external(path: &Path) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap();
+    let directory = decode_terminal_directory(path);
+    let descriptor = directory.blocks.last().unwrap().1;
+    let start = descriptor.offset as usize;
+    let response = bytes[start..start + 4 + descriptor.stored_size as usize].to_vec();
+    rewrite_terminal_directory(path, |directory| {
+        let block = directory.blocks.last_mut().unwrap().1;
         block.location = BlockLocation::External {
             url: "test:external".into(),
         };
@@ -1130,7 +1198,8 @@ fn archive_external_blocks_validate_exact_framing_and_share_read_paths() {
         MemorySource::new(Arc::<[u8]>::from(std::fs::read(&path).unwrap())),
         OpenOptions::default()
             .with_access_keys(AccessKeys::new().with_key(private("recipient1")))
-            .with_external_resolver(resolver),
+            .with_external_resolver(resolver)
+            .with_external_access_policy(allowing_policy()),
     )
     .unwrap();
     let mut full = Vec::new();
@@ -1156,7 +1225,9 @@ fn archive_external_blocks_validate_exact_framing_and_share_read_paths() {
     .unwrap();
     assert!(matches!(
         missing.copy_to("data", &mut Vec::new()),
-        Err(PithosError::ExternalBlockSourceRequired)
+        Err(PithosError::UnsupportedFeature(
+            ArchiveFeature::ExternalStorage
+        ))
     ));
     let mut corrupt = response.clone();
     corrupt[4] ^= 1;
@@ -1175,7 +1246,8 @@ fn archive_external_blocks_validate_exact_framing_and_share_read_paths() {
             MemorySource::new(Arc::<[u8]>::from(std::fs::read(&path).unwrap())),
             OpenOptions::default()
                 .with_access_keys(AccessKeys::new().with_key(private("recipient1")))
-                .with_external_resolver(resolver),
+                .with_external_resolver(resolver)
+                .with_external_access_policy(allowing_policy()),
         )
         .unwrap();
         assert!(archive.copy_to("data", &mut Vec::new()).is_err());
@@ -1223,7 +1295,8 @@ fn archive_block_limits_reject_before_local_or_external_acquisition() {
         OpenOptions::default()
             .with_limits(limits)
             .with_access_keys(AccessKeys::new().with_key(private("recipient1")))
-            .with_external_resolver(resolver),
+            .with_external_resolver(resolver)
+            .with_external_access_policy(allowing_policy()),
     )
     .unwrap();
     assert!(matches!(
@@ -1259,6 +1332,190 @@ fn archive_block_limits_reject_before_local_or_external_acquisition() {
         })
     ));
     assert_eq!(reads.load(Ordering::Relaxed), before);
+}
+
+#[test]
+fn external_availability_requires_both_resolver_and_policy() {
+    let (_temporary, path) = fixture();
+    let response = as_external(&path);
+    let bytes = Arc::<[u8]>::from(std::fs::read(path).unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = CountingResolver {
+        response: Arc::from(response.clone()),
+        calls: Arc::clone(&calls),
+        expected: Arc::new(Mutex::new(Vec::new())),
+    };
+    let keys = || AccessKeys::new().with_key(private("recipient1"));
+
+    let default = Archive::open(
+        MemorySource::new(Arc::clone(&bytes)),
+        OpenOptions::default().with_access_keys(keys()),
+    )
+    .unwrap();
+    assert!(matches!(
+        default.entries().next().unwrap().kind,
+        EntryKind::File {
+            available: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        default.copy_range_to("data", 0..0, &mut Vec::new()),
+        Err(PithosError::UnsupportedFeature(
+            ArchiveFeature::ExternalStorage
+        ))
+    ));
+
+    let resolver_only = Archive::open(
+        MemorySource::new(Arc::clone(&bytes)),
+        OpenOptions::default()
+            .with_access_keys(keys())
+            .with_external_resolver(resolver.clone()),
+    )
+    .unwrap();
+    assert!(matches!(
+        resolver_only.copy_to("data", &mut Vec::new()),
+        Err(PithosError::UnsupportedFeature(
+            ArchiveFeature::ExternalStorage
+        ))
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    let policy_only = Archive::open(
+        MemorySource::new(Arc::clone(&bytes)),
+        OpenOptions::default()
+            .with_access_keys(keys())
+            .with_external_access_policy(allowing_policy()),
+    )
+    .unwrap();
+    assert!(matches!(
+        policy_only.copy_to("data", &mut Vec::new()),
+        Err(PithosError::UnsupportedFeature(
+            ArchiveFeature::ExternalStorage
+        ))
+    ));
+
+    for options in [
+        OpenOptions::default()
+            .with_access_keys(keys())
+            .with_external_resolver(resolver.clone())
+            .with_external_access_policy(allowing_policy()),
+        OpenOptions::default()
+            .with_access_keys(keys())
+            .with_external_access_policy(allowing_policy())
+            .with_external_resolver(resolver.clone()),
+    ] {
+        let archive = Archive::open(MemorySource::new(Arc::clone(&bytes)), options).unwrap();
+        assert!(matches!(
+            archive.entries().next().unwrap().kind,
+            EntryKind::File {
+                available: true,
+                ..
+            }
+        ));
+        let mut output = Vec::new();
+        archive.copy_to("data", &mut output).unwrap();
+        assert_eq!(output, b"archive reader private fixture");
+    }
+}
+
+#[test]
+fn external_policy_denial_precedes_initial_and_redirect_access() {
+    let (_temporary, path) = fixture();
+    let response = as_external(&path);
+    let bytes = Arc::<[u8]>::from(std::fs::read(path).unwrap());
+    let checks = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let archive = Archive::open(
+        MemorySource::new(Arc::clone(&bytes)),
+        OpenOptions::default()
+            .with_access_keys(AccessKeys::new().with_key(private("recipient1")))
+            .with_external_resolver(CountingResolver {
+                response: Arc::from(response.clone()),
+                calls: Arc::clone(&calls),
+                expected: Arc::new(Mutex::new(Vec::new())),
+            })
+            .with_external_access_policy(Arc::new(RecordingPolicy {
+                checks: Arc::clone(&checks),
+                denied: Some(INITIAL_TARGET),
+            })),
+    )
+    .unwrap();
+    assert!(matches!(
+        archive.entries().next().unwrap().kind,
+        EntryKind::File {
+            available: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        archive.copy_to("data", &mut Vec::new()),
+        Err(PithosError::ExternalBlockAccessDenied)
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(&*checks.lock().unwrap(), &[INITIAL_TARGET]);
+
+    let checks = Arc::new(Mutex::new(Vec::new()));
+    let accessed = Arc::new(Mutex::new(Vec::new()));
+    let archive = Archive::open(
+        MemorySource::new(bytes),
+        OpenOptions::default()
+            .with_access_keys(AccessKeys::new().with_key(private("recipient1")))
+            .with_external_resolver(RedirectingResolver {
+                response: Arc::from(response),
+                accessed: Arc::clone(&accessed),
+            })
+            .with_external_access_policy(Arc::new(RecordingPolicy {
+                checks: Arc::clone(&checks),
+                denied: Some(REDIRECT_TARGET),
+            })),
+    )
+    .unwrap();
+    assert!(matches!(
+        archive.copy_to("data", &mut Vec::new()),
+        Err(PithosError::ExternalBlockAccessDenied)
+    ));
+    assert_eq!(&*checks.lock().unwrap(), &[INITIAL_TARGET, REDIRECT_TARGET]);
+    assert_eq!(&*accessed.lock().unwrap(), &[INITIAL_TARGET]);
+    assert!(
+        !checks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|target| target == "test:external")
+    );
+}
+
+#[test]
+fn unsupported_external_content_preflights_the_whole_file_and_adapters() {
+    let content = format!("{}{}", "x".repeat(1024), "y".repeat(1024));
+    let (_temporary, path) = fixture_with_options(
+        &content,
+        0,
+        true,
+        Some(CdcConfig::new(64, 256, 1024).unwrap()),
+    );
+    assert!(decode_terminal_directory(&path).blocks.len() > 1);
+    let _response = last_block_as_external(&path);
+    let archive = open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+    let mut sink = RecordingSink(Vec::new());
+    assert!(matches!(
+        archive.copy_to("data", &mut sink),
+        Err(PithosError::UnsupportedFeature(
+            ArchiveFeature::ExternalStorage
+        ))
+    ));
+    assert!(sink.0.is_empty());
+
+    let mut exported = Vec::new();
+    assert!(matches!(
+        crypt4gh::export(&archive, "data", vec![public("recipient2")], &mut exported,),
+        Err(crate::adapters::crypt4gh::Crypt4GHError::Archive {
+            source: PithosError::UnsupportedFeature(ArchiveFeature::ExternalStorage),
+            ..
+        })
+    ));
+    assert!(exported.is_empty());
 }
 use crate::adapters::crypt4gh;
 use crate::fs::extract;

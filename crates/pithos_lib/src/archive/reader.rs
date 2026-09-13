@@ -14,8 +14,9 @@ use crate::error::PithosError;
 use crate::format::limits::DeserializationLimits;
 use crate::format::wire::{BlockDataEntry, BlockDataState, BlockIndexEntry, Directory, FileHeader};
 use crate::source::ArchiveSource;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
+use std::sync::Arc;
 
 /// Distinguishes archive failures from a presentation callback failure without
 /// making the archive core depend on the callback's error type.
@@ -112,13 +113,46 @@ impl AccessKeys {
 }
 
 /// Resolves an opaque external block location to exactly one framed `BLCK` value.
+///
+/// The resolver owns interpretation of the opaque location and selection of concrete
+/// access targets. It must call the supplied policy before its initial access and before
+/// every redirect. The [`ExternalLocation`] is archive-owned opaque data and is not
+/// necessarily itself a concrete policy target.
 pub trait ExternalBlockResolver {
     fn resolve(
         &self,
+        policy: &dyn ExternalBlockAccessPolicy,
         location: &ExternalLocation,
         expected_len: u64,
         max_response_size: u64,
     ) -> Result<Vec<u8>, PithosError>;
+}
+
+/// Describes a feature that prevents content access without changing archive structure.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ArchiveFeature {
+    Compression,
+    BlockEncryption,
+    EncryptedBlockList,
+    EncryptedRecipientList,
+    ExternalStorage,
+}
+
+/// Decides whether an external resolver may access a concrete target.
+///
+/// Resolvers select concrete targets from an opaque [`ExternalLocation`] and must call
+/// this policy before the initial access and before every redirect. The policy is not
+/// called by the archive core for the opaque location itself.
+pub trait ExternalBlockAccessPolicy: Send + Sync {
+    fn allows(&self, target: &str) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentAvailability {
+    Available,
+    MissingAccess,
+    Unsupported(ArchiveFeature),
 }
 
 /// The default resolver rejects external block reads.
@@ -128,11 +162,14 @@ pub struct NoExternalBlocks;
 impl ExternalBlockResolver for NoExternalBlocks {
     fn resolve(
         &self,
+        _policy: &dyn ExternalBlockAccessPolicy,
         _location: &ExternalLocation,
         _expected_len: u64,
         _max_response_size: u64,
     ) -> Result<Vec<u8>, PithosError> {
-        Err(PithosError::ExternalBlockSourceRequired)
+        Err(PithosError::UnsupportedFeature(
+            ArchiveFeature::ExternalStorage,
+        ))
     }
 }
 
@@ -141,6 +178,8 @@ pub struct OpenOptions<E = NoExternalBlocks> {
     limits: OpenLimits,
     keys: AccessKeys,
     external: E,
+    external_resolver_supplied: bool,
+    external_access_policy: Option<Arc<dyn ExternalBlockAccessPolicy>>,
 }
 
 impl Default for OpenOptions<NoExternalBlocks> {
@@ -149,6 +188,8 @@ impl Default for OpenOptions<NoExternalBlocks> {
             limits: OpenLimits::default(),
             keys: AccessKeys::default(),
             external: NoExternalBlocks,
+            external_resolver_supplied: false,
+            external_access_policy: None,
         }
     }
 }
@@ -169,7 +210,17 @@ impl<E> OpenOptions<E> {
             limits: self.limits,
             keys: self.keys,
             external,
+            external_resolver_supplied: true,
+            external_access_policy: self.external_access_policy,
         }
+    }
+
+    pub fn with_external_access_policy(
+        mut self,
+        policy: Arc<dyn ExternalBlockAccessPolicy>,
+    ) -> Self {
+        self.external_access_policy = Some(policy);
+        self
     }
 }
 
@@ -209,6 +260,7 @@ pub struct ArchiveReference {
 pub struct Archive<S, E = NoExternalBlocks> {
     source: S,
     external: E,
+    external_access_policy: Option<Arc<dyn ExternalBlockAccessPolicy>>,
     archive_len: u64,
     terminal_directory: Span,
     index: ArchiveIndex,
@@ -217,6 +269,7 @@ pub struct Archive<S, E = NoExternalBlocks> {
     access: ResolvedAccess,
     access_keys: AccessKeys,
     limits: OpenLimits,
+    content_availability: BTreeMap<FileId, ContentAvailability>,
 }
 
 impl<S, E> Archive<S, E>
@@ -340,6 +393,11 @@ where
             max_segments: options.limits.max_parent_directories.saturating_add(1),
         };
         let index = build_effective_index(&segments, archive_len, index_limits)?;
+        let content_availability = classify_content_availability(
+            &index,
+            options.external_resolver_supplied,
+            options.external_access_policy.is_some(),
+        )?;
         for span in index.local_block_spans() {
             let mut marker = [0; 4];
             source.read_exact_at(span.start(), &mut marker)?;
@@ -349,6 +407,7 @@ where
         Ok(Self {
             source,
             external: options.external,
+            external_access_policy: options.external_access_policy,
             archive_len,
             terminal_directory: Span::new(terminal_start, terminal_len)?,
             index,
@@ -357,13 +416,14 @@ where
             access,
             access_keys: options.keys,
             limits: options.limits,
+            content_availability,
         })
     }
 
     pub fn entries(&self) -> impl ExactSizeIterator<Item = ArchiveEntry> + '_ {
         self.index
             .entries()
-            .map(|entry| archive_entry(&self.index, entry))
+            .map(|entry| archive_entry(&self.index, entry, &self.content_availability))
     }
 
     /// Consumes the reader and transfers its validated state to append/grant planning.
@@ -392,11 +452,12 @@ where
         Ok(self
             .index
             .entry_at_path(&path)
-            .map(|entry| archive_entry(&self.index, entry)))
+            .map(|entry| archive_entry(&self.index, entry, &self.content_availability)))
     }
 
     pub fn copy_to<W: Write + ?Sized>(&self, path: &str, sink: &mut W) -> Result<(), PithosError> {
         let (id, _) = self.content_id(path)?;
+        self.require_content_available(id)?;
         self.copy_plan(id, self.index.full_file_plan(id)?, sink)
     }
 
@@ -408,6 +469,7 @@ where
     ) -> Result<(), PithosError> {
         let (id, size) = self.content_id(path)?;
         let range = ReadRange::new(range, size)?;
+        self.require_content_available(id)?;
         self.copy_plan(id, self.index.range_plan(id, range)?, sink)
     }
 
@@ -417,6 +479,8 @@ where
         operation: impl FnOnce(FileId, &PrivateKey, &FileKey) -> Result<T, CallbackError>,
     ) -> Result<T, ContentOperationError<CallbackError>> {
         let (id, _) = self.content_id(path).map_err(ContentOperationError::Core)?;
+        self.require_content_available(id)
+            .map_err(ContentOperationError::Core)?;
         let key = self
             .access
             .key(id)
@@ -441,6 +505,8 @@ where
         id: FileId,
         mut operation: impl FnMut(Zeroizing<Vec<u8>>) -> Result<(), CallbackError>,
     ) -> Result<(), ContentOperationError<CallbackError>> {
+        self.require_content_available(id)
+            .map_err(ContentOperationError::Core)?;
         let plan = self
             .index
             .full_file_plan(id)
@@ -464,6 +530,19 @@ where
             PithosError::InvalidBlockDataState("only data/metadata entries have content".into())
         })?;
         Ok((entry.id, content.size))
+    }
+
+    pub(crate) fn require_content_available(&self, id: FileId) -> Result<(), PithosError> {
+        match self.content_availability.get(&id).copied() {
+            Some(ContentAvailability::Available) => Ok(()),
+            Some(ContentAvailability::MissingAccess) => Err(PithosError::ContentUnavailable),
+            Some(ContentAvailability::Unsupported(feature)) => {
+                Err(PithosError::UnsupportedFeature(feature))
+            }
+            None => Err(PithosError::InvalidBlockDataState(
+                "only data/metadata entries have content".into(),
+            )),
+        }
     }
 
     fn copy_plan<W: Write + ?Sized>(
@@ -526,6 +605,9 @@ where
                             PithosError::ExternalBlockFraming("response size overflow".into())
                         })?;
                 let response = self.external.resolve(
+                    self.external_access_policy.as_deref().ok_or(
+                        PithosError::UnsupportedFeature(ArchiveFeature::ExternalStorage),
+                    )?,
                     location,
                     expected_len,
                     self.limits
@@ -571,15 +653,25 @@ where
     }
 }
 
-fn entry_kind(entry: &Entry) -> EntryKind {
+fn entry_kind(
+    entry: &Entry,
+    id: FileId,
+    content_availability: &BTreeMap<FileId, ContentAvailability>,
+) -> EntryKind {
     match entry {
         Entry::File(content) => EntryKind::File {
             size: content.size,
-            available: matches!(content.content, ContentState::Available(_)),
+            available: matches!(
+                content_availability.get(&id),
+                Some(ContentAvailability::Available)
+            ),
         },
         Entry::Metadata(content) => EntryKind::Metadata {
             size: content.size,
-            available: matches!(content.content, ContentState::Available(_)),
+            available: matches!(
+                content_availability.get(&id),
+                Some(ContentAvailability::Available)
+            ),
         },
         Entry::Directory(_) => EntryKind::Directory,
         Entry::Symlink { target, .. } => EntryKind::Symlink {
@@ -588,12 +680,16 @@ fn entry_kind(entry: &Entry) -> EntryKind {
     }
 }
 
-fn archive_entry(index: &ArchiveIndex, entry: &super::index::IndexedEntry) -> ArchiveEntry {
+fn archive_entry(
+    index: &ArchiveIndex,
+    entry: &super::index::IndexedEntry,
+    content_availability: &BTreeMap<FileId, ContentAvailability>,
+) -> ArchiveEntry {
     let metadata = entry.entry.metadata();
     ArchiveEntry {
         id: entry.id.0,
         path: entry.path.as_str().to_owned(),
-        kind: entry_kind(&entry.entry),
+        kind: entry_kind(&entry.entry, entry.id, content_availability),
         created: metadata.created,
         modified: metadata.modified,
         permissions: metadata.permissions,
@@ -609,6 +705,41 @@ fn archive_entry(index: &ArchiveIndex, entry: &super::index::IndexedEntry) -> Ar
             })
             .collect(),
     }
+}
+
+fn classify_content_availability(
+    index: &ArchiveIndex,
+    external_resolver_supplied: bool,
+    external_access_policy_supplied: bool,
+) -> Result<BTreeMap<FileId, ContentAvailability>, PithosError> {
+    let external_supported = external_resolver_supplied && external_access_policy_supplied;
+    let mut availability = BTreeMap::new();
+    for entry in index.entries() {
+        let Some(content) = entry.entry.content() else {
+            continue;
+        };
+        let state = match &content.content {
+            ContentState::Unavailable => ContentAvailability::MissingAccess,
+            ContentState::Available(references) => {
+                let has_external_block = references.iter().any(|hash| {
+                    matches!(
+                        index.descriptor(hash),
+                        Some(crate::archive::types::BlockDescriptor {
+                            location: BlockLocation::External(_),
+                            ..
+                        })
+                    )
+                });
+                if has_external_block && !external_supported {
+                    ContentAvailability::Unsupported(ArchiveFeature::ExternalStorage)
+                } else {
+                    ContentAvailability::Available
+                }
+            }
+        };
+        availability.insert(entry.id, state);
+    }
+    Ok(availability)
 }
 
 fn deserialization_limits(limits: OpenLimits) -> DeserializationLimits {

@@ -25,8 +25,8 @@ pub(crate) use path_validation::{
 };
 pub(crate) use reader::ContentOperationError;
 pub use reader::{
-    AccessKeys, Archive, ArchiveEntry, ArchiveReference, EntryKind, ExternalBlockResolver,
-    NoExternalBlocks, OpenLimits, OpenOptions,
+    AccessKeys, Archive, ArchiveEntry, ArchiveFeature, ArchiveReference, EntryKind,
+    ExternalBlockAccessPolicy, ExternalBlockResolver, NoExternalBlocks, OpenLimits, OpenOptions,
 };
 pub(crate) use snapshot::AppendSnapshot;
 pub use types::{ArchivePath, ExternalLocation};

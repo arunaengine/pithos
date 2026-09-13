@@ -1,3 +1,4 @@
+use crate::archive::ArchiveFeature;
 use crate::crypto::CryptoError;
 use crate::source::SourceError;
 use std::io;
@@ -8,6 +9,7 @@ pub use crate::format::limits::DeserializationError;
 
 /// Custom top-level error type for all of Pithos
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum PithosError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -57,6 +59,10 @@ pub enum PithosError {
     InvalidEntryCombination { path: String, reason: String },
     #[error("content is unavailable with the supplied access keys")]
     ContentUnavailable,
+    #[error("archive uses unsupported feature: {0:?}")]
+    UnsupportedFeature(ArchiveFeature),
+    #[error("external block access denied by policy")]
+    ExternalBlockAccessDenied,
     #[error("append snapshot does not contain file id {0}")]
     SnapshotFileIdNotFound(u64),
     #[error("content for snapshot file id {0} is unavailable with the supplied access keys")]
@@ -65,8 +71,6 @@ pub enum PithosError {
     SnapshotDirectoryHasNoContent(u64),
     #[error("snapshot file id {0} is a symlink and has no content key")]
     SnapshotSymlinkHasNoContent(u64),
-    #[error("external block source required")]
-    ExternalBlockSourceRequired,
     #[error("external block framing error: {0}")]
     ExternalBlockFraming(String),
     #[error("Block hash not found: {0:?}")]
