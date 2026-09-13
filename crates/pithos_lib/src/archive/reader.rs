@@ -14,7 +14,7 @@ use crate::error::PithosError;
 use crate::format::limits::DeserializationLimits;
 use crate::format::wire::{BlockDataState, BlockIndexEntry, Directory, FileHeader};
 use crate::source::ArchiveSource;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 /// Distinguishes archive failures from a presentation callback failure without
@@ -276,6 +276,23 @@ where
             raw.push((directory, span));
         }
         raw.reverse();
+
+        let mut first_grants = HashMap::new();
+        for (directory, _) in &raw {
+            for (sender, section) in &directory.encryption {
+                for (recipient, recipient_section) in &section.recipients {
+                    let pair = (*sender, *recipient);
+                    if let Some(first) = first_grants.get(&pair)
+                        && *first != &recipient_section.recipient_data
+                    {
+                        return Err(PithosError::ConflictingRecipientGrant);
+                    }
+                    first_grants
+                        .entry(pair)
+                        .or_insert(&recipient_section.recipient_data);
+                }
+            }
+        }
 
         let mut access = ResolvedAccess::new();
         let mut recovery_order = 0usize;

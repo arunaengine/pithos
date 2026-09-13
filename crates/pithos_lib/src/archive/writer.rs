@@ -1246,6 +1246,7 @@ impl<W: Write> ArchiveWriter<W> {
         self.validate_entry_state()?;
         validate_relationships(&self.directory)?;
         if let Some(snapshot) = &self.append_snapshot {
+            snapshot.validate_prospective_recipient_pairs(&self.directory.encryption)?;
             let relationships = self
                 .directory
                 .relations
@@ -1748,7 +1749,7 @@ mod tests {
         .into_append_snapshot();
         let mut child = ArchiveWriter::append(
             Vec::new(),
-            sender.duplicate(),
+            PrivateKey::generate(),
             vec![sender.public_key()],
             CdcConfig::default(),
             snapshot,
@@ -2073,7 +2074,7 @@ mod tests {
         .into_append_snapshot();
         let mut child = ArchiveWriter::append(
             Vec::new(),
-            sender,
+            PrivateKey::generate(),
             vec![recipient],
             CdcConfig::default(),
             snapshot,

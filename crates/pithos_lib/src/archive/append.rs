@@ -13,7 +13,8 @@ pub enum AppendDurability {
 
 /// Options for a direct filesystem append.
 pub struct AppendOptions {
-    pub(crate) sender: PrivateKey,
+    /// Private key used to open the existing archive and authorize the append.
+    pub(crate) access_key: PrivateKey,
     pub(crate) recipients: Vec<PublicKey>,
     pub(crate) cdc: CdcConfig,
     pub(crate) durability: AppendDurability,
@@ -21,9 +22,11 @@ pub struct AppendOptions {
 }
 
 impl AppendOptions {
-    pub fn new(sender: PrivateKey, recipients: Vec<PublicKey>) -> Self {
+    /// Creates append options using `access_key` to open and authorize the existing archive.
+    /// A fresh wrapping sender is generated for each child during filesystem append operations.
+    pub fn new(access_key: PrivateKey, recipients: Vec<PublicKey>) -> Self {
         Self {
-            sender,
+            access_key,
             recipients,
             cdc: CdcConfig::default(),
             durability: AppendDurability::Flush,
@@ -42,7 +45,16 @@ impl AppendOptions {
     }
 
     pub(crate) fn validate_recipients(&self) -> Result<(), PithosError> {
-        WriteOptions::new(self.sender.duplicate(), self.recipients.clone()).validate()
+        WriteOptions::new(self.access_key.duplicate(), self.recipients.clone()).validate()
+    }
+
+    pub(crate) fn recipients_with_access_key(&self) -> Vec<PublicKey> {
+        let access_public = self.access_key.public_key();
+        let mut recipients = self.recipients.clone();
+        if !recipients.contains(&access_public) {
+            recipients.push(access_public);
+        }
+        recipients
     }
 }
 

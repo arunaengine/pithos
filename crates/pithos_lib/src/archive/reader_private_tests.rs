@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use x25519_dalek::{PublicKey as DalekPublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 fn private(name: &str) -> PrivateKey {
     crate::crypto::parse_private_pem(
@@ -38,6 +39,18 @@ fn public(name: &str) -> PublicKey {
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     fixture_with("archive reader private fixture", 0)
+}
+
+fn empty_fixture() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("empty.pith");
+    let writer = ArchiveWriter::create(
+        File::create(&path).unwrap(),
+        WriteOptions::new(private("sender"), vec![public("recipient1")]),
+    )
+    .unwrap();
+    writer.finish().unwrap();
+    (temp, path)
 }
 
 fn fixture_with(content: &str, compression_level: u8) -> (tempfile::TempDir, PathBuf) {
@@ -159,6 +172,86 @@ fn append_empty_directory(path: &Path, relations: Option<Vec<(u64, String)>>) {
     crate::format::codec::update_directory_crc(&mut directory).unwrap();
     crate::format::codec::encode_directory(&directory, &mut archive).unwrap();
     std::fs::write(path, archive).unwrap();
+}
+
+fn append_recipient_directory(path: &Path, mutate: impl FnOnce(&mut RecipientData)) {
+    let mut archive = std::fs::read(path).unwrap();
+    let (parent_start, parent_len) = directory_bounds(&archive);
+    let parent = crate::format::codec::decode_directory(
+        &mut Cursor::new(&archive[parent_start..]),
+        &DeserializationLimits::default(),
+    )
+    .unwrap();
+    let (sender, section) = parent.encryption.first().unwrap();
+    let (recipient, recipient_section) = section.recipients.first().unwrap();
+    let mut recipient_data = recipient_section.recipient_data.clone();
+    mutate(&mut recipient_data);
+    let encryption = IndexMap::from_iter([(
+        *sender,
+        EncryptionSection {
+            recipients: IndexMap::from_iter([(*recipient, RecipientSection { recipient_data })]),
+        },
+    )]);
+    let mut child = Directory::new(
+        Some((parent_start as u64, parent_len as u64)),
+        crate::format::entries::WireEntries::new(),
+        encryption,
+    );
+    crate::format::codec::update_directory_len(&mut child).unwrap();
+    crate::format::codec::update_directory_crc(&mut child).unwrap();
+    crate::format::codec::encode_directory(&child, &mut archive).unwrap();
+    std::fs::write(path, archive).unwrap();
+}
+
+fn set_base_recipient_records(path: &Path, records: Vec<(u64, [u8; 32])>) {
+    rewrite_terminal_directory(path, |directory| {
+        directory
+            .encryption
+            .first_mut()
+            .unwrap()
+            .1
+            .recipients
+            .first_mut()
+            .unwrap()
+            .1
+            .recipient_data = RecipientData::Decrypted(Zeroizing::new(records));
+    });
+}
+
+fn make_terminal_recipient_count_and_id_non_minimal(path: &Path, id: u8, key: u8) {
+    let mut archive = std::fs::read(path).unwrap();
+    let (start, _) = directory_bounds(&archive);
+    let pattern = [vec![1, 1, id], vec![key; 32]].concat();
+    let relative = archive[start..]
+        .windows(pattern.len())
+        .position(|window| window == pattern)
+        .expect("terminal decrypted recipient record");
+    let record = start + relative;
+    archive.splice(record + 1..record + 3, [0x81, 0x00, id | 0x80, 0x00]);
+    let directory_len = (archive.len() - start) as u64;
+    let footer = archive.len() - 12;
+    archive[footer..footer + 8].copy_from_slice(&directory_len.to_be_bytes());
+    let checksum = crc32fast::hash(&archive[start..archive.len() - 4]);
+    let crc_offset = archive.len() - 4;
+    archive[crc_offset..].copy_from_slice(&checksum.to_be_bytes());
+    std::fs::write(path, archive).unwrap();
+}
+
+fn assert_conflicting_recipient_grant(path: &Path) {
+    let bytes = Arc::<[u8]>::from(std::fs::read(path).unwrap());
+    for with_matching_key in [false, true] {
+        let options = if with_matching_key {
+            OpenOptions::default()
+                .with_access_keys(AccessKeys::new().with_key(private("recipient1")))
+        } else {
+            OpenOptions::default()
+        };
+        let error = match Archive::open(MemorySource::new(Arc::clone(&bytes)), options) {
+            Ok(_) => panic!("conflicting recipient grant was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(format!("{error:?}"), "ConflictingRecipientGrant");
+    }
 }
 
 fn open_without_keys(path: &Path) -> Result<Archive<MemorySource>, PithosError> {
@@ -551,6 +644,88 @@ fn archive_rejects_conflicting_recovered_file_keys_at_open() {
         ),
         Err(PithosError::ConflictingRecoveredFileKey)
     ));
+}
+
+#[test]
+fn archive_validates_every_encoded_sender_and_recipient_key_without_access_keys() {
+    for sender_is_invalid in [true, false] {
+        let (_temporary, path) = empty_fixture();
+        rewrite_terminal_directory(&path, |directory| {
+            if sender_is_invalid {
+                let section = directory.encryption.first().unwrap().1.clone();
+                directory.encryption.clear();
+                directory.encryption.insert([0; 32], section);
+            } else {
+                let section = directory.encryption.first_mut().unwrap().1;
+                let recipient = section.recipients.first().unwrap().1.clone();
+                section.recipients.clear();
+                section.recipients.insert([0; 32], recipient);
+            }
+        });
+
+        assert!(matches!(
+            open_without_keys(&path),
+            Err(PithosError::Crypt(
+                crypto::CryptoError::NonContributoryPublicKey
+            ))
+        ));
+    }
+}
+
+#[test]
+fn structurally_equal_encrypted_recipient_grants_repeat_with_or_without_access_keys() {
+    let (_temporary, path) = empty_fixture();
+    append_recipient_directory(&path, |_| {});
+    open_without_keys(&path).unwrap();
+    open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+}
+
+#[test]
+fn encrypted_recipient_grant_conflicts_are_key_independent_and_compare_all_bytes() {
+    for mutate_last_byte in [false, true] {
+        let (_temporary, path) = empty_fixture();
+        append_recipient_directory(&path, |data| {
+            let RecipientData::Encrypted(bytes) = data else {
+                panic!("writer recipient grant was not sealed");
+            };
+            let index = if mutate_last_byte { bytes.len() - 1 } else { 0 };
+            bytes[index] ^= 1;
+        });
+        assert_conflicting_recipient_grant(&path);
+    }
+}
+
+#[test]
+fn decrypted_recipient_grants_compare_decoded_order_and_accept_non_minimal_uleb128() {
+    let first = (7, [0x5a; 32]);
+    let second = (8, [0xa5; 32]);
+
+    let (_temporary, equal) = empty_fixture();
+    set_base_recipient_records(&equal, vec![first]);
+    append_recipient_directory(&equal, |_| {});
+    make_terminal_recipient_count_and_id_non_minimal(&equal, 7, 0x5a);
+    open_without_keys(&equal).unwrap();
+    open_path(&equal, AccessKeys::new().with_key(private("recipient1")));
+
+    let (_temporary, conflicting) = empty_fixture();
+    set_base_recipient_records(&conflicting, vec![first, second]);
+    append_recipient_directory(&conflicting, |data| {
+        let RecipientData::Decrypted(records) = data else {
+            panic!("test grant was unexpectedly encrypted");
+        };
+        records.reverse();
+    });
+    assert_conflicting_recipient_grant(&conflicting);
+}
+
+#[test]
+fn recipient_grant_variants_must_match_across_directories() {
+    let (_temporary, path) = empty_fixture();
+    set_base_recipient_records(&path, Vec::new());
+    append_recipient_directory(&path, |data| {
+        *data = RecipientData::Encrypted(Vec::new());
+    });
+    assert_conflicting_recipient_grant(&path);
 }
 
 #[test]

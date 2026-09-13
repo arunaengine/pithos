@@ -2,6 +2,7 @@ use crate::archive::{
     AccessKeys, AppendDurability, AppendObservation, AppendOptions, AppendSnapshot, Archive,
     ArchiveWriter, FileId, OpenOptions, WriterError,
 };
+use crate::crypto::PrivateKey;
 use crate::error::PithosError;
 use crate::fs::FsError;
 use crate::fs::ingest::{InputManifest, build_input_manifest};
@@ -150,7 +151,7 @@ fn append_files_impl(
     let bytes = Arc::new(AtomicU64::new(0));
     let snapshot = open_snapshot(
         &locked,
-        spec.options.sender.duplicate(),
+        spec.options.access_key.duplicate(),
         Arc::clone(&reads),
         Arc::clone(&bytes),
     )
@@ -161,6 +162,8 @@ fn append_files_impl(
         archive_metadata.dev(),
         archive_metadata.ino(),
     )?;
+    let wrapping_sender = fresh_wrapping_sender(&snapshot, &spec.options);
+    let recipients = spec.options.recipients_with_access_key();
     let mutated = Arc::new(AtomicBool::new(false));
 
     let AppendSpec { options, .. } = spec;
@@ -172,13 +175,8 @@ fn append_files_impl(
             Arc::clone(&mutated),
         );
         sink.seek(SeekFrom::Start(original_len))?;
-        let mut writer = ArchiveWriter::append(
-            sink,
-            options.sender,
-            options.recipients,
-            options.cdc,
-            snapshot,
-        )?;
+        let mut writer =
+            ArchiveWriter::append(sink, wrapping_sender, recipients, options.cdc, snapshot)?;
         plan.manifest
             .ingest_planned(&plan.ids, &mut writer, options.processing)
             .map_err(writer_error)?;
@@ -237,13 +235,15 @@ pub fn grant_readers(
     let bytes = Arc::new(AtomicU64::new(0));
     let snapshot = open_snapshot(
         &locked,
-        options.sender.duplicate(),
+        options.access_key.duplicate(),
         Arc::clone(&reads),
         Arc::clone(&bytes),
     )
     .map_err(|source| append_error("open grant snapshot", archive, source))?;
     validate_grant_ids(&snapshot, ids)
         .map_err(|source| append_error("validate grant ids", archive, source))?;
+    let wrapping_sender = fresh_wrapping_sender(&snapshot, &options);
+    let recipients = options.recipients_with_access_key();
     let mutated = Arc::new(AtomicBool::new(false));
 
     let result = (|| {
@@ -254,13 +254,8 @@ pub fn grant_readers(
             Arc::clone(&mutated),
         );
         sink.seek(SeekFrom::Start(original_len))?;
-        let mut writer = ArchiveWriter::append(
-            sink,
-            options.sender,
-            options.recipients,
-            options.cdc,
-            snapshot,
-        )?;
+        let mut writer =
+            ArchiveWriter::append(sink, wrapping_sender, recipients, options.cdc, snapshot)?;
         writer.grant_file_keys(&ids.iter().copied().map(FileId).collect::<Vec<_>>())?;
         let mut sink = writer.finish().map_err(|error| error.into_parts().0)?;
         if options.durability == AppendDurability::SyncAll {
@@ -333,6 +328,23 @@ fn open_snapshot(
         OpenOptions::default().with_access_keys(AccessKeys::new().with_key(sender)),
     )
     .map(Archive::into_append_snapshot)
+}
+
+fn fresh_wrapping_sender(snapshot: &AppendSnapshot, options: &AppendOptions) -> PrivateKey {
+    let recipients = options.recipients_with_access_key();
+    let access_public = options.access_key.public_key();
+    loop {
+        let sender = PrivateKey::generate();
+        let sender_public = sender.public_key();
+        if sender_public != access_public
+            && !snapshot.sender_pair_is_occupied(
+                sender_public.into_dalek_public_key().to_bytes(),
+                &recipients,
+            )
+        {
+            return sender;
+        }
+    }
 }
 
 fn validate_grant_ids(snapshot: &AppendSnapshot, ids: &[u64]) -> Result<(), PithosError> {
@@ -511,6 +523,7 @@ mod tests {
     use crate::format::limits::DeserializationLimits;
     use crate::source::FileSource;
     use std::io::Cursor;
+    use x25519_dalek::PublicKey as DalekPublicKey;
 
     struct AppendFixture {
         archive: PathBuf,
@@ -558,6 +571,86 @@ mod tests {
             .unwrap();
         drop(writer.finish().unwrap());
         AppendFixture { archive, sender }
+    }
+
+    fn terminal_directory(path: &Path) -> crate::format::wire::Directory {
+        let bytes = std::fs::read(path).unwrap();
+        let directory_len =
+            u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
+        let directory_start = bytes.len() - usize::try_from(directory_len).unwrap();
+        crate::format::codec::decode_directory(
+            &mut Cursor::new(&bytes[directory_start..]),
+            &DeserializationLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn append_and_grant_use_fresh_wire_senders_and_retain_the_access_key_as_a_recipient() {
+        let temporary = tempfile::tempdir().unwrap();
+        let fixture = append_fixture(&temporary);
+        let access_public =
+            DalekPublicKey::from(&fixture.sender.as_dalek_static_secret()).to_bytes();
+        let base_sender = *terminal_directory(&fixture.archive)
+            .encryption
+            .first()
+            .unwrap()
+            .0;
+        let other = PrivateKey::generate();
+        let source = fixture.append_source("appended.txt", b"appended through a fresh sender");
+
+        append_files(
+            &fixture.archive,
+            AppendOptions::new(fixture.sender.duplicate(), vec![other.public_key()]),
+            &[source],
+        )
+        .unwrap();
+        let child = terminal_directory(&fixture.archive);
+        let child_sender = *child.encryption.first().unwrap().0;
+        assert_ne!(child_sender, base_sender);
+        assert_ne!(child_sender, access_public);
+        assert!(
+            child
+                .encryption
+                .first()
+                .unwrap()
+                .1
+                .recipients
+                .contains_key(&access_public)
+        );
+        fixture
+            .open()
+            .copy_to("appended.txt", &mut Vec::new())
+            .unwrap();
+
+        grant_readers(
+            &fixture.archive,
+            AppendOptions::new(fixture.sender.duplicate(), vec![other.public_key()]),
+            &[0],
+        )
+        .unwrap();
+        let grant = terminal_directory(&fixture.archive);
+        let grant_sender = *grant.encryption.first().unwrap().0;
+        assert_ne!(grant_sender, base_sender);
+        assert_ne!(grant_sender, child_sender);
+        assert_ne!(grant_sender, access_public);
+        assert!(
+            grant
+                .encryption
+                .first()
+                .unwrap()
+                .1
+                .recipients
+                .contains_key(&access_public)
+        );
+
+        let archive = Archive::open(
+            FileSource::open(&fixture.archive).unwrap(),
+            OpenOptions::default().with_access_keys(AccessKeys::new().with_key(other)),
+        )
+        .unwrap();
+        archive.copy_to("base.txt", &mut Vec::new()).unwrap();
+        archive.copy_to("appended.txt", &mut Vec::new()).unwrap();
     }
 
     #[test]

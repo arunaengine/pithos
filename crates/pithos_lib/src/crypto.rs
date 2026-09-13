@@ -192,7 +192,7 @@ impl PublicKey {
         }
         let mut key = [0; 32];
         key.copy_from_slice(&bytes[12..]);
-        validate_contributory_public_key(&key)?;
+        validate_x25519_public_key(&key)?;
         Ok(Self(key))
     }
 
@@ -249,7 +249,7 @@ pub(crate) fn derive_shared(
     Ok(SharedSecret(shared.to_bytes()))
 }
 
-fn validate_contributory_public_key(public: &[u8; 32]) -> Result<(), CryptoError> {
+pub(crate) fn validate_x25519_public_key(public: &[u8; 32]) -> Result<(), CryptoError> {
     // Low-order public keys produce the identity for every clamped X25519 scalar.
     let probe = StaticSecret::from([0; 32]).diffie_hellman(&DalekPublicKey::from(*public));
     if probe.was_contributory() {

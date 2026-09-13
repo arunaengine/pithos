@@ -1,7 +1,7 @@
 use crate::archive::types::{
     ArchivePath, BlockDescriptor, BlockHash, BlockLocation, ContentEntry, ContentState, Entry,
-    EntryMetadata, ExternalLocation, FileId, Processing, Reference, RelationId, SegmentEntry, Span,
-    ValidatedSegment,
+    EntryMetadata, ExternalLocation, FileId, Processing, RecipientPair, Reference, RelationId,
+    SegmentEntry, Span, ValidatedSegment,
 };
 use crate::error::PithosError;
 use crate::format::directory::STANDARD_RELATIONSHIPS;
@@ -103,12 +103,23 @@ pub(crate) fn segment_from_wire(
             }
         }
     }
+    let recipient_pairs: Vec<RecipientPair> = directory
+        .encryption
+        .iter()
+        .flat_map(|(sender, section)| {
+            section
+                .recipients
+                .keys()
+                .map(move |recipient| (*sender, *recipient))
+        })
+        .collect();
     Ok(ValidatedSegment {
         span,
         parent,
         entries,
         descriptors,
         relationships,
+        recipient_pairs,
     })
 }
 

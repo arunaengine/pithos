@@ -304,4 +304,7 @@ pub(crate) struct ValidatedSegment {
     pub(crate) entries: Vec<SegmentEntry>,
     pub(crate) descriptors: Vec<(BlockHash, BlockDescriptor)>,
     pub(crate) relationships: Vec<(RelationId, Arc<str>)>,
+    pub(crate) recipient_pairs: Vec<RecipientPair>,
 }
+
+pub(crate) type RecipientPair = ([u8; 32], [u8; 32]);

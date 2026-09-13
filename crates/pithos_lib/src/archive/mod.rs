@@ -88,6 +88,7 @@ mod tests {
             entries,
             descriptors: Vec::new(),
             relationships: Vec::new(),
+            recipient_pairs: Vec::new(),
         }
     }
 
@@ -145,6 +146,7 @@ mod tests {
             entries: Vec::new(),
             descriptors: vec![(hash, descriptor(4))],
             relationships: Vec::new(),
+            recipient_pairs: Vec::new(),
         };
         let mut newer_descriptor = descriptor(4);
         newer_descriptor.stored_size = 99;
@@ -154,6 +156,7 @@ mod tests {
             entries: Vec::new(),
             descriptors: vec![(hash, newer_descriptor)],
             relationships: Vec::new(),
+            recipient_pairs: Vec::new(),
         };
         let older_before = older.clone();
         let newer_before = newer.clone();
@@ -191,6 +194,7 @@ mod tests {
             entries: Vec::new(),
             descriptors: vec![(hash, descriptor(4))],
             relationships: Vec::new(),
+            recipient_pairs: Vec::new(),
         };
         for invalid_span in [Span::new(995, 10).unwrap(), Span::new(20, 5).unwrap()] {
             let mut later = descriptor(4);
@@ -201,6 +205,7 @@ mod tests {
                 entries: Vec::new(),
                 descriptors: vec![(hash, later)],
                 relationships: Vec::new(),
+                recipient_pairs: Vec::new(),
             };
 
             let index =
@@ -224,6 +229,7 @@ mod tests {
                         local_descriptor(Span::new(5, 4).unwrap()),
                     )],
                     relationships: Vec::new(),
+                    recipient_pairs: Vec::new(),
                 }],
             ),
             (
@@ -237,6 +243,7 @@ mod tests {
                         local_descriptor(Span::new(10, 11).unwrap()),
                     )],
                     relationships: Vec::new(),
+                    recipient_pairs: Vec::new(),
                 }],
             ),
             (
@@ -252,6 +259,7 @@ mod tests {
                             local_descriptor(Span::new(10, 4).unwrap()),
                         )],
                         relationships: Vec::new(),
+                        recipient_pairs: Vec::new(),
                     },
                 ],
             ),
@@ -268,6 +276,7 @@ mod tests {
                             local_descriptor(Span::new(50, 11).unwrap()),
                         )],
                         relationships: Vec::new(),
+                        recipient_pairs: Vec::new(),
                     },
                 ],
             ),

@@ -400,7 +400,7 @@ fn encode_encryption_section<W: Write>(
 fn decode_encryption_section<R: Read>(
     reader: &mut R,
     limits: &DeserializationLimits,
-) -> Result<EncryptionSection, DeserializationError> {
+) -> Result<EncryptionSection, PithosError> {
     let count = bounded_len(
         reader.read_varint::<u64>()?,
         limits.max_collection_entries,
@@ -410,8 +410,9 @@ fn decode_encryption_section<R: Read>(
     for _ in 0..count {
         let mut key = [0; 32];
         reader.read_exact(&mut key)?;
+        crate::crypto::validate_x25519_public_key(&key)?;
         if recipients.contains_key(&key) {
-            return Err(DeserializationError::DuplicateRecipientKey);
+            return Err(DeserializationError::DuplicateRecipientKey.into());
         }
         recipients.insert(
             key,
@@ -555,6 +556,7 @@ pub(crate) fn decode_directory<R: Read>(
     for _ in 0..encryption_count {
         let mut key = [0; 32];
         reader.read_exact(&mut key)?;
+        crate::crypto::validate_x25519_public_key(&key)?;
         if encryption.contains_key(&key) {
             return Err(PithosError::DuplicateSenderKey);
         }

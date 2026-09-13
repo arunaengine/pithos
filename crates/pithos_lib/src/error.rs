@@ -101,6 +101,8 @@ pub enum PithosError {
     AccessibleFileSizeMismatch { expected: u64, actual: u64 },
     #[error("conflicting recovered file key")]
     ConflictingRecoveredFileKey,
+    #[error("conflicting recipient grant")]
+    ConflictingRecipientGrant,
     #[error("invalid half-open read range {start}..{end} for file size {file_size}")]
     InvalidReadRange {
         start: u64,
