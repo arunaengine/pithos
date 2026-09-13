@@ -4,10 +4,9 @@ use crate::archive::types::{
     SegmentEntry, Span, ValidatedSegment,
 };
 use crate::error::PithosError;
-use crate::format::directory::STANDARD_RELATIONSHIPS;
-use crate::format::wire::{
-    BlockDataState, BlockLocation as WireBlockLocation, Directory, FileType,
-};
+use crate::format::block::BlockLocation as FormatBlockLocation;
+use crate::format::directory::{Directory, STANDARD_RELATIONSHIPS};
+use crate::format::file_entry::{BlockDataState, FileEntry, FileType};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -32,21 +31,21 @@ impl Default for IndexLimits {
     }
 }
 
-pub(crate) fn segment_from_wire(
+pub(crate) fn validated_segment_from_directory(
     directory: &Directory,
     span: Span,
     parent: Option<Span>,
 ) -> Result<ValidatedSegment, PithosError> {
     let mut entries = Vec::new();
     let mut entry_ids = HashSet::new();
-    for (id, path, wire) in directory.files.iter() {
+    for (id, path, file_entry) in directory.files.iter() {
         if !entry_ids.insert(id) {
             return Err(PithosError::DuplicateFileId(format!(
                 "File id already occupied: {id}"
             )));
         }
         let path = ArchivePath::new(path)?;
-        let entry = entry_from_wire(path.as_str(), wire)?;
+        let entry = entry_from_file_entry(path.as_str(), file_entry)?;
         entries.push(SegmentEntry {
             id: FileId(id),
             path,
@@ -55,35 +54,35 @@ pub(crate) fn segment_from_wire(
     }
     validate_relationships(directory)?;
     let mut descriptors = Vec::new();
-    for (hash, wire) in &directory.blocks {
-        let processing = Processing::from_byte(wire.flags.0)?;
-        if matches!(wire.location, WireBlockLocation::Local)
+    for (hash, block_index_entry) in &directory.blocks {
+        let processing = Processing::from_byte(block_index_entry.flags.0)?;
+        if matches!(block_index_entry.location, FormatBlockLocation::Local)
             && processing.to_byte() & 0x08 != 0
-            && wire.stored_size < 28
+            && block_index_entry.stored_size < 28
         {
             return Err(PithosError::InvalidBlockDescriptor(
                 "encrypted local block payload is shorter than 28 bytes",
             ));
         }
-        let stored_size_with_marker =
-            wire.stored_size
-                .checked_add(4)
-                .ok_or(PithosError::InvalidDirectoryRange {
-                    operation: "validate block range",
-                })?;
-        let location = match &wire.location {
-            WireBlockLocation::Local => {
-                BlockLocation::Local(Span::new(wire.offset, stored_size_with_marker)?)
-            }
-            WireBlockLocation::External { url } => {
+        let stored_size_with_marker = block_index_entry.stored_size.checked_add(4).ok_or(
+            PithosError::InvalidDirectoryRange {
+                operation: "validate block range",
+            },
+        )?;
+        let location = match &block_index_entry.location {
+            FormatBlockLocation::Local => BlockLocation::Local(Span::new(
+                block_index_entry.offset,
+                stored_size_with_marker,
+            )?),
+            FormatBlockLocation::External { url } => {
                 BlockLocation::External(ExternalLocation::new(url))
             }
         };
         descriptors.push((
             BlockHash(*hash),
             BlockDescriptor {
-                stored_size: wire.stored_size,
-                original_size: wire.original_size,
+                stored_size: block_index_entry.stored_size,
+                original_size: block_index_entry.original_size,
                 processing,
                 location,
             },
@@ -123,16 +122,13 @@ pub(crate) fn segment_from_wire(
     })
 }
 
-fn entry_from_wire(
-    path: &str,
-    wire: &crate::format::wire::FileEntry,
-) -> Result<Entry, PithosError> {
-    crate::archive::path_validation::validate_entry(path, wire)?;
+fn entry_from_file_entry(path: &str, file_entry: &FileEntry) -> Result<Entry, PithosError> {
+    crate::archive::path_validation::validate_entry(path, file_entry)?;
     let metadata = EntryMetadata {
-        created: wire.created,
-        modified: wire.modified,
-        permissions: wire.permissions,
-        references: wire
+        created: file_entry.created,
+        modified: file_entry.modified,
+        permissions: file_entry.permissions,
+        references: file_entry
             .references
             .iter()
             .map(|reference| Reference {
@@ -141,7 +137,7 @@ fn entry_from_wire(
             })
             .collect(),
     };
-    let content = || match &wire.block_data {
+    let content = || match &file_entry.block_data {
         BlockDataState::Decrypted(blocks) => {
             ContentState::Available(crate::archive::types::BlockReferences::new(
                 blocks.iter().map(|(hash, _)| BlockHash(*hash)).collect(),
@@ -149,20 +145,20 @@ fn entry_from_wire(
         }
         BlockDataState::Encrypted(_) => ContentState::Unavailable,
     };
-    match wire.file_type {
+    match file_entry.file_type {
         FileType::Data => Ok(Entry::File(ContentEntry {
             metadata,
-            size: wire.file_size,
+            size: file_entry.file_size,
             content: content(),
         })),
         FileType::Metadata => Ok(Entry::Metadata(ContentEntry {
             metadata,
-            size: wire.file_size,
+            size: file_entry.file_size,
             content: content(),
         })),
         FileType::Directory => Ok(Entry::Directory(metadata)),
         FileType::Symlink => {
-            let target = wire
+            let target = file_entry
                 .symlink_target
                 .as_deref()
                 .expect("validated symlink entry has a target");

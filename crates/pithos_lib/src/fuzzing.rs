@@ -26,14 +26,17 @@ pub enum FuzzOutcome {
 }
 
 pub fn decode_header(data: &[u8]) -> FuzzOutcome {
-    match crate::format::codec::decode_header(&mut Cursor::new(data)) {
+    match crate::format::header::decode_header(&mut Cursor::new(data)) {
         Ok(_) => FuzzOutcome::Accepted,
         Err(_) => FuzzOutcome::Rejected(FuzzErrorCategory::Deserialization),
     }
 }
 
 pub fn decode_directory(data: &[u8]) -> FuzzOutcome {
-    match crate::format::codec::decode_complete_directory(data, &DeserializationLimits::default()) {
+    let limits = DeserializationLimits::default();
+    let mut remaining_block_references = limits.max_block_references;
+    match crate::archive::decode_validated_directory(data, &limits, &mut remaining_block_references)
+    {
         Ok(_) => FuzzOutcome::Accepted,
         Err(error) => FuzzOutcome::Rejected(classify_archive_error(&error)),
     }

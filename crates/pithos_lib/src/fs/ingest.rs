@@ -3,6 +3,7 @@ use crate::archive::{
     AppendSnapshot, ArchivePath, ArchiveWriter, EntryMetadata, ProcessingOptions, WriterError,
 };
 use crate::error::PithosError;
+use crate::format::file_entry::VALID_PERMISSION_BITS;
 use crate::fs::FsError;
 use cap_std::fs::{
     Dir, FileTypeExt as CapFileTypeExt, MetadataExt as CapMetadataExt,
@@ -59,7 +60,7 @@ fn metadata(metadata: &fs::Metadata) -> EntryMetadata {
     EntryMetadata::new(
         timestamp(metadata.created()),
         timestamp(metadata.modified()),
-        metadata.permissions().mode() & 0o7777,
+        metadata.permissions().mode() & VALID_PERMISSION_BITS,
     )
 }
 
@@ -73,7 +74,7 @@ fn cap_metadata(metadata: &cap_std::fs::Metadata) -> EntryMetadata {
     EntryMetadata::new(
         timestamp(metadata.created()),
         timestamp(metadata.modified()),
-        metadata.permissions().mode() & 0o7777,
+        metadata.permissions().mode() & VALID_PERMISSION_BITS,
     )
 }
 

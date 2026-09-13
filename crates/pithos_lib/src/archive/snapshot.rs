@@ -6,7 +6,7 @@ use crate::archive::types::{
 use crate::archive::validation::IndexLimits;
 use crate::crypto::{FileKey, PublicKey};
 use crate::error::PithosError;
-use crate::format::wire::EncryptionSection;
+use crate::format::encryption::EncryptionSection;
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// The secret-contained state needed to safely plan a direct append or grant.
 ///
 /// This is intentionally derived only from a fully opened archive. It retains validated
-/// segments for pure prospective merge, but not the source, wire directories, or reader facade.
+/// segments for pure prospective merge, but not the source, decoded directories, or reader facade.
 pub(crate) struct AppendSnapshot {
     archive_len: u64,
     terminal_directory: Span,
@@ -420,7 +420,7 @@ mod tests {
         let first_len =
             u64::from_be_bytes(first[first.len() - 12..first.len() - 4].try_into().unwrap());
         let first_start = first.len() - usize::try_from(first_len).unwrap();
-        let first_directory = crate::format::codec::decode_directory(
+        let first_directory = crate::format::directory::decode_directory(
             &mut Cursor::new(&first[first_start..]),
             &DeserializationLimits::default(),
         )
@@ -448,7 +448,7 @@ mod tests {
         bytes.extend_from_slice(&child);
         let len = u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
         let start = bytes.len() - usize::try_from(len).unwrap();
-        let mut directory = crate::format::codec::decode_directory(
+        let mut directory = crate::format::directory::decode_directory(
             &mut Cursor::new(&bytes[start..]),
             &DeserializationLimits::default(),
         )
@@ -457,10 +457,10 @@ mod tests {
         let mut newer = earliest.clone();
         newer.stored_size -= 1;
         directory.blocks.insert(hash.0, newer);
-        crate::format::codec::update_directory_len(&mut directory).unwrap();
-        crate::format::codec::update_directory_crc(&mut directory).unwrap();
+        crate::format::directory::update_directory_len(&mut directory).unwrap();
+        crate::format::directory::update_directory_crc(&mut directory).unwrap();
         let mut replacement = Vec::new();
-        crate::format::codec::encode_directory(&directory, &mut replacement).unwrap();
+        crate::format::directory::encode_directory(&directory, &mut replacement).unwrap();
         bytes.truncate(start);
         bytes.write_all(&replacement).unwrap();
 

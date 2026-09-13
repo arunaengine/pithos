@@ -1,5 +1,5 @@
 error[E0603]: struct `Crypt4GHHeader` is private
- --> tests/ui/crypt4gh_wire_record_is_private.rs:1:37
+ --> tests/ui/crypt4gh_header_is_private.rs:1:37
   |
 1 | use pithos_lib::adapters::crypt4gh::Crypt4GHHeader;
   |                                     ^^^^^^^^^^^^^^ private struct

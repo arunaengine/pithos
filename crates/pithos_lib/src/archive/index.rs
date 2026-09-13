@@ -5,7 +5,7 @@ use crate::archive::types::{
 };
 use crate::archive::validation::{IndexLimits, validate_aggregate, validate_entry};
 use crate::error::PithosError;
-use crate::format::wire::FileHeader;
+use crate::format::header::FileHeader;
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;

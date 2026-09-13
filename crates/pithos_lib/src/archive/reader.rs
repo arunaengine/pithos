@@ -1,6 +1,6 @@
 use super::{
     AccessProvenance, AppendSnapshot, FileId, ResolvedAccess, Span, build_effective_index,
-    segment_from_wire,
+    decode_validated_directory, validated_segment_from_directory,
 };
 use crate::archive::index::ArchiveIndex;
 use crate::archive::types::{
@@ -11,8 +11,14 @@ use crate::archive::validation::IndexLimits;
 use crate::block;
 use crate::crypto::{self, FileKey, PrivateKey};
 use crate::error::PithosError;
+use crate::format::block::{
+    BlockIndexEntry, BlockLocation as FormatBlockLocation, ProcessingFlags,
+};
+use crate::format::directory::Directory;
+use crate::format::encryption::RecipientData;
+use crate::format::file_entry::{BlockDataEntry, BlockDataState};
+use crate::format::header::FileHeader;
 use crate::format::limits::DeserializationLimits;
-use crate::format::wire::{BlockDataEntry, BlockDataState, BlockIndexEntry, Directory, FileHeader};
 use crate::source::ArchiveSource;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -282,7 +288,7 @@ where
         let archive_len = source.len()?;
         let mut header = [0; FileHeader::ENCODED_LEN];
         source.read_exact_at(0, &mut header)?;
-        let header = crate::format::codec::decode_header(&mut header.as_slice())?;
+        let header = crate::format::header::decode_header(&mut header.as_slice())?;
         if header.version != FileHeader::SUPPORTED_VERSION {
             return Err(PithosError::UnsupportedFileVersion {
                 supported: FileHeader::SUPPORTED_VERSION,
@@ -329,7 +335,7 @@ where
                 });
             }
             let bytes = Zeroizing::new(read_source(&source, start, len, "directory")?);
-            let directory = crate::format::codec::decode_complete_directory_with_budget(
+            let directory = decode_validated_directory(
                 &bytes,
                 &remaining_deserialization_limits(options.limits, &decoded),
                 &mut remaining_block_references,
@@ -383,7 +389,7 @@ where
             let parent = segment_index
                 .checked_sub(1)
                 .map(|index| segments[index].span);
-            segments.push(segment_from_wire(&directory, span, parent)?);
+            segments.push(validated_segment_from_directory(&directory, span, parent)?);
         }
         let index_limits = IndexLimits {
             max_entries: options.limits.max_entries,
@@ -401,7 +407,7 @@ where
         for span in index.local_block_spans() {
             let mut marker = [0; 4];
             source.read_exact_at(span.start(), &mut marker)?;
-            crate::format::codec::decode_block_marker(&mut marker.as_slice())?;
+            crate::format::block::decode_block_marker(&mut marker.as_slice())?;
         }
 
         Ok(Self {
@@ -581,7 +587,7 @@ where
             BlockLocation::Local(span) => {
                 let mut marker = [0; 4];
                 self.source.read_exact_at(span.start(), &mut marker)?;
-                crate::format::codec::decode_block_marker(&mut marker.as_slice())?;
+                crate::format::block::decode_block_marker(&mut marker.as_slice())?;
                 let payload_start =
                     span.start()
                         .checked_add(4)
@@ -623,7 +629,7 @@ where
                     ));
                 }
                 let (mut marker, stored) = response.split_at(4);
-                crate::format::codec::decode_block_marker(&mut marker)?;
+                crate::format::block::decode_block_marker(&mut marker)?;
                 stored.to_vec()
             }
         };
@@ -631,10 +637,8 @@ where
             offset: 0,
             stored_size: planned.descriptor.stored_size,
             original_size: planned.descriptor.original_size,
-            flags: crate::format::wire::ProcessingFlags::from_byte(
-                planned.descriptor.processing.to_byte(),
-            ),
-            location: crate::format::wire::BlockLocation::Local,
+            flags: ProcessingFlags::from_byte(planned.descriptor.processing.to_byte()),
+            location: FormatBlockLocation::Local,
         };
         let key = self
             .access
@@ -846,31 +850,30 @@ fn resolve_recipients(
         let secret = key.as_dalek_static_secret();
         let recipient = DalekPublicKey::from(&secret).to_bytes();
         for (sender_section, (sender, section)) in directory.encryption.iter().enumerate() {
-            let candidates: Vec<(&[u8; 32], &crate::format::wire::RecipientData)> =
-                if sender == &recipient {
-                    section
-                        .recipients
-                        .iter()
-                        .map(|(recipient, section)| (recipient, &section.recipient_data))
-                        .collect()
-                } else {
-                    section
-                        .recipients
-                        .get(&recipient)
-                        .map(|section| vec![(sender, &section.recipient_data)])
-                        .unwrap_or_default()
-                };
+            let candidates: Vec<(&[u8; 32], &RecipientData)> = if sender == &recipient {
+                section
+                    .recipients
+                    .iter()
+                    .map(|(recipient, section)| (recipient, &section.recipient_data))
+                    .collect()
+            } else {
+                section
+                    .recipients
+                    .get(&recipient)
+                    .map(|section| vec![(sender, &section.recipient_data)])
+                    .unwrap_or_default()
+            };
             for (recipient_section, (peer, data)) in candidates.into_iter().enumerate() {
                 let shared = crypto::derive_shared(secret.as_bytes(), peer)?;
                 let entries = match data {
-                    crate::format::wire::RecipientData::Encrypted(bytes) => {
+                    RecipientData::Encrypted(bytes) => {
                         let plaintext = crypto::unwrap_recipient_list(&shared, bytes)?;
-                        crate::format::codec::decode_decrypted_recipient_list(
+                        crate::format::encryption::decode_decrypted_recipient_list(
                             &plaintext,
                             &decoded_limits,
                         )?
                     }
-                    crate::format::wire::RecipientData::Decrypted(entries) => entries.clone(),
+                    RecipientData::Decrypted(entries) => entries.clone(),
                 };
                 for (file_id, file_key) in entries.iter() {
                     access.insert(
@@ -911,7 +914,7 @@ fn resolve_block_lists(
                 let mut decoded_limits = deserialization_limits(limits);
                 decoded_limits.max_block_references = *remaining_block_references;
                 let plaintext = crypto::open_file_block_list(file_key, bytes)?;
-                let entries = crate::format::codec::decode_decrypted_block_list_with_budget(
+                let entries = crate::format::file_entry::decode_decrypted_block_list_with_budget(
                     &plaintext,
                     &decoded_limits,
                     remaining_block_references,

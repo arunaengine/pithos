@@ -1,7 +1,7 @@
 //! Validated, immutable archive state.
 //!
 //! This module deliberately has no filesystem, adapter, or writer-input
-//! dependency. `Archive` is the public reader boundary; wire records and
+//! dependency. `Archive` is the public reader boundary; internal format types and
 //! recovered access material remain crate-private.
 
 mod access;
@@ -21,7 +21,7 @@ pub(crate) use access::{AccessProvenance, ResolvedAccess};
 pub use append::{AppendDurability, AppendObservation, AppendOptions};
 pub(crate) use index::build_effective_index;
 pub(crate) use path_validation::{
-    validate_new_candidate, validate_symlink_target, validate_wire_map,
+    validate_directory_entries, validate_new_candidate, validate_symlink_target,
 };
 pub(crate) use reader::ContentOperationError;
 pub use reader::{
@@ -31,7 +31,20 @@ pub use reader::{
 pub(crate) use snapshot::AppendSnapshot;
 pub use types::{ArchivePath, ExternalLocation};
 pub(crate) use types::{FileId, Span};
-pub(crate) use validation::segment_from_wire;
+pub(crate) use validation::validated_segment_from_directory;
+
+pub(crate) fn decode_validated_directory(
+    bytes: &[u8],
+    limits: &crate::format::limits::DeserializationLimits,
+    remaining_block_references: &mut u64,
+) -> Result<crate::format::directory::Directory, crate::error::PithosError> {
+    crate::format::directory::decode_complete_directory_with_validation_and_budget(
+        bytes,
+        limits,
+        remaining_block_references,
+        |directory| validate_directory_entries(&directory.files),
+    )
+}
 pub use writer::{
     ArchiveWriter, CdcConfig, CreateError, EntryMetadata, EntryReference, FinishError,
     IncompleteWriter, ProcessingOptions, WriteOptions, WriterError, WrittenEntry,
@@ -93,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn index_preserves_wire_order_and_component_hierarchy() {
+    fn index_preserves_segment_entry_order_and_component_hierarchy() {
         let entries = vec![
             SegmentEntry {
                 id: FileId(7),

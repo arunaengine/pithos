@@ -9,6 +9,7 @@ use crate::archive::{
     ArchivePath, ArchiveWriter, EntryMetadata, EntryReference, ProcessingOptions, WriterError,
 };
 use crate::error::PithosError;
+use crate::format::file_entry::VALID_PERMISSION_BITS;
 use cap_std::fs::{
     Dir, File as CapFile, MetadataExt as CapMetadataExt, PermissionsExt as CapPermissionsExt,
 };
@@ -414,7 +415,7 @@ fn host_metadata(metadata: &cap_std::fs::Metadata) -> EntryMetadata {
     EntryMetadata::new(
         timestamp(metadata.created()),
         timestamp(metadata.modified()),
-        metadata.permissions().mode() & 0o7777,
+        metadata.permissions().mode() & VALID_PERMISSION_BITS,
     )
 }
 
@@ -1303,7 +1304,7 @@ fn inspect_ro_crate_zip_archive_manifest<R: Read + Seek>(
                 metadata: EntryMetadata::new(
                     zip_timestamp(&entry),
                     zip_timestamp(&entry),
-                    entry.unix_mode().unwrap_or(default_permissions) & 0o7777,
+                    entry.unix_mode().unwrap_or(default_permissions) & VALID_PERMISSION_BITS,
                 ),
                 source: Some(ZipEntrySource {
                     archive_index,

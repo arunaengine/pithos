@@ -1,7 +1,7 @@
 use crate::archive::{AppendSnapshot, ArchivePath};
 use crate::error::PithosError;
-use crate::format::entries::WireEntries;
-use crate::format::wire::{BlockDataState, FileEntry, FileType};
+use crate::format::directory::DirectoryEntries;
+use crate::format::file_entry::{BlockDataState, FileEntry, FileType, VALID_PERMISSION_BITS};
 use std::collections::HashMap;
 
 fn invalid_path(path: &str, reason: impl Into<String>) -> PithosError {
@@ -92,7 +92,7 @@ pub(crate) fn validate_symlink_target(path: &str, target: &str) -> Result<(), Pi
 
 pub(crate) fn validate_entry(path: &str, entry: &FileEntry) -> Result<(), PithosError> {
     validate_entry_path(path)?;
-    if entry.permissions & !0o7777 != 0 {
+    if entry.permissions & !VALID_PERMISSION_BITS != 0 {
         return Err(PithosError::InvalidPermissions(entry.permissions));
     }
     match entry.file_type {
@@ -151,7 +151,7 @@ pub(crate) fn validate_entry(path: &str, entry: &FileEntry) -> Result<(), Pithos
 }
 
 fn validate_candidate_hierarchy(
-    map: &WireEntries,
+    map: &DirectoryEntries,
     snapshot: Option<&AppendSnapshot>,
     path: &str,
     entry: &FileEntry,
@@ -206,7 +206,7 @@ fn validate_candidate_hierarchy(
 
 #[cfg(test)]
 pub(crate) fn validate_existing_candidate(
-    map: &WireEntries,
+    map: &DirectoryEntries,
     path: &str,
     entry: &FileEntry,
 ) -> Result<(), PithosError> {
@@ -215,7 +215,7 @@ pub(crate) fn validate_existing_candidate(
 }
 
 pub(crate) fn validate_new_candidate(
-    map: &WireEntries,
+    map: &DirectoryEntries,
     path: &str,
     entry: &FileEntry,
 ) -> Result<(), PithosError> {
@@ -229,7 +229,7 @@ pub(crate) fn validate_new_candidate(
 }
 
 pub(crate) fn validate_new_candidate_with_snapshot(
-    map: &WireEntries,
+    map: &DirectoryEntries,
     path: &str,
     entry: &FileEntry,
     snapshot: &AppendSnapshot,
@@ -243,15 +243,17 @@ pub(crate) fn validate_new_candidate_with_snapshot(
     validate_candidate_hierarchy(map, Some(snapshot), path, entry)
 }
 
-pub(crate) fn validate_wire_map(map: &WireEntries) -> Result<(), PithosError> {
+pub(crate) fn validate_directory_entries(map: &DirectoryEntries) -> Result<(), PithosError> {
     for (_, path, entry) in map.iter() {
         validate_entry(path, entry)?;
     }
 
-    validate_wire_hierarchy(map)
+    validate_directory_entry_hierarchy(map)
 }
 
-pub(crate) fn validate_wire_hierarchy(map: &WireEntries) -> Result<(), PithosError> {
+pub(crate) fn validate_directory_entry_hierarchy(
+    map: &DirectoryEntries,
+) -> Result<(), PithosError> {
     let mut earlier: HashMap<&str, &FileEntry> = HashMap::new();
     for (_, path, entry) in map.iter() {
         for (offset, _) in path.match_indices('/') {
@@ -275,7 +277,9 @@ pub(crate) fn validate_wire_hierarchy(map: &WireEntries) -> Result<(), PithosErr
     Ok(())
 }
 
-pub(crate) fn validate_wire_hierarchy_complete(map: &WireEntries) -> Result<(), PithosError> {
+pub(crate) fn validate_directory_entry_hierarchy_complete(
+    map: &DirectoryEntries,
+) -> Result<(), PithosError> {
     let mut earlier: HashMap<&str, &FileEntry> = HashMap::new();
     for (_, path, entry) in map.iter() {
         for (offset, _) in path.match_indices('/') {
@@ -298,8 +302,8 @@ pub(crate) fn validate_wire_hierarchy_complete(map: &WireEntries) -> Result<(), 
     Ok(())
 }
 
-pub(crate) fn validate_wire_hierarchy_with_snapshot(
-    map: &WireEntries,
+pub(crate) fn validate_directory_entry_hierarchy_with_snapshot(
+    map: &DirectoryEntries,
     snapshot: &AppendSnapshot,
 ) -> Result<(), PithosError> {
     let mut earlier: HashMap<&str, &FileEntry> = HashMap::new();
@@ -626,7 +630,7 @@ mod tests {
 
         for (ancestor_path, ancestor) in [("a", file.clone()), ("a", link.clone())] {
             for order in [0, 1] {
-                let mut map = WireEntries::new();
+                let mut map = DirectoryEntries::new();
                 if order == 0 {
                     map.insert(0, ancestor_path, ancestor.clone()).unwrap();
                     map.insert(1, "a/child", file.clone()).unwrap();
@@ -634,12 +638,12 @@ mod tests {
                     map.insert(0, "a/child", file.clone()).unwrap();
                     map.insert(1, ancestor_path, ancestor.clone()).unwrap();
                 }
-                assert!(validate_wire_map(&map).is_err());
+                assert!(validate_directory_entries(&map).is_err());
             }
         }
 
         for order in [0, 1] {
-            let mut map = WireEntries::new();
+            let mut map = DirectoryEntries::new();
             if order == 0 {
                 map.insert(0, "a/child", file.clone()).unwrap();
                 map.insert(1, "a", file.clone()).unwrap();
@@ -647,18 +651,18 @@ mod tests {
                 map.insert(0, "a", file.clone()).unwrap();
                 map.insert(1, "a/child", file.clone()).unwrap();
             }
-            assert!(validate_wire_map(&map).is_err());
+            assert!(validate_directory_entries(&map).is_err());
         }
 
-        let mut parent_first = WireEntries::new();
+        let mut parent_first = DirectoryEntries::new();
         parent_first.insert(0, "a", directory.clone()).unwrap();
         parent_first.insert(1, "a/child", file.clone()).unwrap();
-        assert!(validate_wire_map(&parent_first).is_ok());
+        assert!(validate_directory_entries(&parent_first).is_ok());
 
-        let mut child_first = WireEntries::new();
+        let mut child_first = DirectoryEntries::new();
         child_first.insert(0, "a/child", file.clone()).unwrap();
         child_first.insert(1, "a", directory.clone()).unwrap();
-        assert!(validate_wire_map(&child_first).is_err());
+        assert!(validate_directory_entries(&child_first).is_err());
     }
 
     #[test]
@@ -674,23 +678,23 @@ mod tests {
             BlockDataState::Decrypted(vec![].into()),
         );
 
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "a", file.clone()).unwrap();
         assert!(validate_new_candidate(&map, "a/child", &file).is_err());
 
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "a/child", file.clone()).unwrap();
         assert!(validate_new_candidate(&map, "a", &file).is_err());
 
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "a", directory.clone()).unwrap();
         assert!(validate_new_candidate(&map, "a/child", &file).is_ok());
 
-        let map = WireEntries::new();
+        let map = DirectoryEntries::new();
         assert!(validate_new_candidate(&map, "a/child", &file).is_err());
         assert!(validate_new_candidate(&map, "a/b/child", &file).is_err());
 
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         for (id, path) in [(0, "ab"), (1, "a!"), (2, "a.b"), (3, "a/child")] {
             map.insert(id, path, file.clone()).unwrap();
         }
@@ -699,7 +703,7 @@ mod tests {
         assert!(validate_new_candidate(&map, "a.bx", &file).is_ok());
         assert!(validate_new_candidate(&map, "abx", &file).is_ok());
 
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "ユニコード", file.clone()).unwrap();
         assert!(validate_new_candidate(&map, "ユニコード/子", &file).is_err());
 
@@ -708,7 +712,7 @@ mod tests {
             .collect::<Vec<_>>();
         let ancestor = deep.join("/");
         let descendant = format!("{ancestor}/leaf");
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, descendant, file.clone()).unwrap();
         assert!(validate_new_candidate(&map, &ancestor, &file).is_err());
     }
@@ -720,7 +724,7 @@ mod tests {
             None,
             BlockDataState::Decrypted(vec![].into()),
         );
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "occupied", file.clone()).unwrap();
 
         assert!(validate_existing_candidate(&map, "occupied", &file).is_ok());
@@ -737,7 +741,7 @@ mod tests {
             None,
             BlockDataState::Decrypted(vec![].into()),
         );
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         for (id, path) in [(0, "a"), (1, "a!"), (2, "a/child")] {
             map.insert(id, path, file.clone()).unwrap();
         }
@@ -746,17 +750,17 @@ mod tests {
             map.iter_ordered().map(|(path, _)| path).collect::<Vec<_>>(),
             ["a", "a/child", "a!"]
         );
-        assert!(validate_wire_map(&map).is_err());
+        assert!(validate_directory_entries(&map).is_err());
     }
 
     #[test]
-    fn descending_wire_paths_keep_component_order_without_vector_insertion() {
+    fn descending_insertions_produce_component_path_order() {
         let file = entry(
             FileType::Data,
             None,
             BlockDataState::Decrypted(vec![].into()),
         );
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         for id in (0..10_000u64).rev() {
             map.insert(id, format!("entry-{id:05}"), file.clone())
                 .unwrap();

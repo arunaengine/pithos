@@ -1,5 +1,6 @@
 use super::FsError;
 use crate::archive::{Archive, EntryKind, ExternalBlockResolver};
+use crate::format::file_entry::VALID_PERMISSION_BITS;
 use crate::source::ArchiveSource;
 use cap_std::fs::Dir;
 use rustix::fs::{AtFlags, Mode, OFlags, fchmod, linkat, openat};
@@ -23,7 +24,7 @@ impl ExtractionOptions {
 
 fn applied_mode(stored_permissions: u32, options: ExtractionOptions) -> Mode {
     let mask = if options.special_permissions {
-        0o7777
+        VALID_PERMISSION_BITS
     } else {
         0o0777
     };

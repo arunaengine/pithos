@@ -67,7 +67,7 @@ macro_rules! secret_role {
             }
 
             // SharedSecret is recovered only through derive_shared, while FileKey
-            // and BlockKey need this wire-to-owned-key conversion.
+            // and BlockKey need this decoded-key-to-owned-key conversion.
             #[allow(dead_code)]
             pub(crate) fn from_protocol(bytes: &[u8; 32]) -> Self {
                 Self(*bytes)

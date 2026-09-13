@@ -5,8 +5,9 @@
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use crc32fast::hash as crc32;
 use pithos_lib::archive::{
-    Archive, ArchivePath, ArchiveWriter, EntryKind, EntryMetadata, OpenLimits, OpenOptions,
-    ProcessingOptions, WriteOptions,
+    Archive, ArchivePath, ArchiveWriter, EntryKind, EntryMetadata, ExternalBlockAccessPolicy,
+    ExternalBlockResolver, ExternalLocation, OpenLimits, OpenOptions, ProcessingOptions,
+    WriteOptions,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
@@ -164,172 +165,103 @@ fn mutate_hello_byte(offset: usize, replacement: u8) -> Vec<u8> {
     bytes
 }
 
-fn read_uleb(bytes: &[u8], cursor: &mut usize) -> Result<u64, &'static str> {
-    let mut value = 0_u64;
-    for shift in (0..64).step_by(7) {
-        let byte = *bytes.get(*cursor).ok_or("truncated ULEB128")?;
-        *cursor += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-    Err("overflowing ULEB128")
+fn refresh_directory(bytes: &mut [u8], directory_start: usize) {
+    let footer = bytes.len() - 12;
+    let directory_len = (bytes.len() - directory_start) as u64;
+    bytes[footer..footer + 8].copy_from_slice(&directory_len.to_be_bytes());
+    let checksum = crc32(&bytes[directory_start..bytes.len() - 4]);
+    let crc_offset = bytes.len() - 4;
+    bytes[crc_offset..].copy_from_slice(&checksum.to_be_bytes());
 }
 
-fn take(bytes: &[u8], cursor: &mut usize, count: usize) -> Result<(), &'static str> {
-    *cursor = cursor.checked_add(count).ok_or("overflow")?;
-    if *cursor > bytes.len() {
-        return Err("truncated field");
+fn encoded_empty_entry(id: u64, path: &str, file_type: u8, permissions: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    uleb(id, &mut bytes);
+    uleb(path.len() as u64, &mut bytes);
+    bytes.extend_from_slice(path.as_bytes());
+    bytes.extend_from_slice(&[file_type, 1, 0]); // Type and an empty decrypted block list.
+    for value in [0, 0, 0, permissions] {
+        uleb(value, &mut bytes);
     }
-    Ok(())
+    bytes.extend_from_slice(&[0, 0]); // No references or symlink target.
+    bytes
 }
 
-/// Decode the finalized draft grammar sufficiently to prove exact consumption.
-fn decode_directory(bytes: &[u8]) -> Result<Option<(u64, u64)>, &'static str> {
-    if bytes.len() < 25 || !bytes.starts_with(b"PITHOSDR") {
-        return Err("directory framing");
+fn base_with_entries(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut bytes = b"PITH\x01\0PITHOSDR\0".to_vec();
+    uleb(entries.len() as u64, &mut bytes);
+    for entry in entries {
+        bytes.extend_from_slice(entry);
     }
-    if u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap())
-        != bytes.len() as u64
-    {
-        return Err("directory length");
+    bytes.push(0); // Blocks.
+    bytes.push(10);
+    for (id, name) in RELATIONS {
+        uleb(id.into(), &mut bytes);
+        uleb(name.len() as u64, &mut bytes);
+        bytes.extend_from_slice(name.as_bytes());
     }
-    if crc32(&bytes[..bytes.len() - 4])
-        != u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().unwrap())
-    {
-        return Err("directory CRC");
-    }
-    let mut at = 8;
-    let parent = match *bytes.get(at).ok_or("parent tag")? {
-        0 => {
-            at += 1;
-            None
-        }
-        1 => {
-            at += 1;
-            Some((read_uleb(bytes, &mut at)?, read_uleb(bytes, &mut at)?))
-        }
-        _ => return Err("parent tag"),
-    };
-    let files = read_uleb(bytes, &mut at)?;
-    for _ in 0..files {
-        read_uleb(bytes, &mut at)?;
-        let path_len = read_uleb(bytes, &mut at)? as usize;
-        take(bytes, &mut at, path_len)?;
-        match *bytes.get(at).ok_or("file type")? {
-            0..=3 => at += 1,
-            _ => return Err("file type"),
-        }
-        match *bytes.get(at).ok_or("block data tag")? {
-            0 => {
-                at += 1;
-                let n = read_uleb(bytes, &mut at)? as usize;
-                take(bytes, &mut at, n)?
-            }
-            1 => {
-                at += 1;
-                let n = read_uleb(bytes, &mut at)? as usize;
-                take(bytes, &mut at, n * 64)?
-            }
-            _ => return Err("block data tag"),
-        }
-        for _ in 0..4 {
-            read_uleb(bytes, &mut at)?;
-        }
-        let refs = read_uleb(bytes, &mut at)?;
-        for _ in 0..refs {
-            read_uleb(bytes, &mut at)?;
-            read_uleb(bytes, &mut at)?;
-        }
-        match *bytes.get(at).ok_or("symlink tag")? {
-            0 => at += 1,
-            1 => {
-                at += 1;
-                let n = read_uleb(bytes, &mut at)? as usize;
-                take(bytes, &mut at, n)?
-            }
-            _ => return Err("symlink tag"),
-        }
-    }
-    let blocks = read_uleb(bytes, &mut at)?;
-    for _ in 0..blocks {
-        take(bytes, &mut at, 32)?;
-        read_uleb(bytes, &mut at)?;
-        read_uleb(bytes, &mut at)?;
-        read_uleb(bytes, &mut at)?;
-        let flags = *bytes.get(at).ok_or("flags")?;
-        at += 1;
-        if flags & 0xf0 != 0 {
-            return Err("reserved flags");
-        }
-        match *bytes.get(at).ok_or("location tag")? {
-            0 => at += 1,
-            1 => {
-                at += 1;
-                let n = read_uleb(bytes, &mut at)? as usize;
-                take(bytes, &mut at, n)?
-            }
-            _ => return Err("location tag"),
-        }
-    }
-    let relations = read_uleb(bytes, &mut at)?;
-    for _ in 0..relations {
-        read_uleb(bytes, &mut at)?;
-        let n = read_uleb(bytes, &mut at)? as usize;
-        take(bytes, &mut at, n)?;
-    }
-    let sections = read_uleb(bytes, &mut at)?;
-    if sections != 0 {
-        return Err("encryption sections not used by canonical vectors");
-    }
-    if at + 12 != bytes.len() {
-        return Err("directory consumption");
-    }
-    Ok(parent)
+    bytes.push(0); // Encryption.
+    bytes.extend_from_slice(&[0; 12]);
+    refresh_directory(&mut bytes, 6);
+    bytes
 }
 
-fn decode_archive(bytes: &[u8]) -> Result<(), &'static str> {
-    if !bytes.starts_with(b"PITH\x01\0") {
-        return Err("header");
+fn external_hello() -> Vec<u8> {
+    let mut bytes = hello();
+    bytes.splice(143..=143, [1, 1, b'x']);
+    refresh_directory(&mut bytes, 15);
+    bytes
+}
+
+fn cross_size_append() -> Vec<u8> {
+    let mut bytes = hello();
+    let child_start = bytes.len();
+    let mut child = directory(Some((15, 264)), true, true);
+    child[15..20].copy_from_slice(b"other");
+    child[129] = 4;
+    let child_crc = crc32(&child[..child.len() - 4]);
+    let child_crc_offset = child.len() - 4;
+    child[child_crc_offset..].copy_from_slice(&child_crc.to_be_bytes());
+    bytes.extend(child);
+    assert_eq!(child_start, 279);
+    bytes
+}
+
+#[derive(Clone, Copy)]
+struct MalformedExternalResolver;
+
+impl ExternalBlockResolver for MalformedExternalResolver {
+    fn resolve(
+        &self,
+        policy: &dyn ExternalBlockAccessPolicy,
+        _location: &ExternalLocation,
+        expected_len: u64,
+        _max_response_size: u64,
+    ) -> Result<Vec<u8>, PithosError> {
+        assert_eq!(expected_len, 9);
+        assert!(policy.allows("test://resolved"));
+        Ok(b"BLCKxxxx".to_vec())
     }
-    let length = u64::from_be_bytes(
-        bytes
-            .get(bytes.len().checked_sub(12).ok_or("footer")?..bytes.len() - 4)
-            .ok_or("footer")?
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let start = bytes
-        .len()
-        .checked_sub(length)
-        .ok_or("terminal underflow")?;
-    let parent = decode_directory(&bytes[start..])?;
-    if let Some((parent_start, parent_len)) = parent {
-        let parent_start = usize::try_from(parent_start).map_err(|_| "parent range")?;
-        let parent_len = usize::try_from(parent_len).map_err(|_| "parent range")?;
-        let parent_end = parent_start.checked_add(parent_len).ok_or("parent range")?;
-        if parent_end > start || parent_end > bytes.len() {
-            return Err("parent range");
-        }
-        if decode_directory(&bytes[parent_start..parent_end])?.is_some() {
-            return Err("base parent");
-        }
-    } else if start != 6 && bytes.get(6..10) != Some(b"BLCK") {
-        return Err("base placement");
+}
+
+struct AllowExternal;
+
+impl ExternalBlockAccessPolicy for AllowExternal {
+    fn allows(&self, _target: &str) -> bool {
+        true
     }
-    Ok(())
 }
 
 #[test]
-fn canonical_vectors_are_generated_decoded_and_exactly_reencoded() {
+fn canonical_vectors_are_generated_opened_and_exactly_reencoded() {
     for (id, generated) in [
         ("CV-BASE-EMPTY-146", base()),
         ("CV-APPEND-EMPTY-28", append()),
         ("CV-LOCAL-HELLO-279", hello()),
     ] {
         assert_eq!(generated, appendix_hex(id), "{id} must match Appendix B");
-        decode_archive(&generated).unwrap_or_else(|error| panic!("{id}: {error}"));
+        Archive::open(MemorySource::new(generated.clone()), OpenOptions::default())
+            .unwrap_or_else(|error| panic!("production reader rejected {id}: {error}"));
         // The table-derived encoder is canonical, so its output is the exact re-encoding.
         assert_eq!(
             generated,
@@ -409,26 +341,31 @@ fn production_reader_rejects_a_direct_list_before_over_budget_allocation() {
 }
 
 #[test]
-fn production_reader_accepts_bounded_non_minimal_uleb128() {
+fn production_reader_accepts_av_uleb_nonminimal() {
+    let id = "AV-ULEB-NONMINIMAL";
     Archive::open(
         MemorySource::new(replace_base_relationship_count(&[0x8a, 0x00])),
         OpenOptions::default(),
     )
-    .unwrap();
+    .unwrap_or_else(|error| panic!("production reader rejected {id}: {error}"));
 }
 
 #[test]
-fn production_reader_rejects_overflowing_uleb128() {
+fn production_reader_rejects_rv_uleb() {
+    let id = "RV-ULEB";
     let result = Archive::open(
         MemorySource::new(replace_base_relationship_count(&[
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02,
         ])),
         OpenOptions::default(),
     );
-    assert!(matches!(
-        result,
-        Err(PithosError::Deserialization(DeserializationError::Io(_)))
-    ));
+    assert!(
+        matches!(
+            result,
+            Err(PithosError::Deserialization(DeserializationError::Io(_)))
+        ),
+        "production reader accepted {id}"
+    );
 }
 
 #[test]
@@ -479,42 +416,14 @@ fn directory_length_calculations_are_independent() {
 #[test]
 fn fixed_mutations_have_the_appendix_crc_and_reach_their_rule() {
     let cases = [
-        ("RV-FLAGS", hello(), 142, 0x10, 0x7bd3b103, "reserved flags"),
-        (
-            "RV-UNKNOWN-TAG",
-            hello(),
-            143,
-            0x02,
-            0x86cf1282,
-            "location tag",
-        ),
-        ("RV-FILETYPE", hello(), 32, 0x04, 0x50f42595, "file type"),
-        (
-            "RV-PARENT",
-            append(),
-            161,
-            0x98,
-            0xb734abf4,
-            "parent topology",
-        ),
-        (
-            "RV-EXTENT",
-            hello(),
-            139,
-            0x0f,
-            0x623c8b49,
-            "extent placement",
-        ),
-        (
-            "RV-SHORT-ENCRYPTED",
-            hello(),
-            142,
-            0x08,
-            0x92564e52,
-            "directory consumption",
-        ),
+        ("RV-FLAGS", hello(), 142, 0x10, 0x7bd3b103),
+        ("RV-UNKNOWN-TAG", hello(), 143, 0x02, 0x86cf1282),
+        ("RV-FILETYPE", hello(), 32, 0x04, 0x50f42595),
+        ("RV-PARENT", append(), 161, 0x98, 0xb734abf4),
+        ("RV-EXTENT", hello(), 139, 0x0f, 0x623c8b49),
+        ("RV-SHORT-ENCRYPTED", hello(), 142, 0x08, 0x92564e52),
     ];
-    for (id, mut bytes, offset, replacement, expected_crc, rule) in cases {
+    for (id, mut bytes, offset, replacement, expected_crc) in cases {
         let crc_offset = bytes.len() - 4;
         let directory_start = bytes.len()
             - u64::from_be_bytes(bytes[crc_offset - 8..crc_offset].try_into().unwrap()) as usize;
@@ -524,23 +433,13 @@ fn fixed_mutations_have_the_appendix_crc_and_reach_their_rule() {
         assert_eq!(
             u32::from_be_bytes(bytes[crc_offset..].try_into().unwrap()),
             expected_crc,
-            "{rule}"
+            "{id}"
         );
         assert_b4_crc(id, expected_crc);
-        match rule {
-            "parent topology" => {
-                let terminal_start = bytes.len()
-                    - u64::from_be_bytes(bytes[crc_offset - 8..crc_offset].try_into().unwrap())
-                        as usize;
-                assert_eq!(bytes[terminal_start + 9], terminal_start as u8);
-            }
-            "directory consumption" => {
-                assert_ne!(bytes[142] & 0x08, 0);
-                assert!(bytes[140] < 28, "encrypted payload is too short");
-            }
-            "extent placement" => assert_eq!(bytes[139], 15, "local extent begins at Directory"),
-            expected => assert_eq!(decode_archive(&bytes), Err(expected)),
-        }
+        assert!(
+            Archive::open(MemorySource::new(bytes), OpenOptions::default()).is_err(),
+            "production reader accepted {id}"
+        );
     }
     let mut underflow = base();
     underflow[140..148].copy_from_slice(&153_u64.to_be_bytes());
@@ -551,7 +450,7 @@ fn fixed_mutations_have_the_appendix_crc_and_reach_their_rule() {
         0x371dda5a
     );
     assert_b4_crc("RV-UNDERFLOW", 0x371dda5a);
-    assert_eq!(decode_archive(&underflow), Err("terminal underflow"));
+    assert!(Archive::open(MemorySource::new(underflow), OpenOptions::default()).is_err());
     let mut permissions = hello();
     permissions[102..104].copy_from_slice(&[0x80, 0x20]);
     let crc_offset = permissions.len() - 4;
@@ -564,14 +463,17 @@ fn fixed_mutations_have_the_appendix_crc_and_reach_their_rule() {
         0x9f6af36e
     );
     assert_b4_crc("RV-PERMISSIONS", 0x9f6af36e);
-    let mut permissions_offset = 102;
-    assert_eq!(read_uleb(&permissions, &mut permissions_offset), Ok(0x1000));
+    assert!(Archive::open(MemorySource::new(permissions), OpenOptions::default()).is_err());
     let mut bad_crc = base();
     bad_crc[151] = 0xd3;
-    assert_eq!(decode_archive(&bad_crc), Err("directory CRC"));
     let mut trailing = base();
     trailing.push(0);
-    assert!(decode_archive(&trailing).is_err());
+    for (id, bytes) in [("RV-CRC", bad_crc), ("RV-TRAILING", trailing)] {
+        assert!(
+            Archive::open(MemorySource::new(bytes), OpenOptions::default()).is_err(),
+            "production reader accepted {id}"
+        );
+    }
 }
 
 fn assert_b4_crc(id: &str, crc: u32) {
@@ -741,7 +643,7 @@ fn specification_consistency_has_navigation_and_review_coverage() {
 }
 
 #[test]
-fn structural_mutation_predicates_cover_appendix_b_groups() {
+fn production_reader_rejects_generated_rv_duplicates_path_hierarchy_and_relationships() {
     for id in [
         "RV-DUPLICATES",
         "RV-PATH",
@@ -757,93 +659,64 @@ fn structural_mutation_predicates_cover_appendix_b_groups() {
             "missing {id}"
         );
     }
-    let unique = |values: &[&str]| {
-        values
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            == values.len()
-    };
-    assert!(!unique(&["0", "0"])); // duplicate IDs, paths, hashes, and relationships share this predicate
-    assert!(!unique(&["hello", "hello"]));
-    assert!(!unique(&["hash", "hash"]));
-    assert!(!unique(&["7", "7"]));
-    let valid_path = |path: &str| {
-        !path.is_empty()
-            && !path.starts_with('/')
-            && !path.ends_with('/')
-            && !path.contains(['\\', '\0'])
-            && !path
-                .split('/')
-                .any(|part| part.is_empty() || matches!(part, "." | ".."))
-            && !path.as_bytes().get(1).is_some_and(|byte| *byte == b':')
-    };
-    assert!(
-        ["/hell", "hell/", "a//b", "a\\b", ".", "C:"]
-            .iter()
-            .all(|path| !valid_path(path))
-    );
-    let valid_symlink_target = |parent_depth: usize, target: &str| {
-        if target.is_empty()
-            || target.starts_with('/')
-            || target.contains(['\\', '\0'])
-            || target.as_bytes().get(1) == Some(&b':')
-        {
-            return false;
+
+    let duplicate = base_with_entries(&[
+        encoded_empty_entry(0, "first", 0, 0o755),
+        encoded_empty_entry(0, "second", 0, 0o755),
+    ]);
+    let invalid_path = base_with_entries(&[encoded_empty_entry(0, "/bad", 0, 0o755)]);
+    let child_before_parent = base_with_entries(&[
+        encoded_empty_entry(0, "parent/child", 1, 0o644),
+        encoded_empty_entry(1, "parent", 0, 0o755),
+    ]);
+    let mut invalid_custom_relationship = base();
+    invalid_custom_relationship[18] = 10;
+    refresh_directory(&mut invalid_custom_relationship, 6);
+
+    for (case, bytes) in [
+        ("RV-DUPLICATES", duplicate),
+        ("RV-PATH", invalid_path),
+        ("hierarchy declaration order", child_before_parent),
+        ("custom relationship range", invalid_custom_relationship),
+        ("RV-CROSS-SIZE", cross_size_append()),
+    ] {
+        assert!(
+            Archive::open(MemorySource::new(bytes), OpenOptions::default()).is_err(),
+            "production reader accepted {case}"
+        );
+    }
+}
+
+#[test]
+fn production_reader_enforces_rv_external_availability_and_framing() {
+    let bytes = external_hello();
+    let unavailable =
+        Archive::open(MemorySource::new(bytes.clone()), OpenOptions::default()).unwrap();
+    assert!(matches!(
+        unavailable.entry("hello").unwrap().unwrap().kind,
+        EntryKind::File {
+            available: false,
+            ..
         }
-        let mut depth = parent_depth;
-        for component in target.split('/') {
-            if component.is_empty() || component == "." {
-                return false;
-            }
-            if component == ".." {
-                if depth == 0 {
-                    return false;
-                }
-                depth -= 1;
-            } else {
-                depth += 1;
-            }
+    ));
+    let mut output = Vec::new();
+    assert!(unavailable.copy_to("hello", &mut output).is_err());
+    assert!(output.is_empty());
+
+    let available = Archive::open(
+        MemorySource::new(bytes),
+        OpenOptions::default()
+            .with_external_resolver(MalformedExternalResolver)
+            .with_external_access_policy(std::sync::Arc::new(AllowExternal)),
+    )
+    .unwrap();
+    assert!(matches!(
+        available.entry("hello").unwrap().unwrap().kind,
+        EntryKind::File {
+            available: true,
+            ..
         }
-        true
-    };
-    let valid_symlink = |parent_depth: usize, target: Option<&str>, blocks: usize, size: u64| {
-        target.is_some_and(|target| valid_symlink_target(parent_depth, target))
-            && blocks == 0
-            && size == 0
-    };
-    assert!(valid_symlink(1, Some("../target"), 0, 0));
-    assert!(!valid_symlink(0, Some("../escape"), 0, 0));
-    assert!(!valid_symlink(0, None, 0, 0));
-    assert!(!valid_symlink(0, Some("inside"), 1, 0));
-    assert!(!valid_symlink(0, Some("inside"), 0, 1));
-    let external_result = |enabled: bool, response: &[u8], stored_size: usize| {
-        if !enabled {
-            "unavailable"
-        } else if response.starts_with(b"BLCK") && response.len() == stored_size + 4 {
-            "readable"
-        } else {
-            "fails before output"
-        }
-    };
-    assert_eq!(external_result(false, b"", 5), "unavailable");
-    assert_eq!(external_result(true, b"BLCKxxxx", 5), "fails before output");
-    assert_eq!(
-        external_result(true, b"BLCKxxxxxx", 5),
-        "fails before output"
-    );
-    assert_eq!(
-        external_result(true, b"BADCxxxxx", 5),
-        "fails before output"
-    );
-    let merge_descriptor = |existing: Option<u64>, candidate: u64| match existing {
-        None => Ok(candidate),
-        Some(size) if size == candidate => Ok(size),
-        Some(_) => Err("cross-segment original_size conflict"),
-    };
-    assert_eq!(merge_descriptor(Some(5), 5), Ok(5));
-    assert_eq!(
-        merge_descriptor(Some(4), 5),
-        Err("cross-segment original_size conflict")
-    );
+    ));
+    assert!(available.copy_to("hello", &mut output).is_err());
+    assert!(output.is_empty());
 }

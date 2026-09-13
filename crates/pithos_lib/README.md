@@ -1,6 +1,6 @@
 # Pithos library
 
-`pithos_lib` is the public Rust API for creating, opening, reading, extending, extracting, and adapting Pithos archives. It has no network client or transport policy. This branch implements the Pithos 1.0 draft wire rules; Cargo package versioning is separate.
+`pithos_lib` is the public Rust API for creating, opening, reading, extending, extracting, and adapting Pithos archives. It has no network client or transport policy. Cargo package versioning is separate.
 
 ## Installation
 
@@ -74,7 +74,7 @@ See [`examples/create.rs`](examples/create.rs) for the maintained version and th
 
 Compiled examples are included with the package: [`create`](examples/create.rs), [`open_list`](examples/open_list.rs), [`read_ranges`](examples/read_ranges.rs), [`extract`](examples/extract.rs), [`append`](examples/append.rs), [`grant_readers`](examples/grant_readers.rs), [`ro_crate`](examples/ro_crate.rs), and [`crypt4gh`](examples/crypt4gh.rs). They are local-only and return errors to their caller.
 
-The typed archive API deliberately keeps old model, helper, and wire-record access private. Use `WriteOptions::base` for plain output or `WriteOptions::new` for encrypted output.
+The typed archive API deliberately keeps old model, helper, and internal format access private. Use `WriteOptions::base` for plain output or `WriteOptions::new` for encrypted output.
 
 ## Read and extract semantics
 

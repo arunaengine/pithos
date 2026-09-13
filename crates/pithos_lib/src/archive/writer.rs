@@ -1,21 +1,21 @@
 //! Streaming archive construction with a consuming publication boundary.
 
 use crate::archive::path_validation::{
-    validate_new_candidate_with_snapshot, validate_wire_hierarchy_complete,
-    validate_wire_hierarchy_with_snapshot,
+    validate_directory_entry_hierarchy_complete, validate_directory_entry_hierarchy_with_snapshot,
+    validate_new_candidate_with_snapshot,
 };
 use crate::archive::validation::validate_relationships;
-use crate::archive::{AppendSnapshot, ArchivePath, FileId, Span, segment_from_wire};
+use crate::archive::{AppendSnapshot, ArchivePath, FileId, Span, validated_segment_from_directory};
 use crate::archive::{validate_new_candidate, validate_symlink_target};
 use crate::block;
 use crate::crypto::{FileKey, PrivateKey, PublicKey};
 use crate::error::PithosError;
-use crate::format::codec;
-use crate::format::entries::WireEntries;
-use crate::format::wire::{
-    BlockDataState, BlockHeader, BlockIndexEntry, BlockLocation, EncryptionSection, FileEntry,
-    FileHeader, FileType, ProcessingFlags, RecipientData, Reference,
-};
+use crate::format::block::{BlockHeader, BlockIndexEntry, BlockLocation, ProcessingFlags};
+use crate::format::directory::{Directory, DirectoryEntries};
+use crate::format::encryption::{EncryptionSection, RecipientData};
+use crate::format::file_entry::{BlockDataState, FileEntry, FileType, Reference};
+use crate::format::header::FileHeader;
+use crate::format::{directory, header};
 use fastcdc::v2020::{Normalization, StreamCDC};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -534,7 +534,7 @@ pub struct ArchiveWriter<W: Write> {
     mode: ArchiveWriterMode,
     cdc: CdcConfig,
     sink: CountingSink<W>,
-    directory: crate::format::wire::Directory,
+    directory: Directory,
     poisoned: bool,
     runtime: Box<dyn WriterRuntime>,
     append_snapshot: Option<AppendSnapshot>,
@@ -585,9 +585,9 @@ impl<W: Write> ArchiveWriter<W> {
                 (ArchiveWriterMode::Encrypted { sender }, encryption)
             }
         };
-        let directory = crate::format::wire::Directory::new(None, WireEntries::new(), encryption);
+        let directory = Directory::new(None, DirectoryEntries::new(), encryption);
         let mut sink = CountingSink { sink, offset: 0 };
-        if let Err(error) = codec::encode_header(&FileHeader::default(), &mut sink) {
+        if let Err(error) = header::encode_header(&FileHeader::default(), &mut sink) {
             return Err(CreateError {
                 error: error.into(),
                 sink: sink.into_inner(),
@@ -625,16 +625,12 @@ impl<W: Write> ArchiveWriter<W> {
             .collect::<Vec<_>>();
         let parent = snapshot.terminal_directory();
         let maximum_id = snapshot.maximum_id();
-        let files = WireEntries::with_maximum_id(maximum_id.map_or(0, |id| id.0));
+        let files = DirectoryEntries::with_maximum_id(maximum_id.map_or(0, |id| id.0));
         let encryption = IndexMap::from_iter([(
             LegacyPublicKey::from(&sender).to_bytes(),
             EncryptionSection::new(&recipients),
         )]);
-        let directory = crate::format::wire::Directory::new(
-            Some((parent.start(), parent.len())),
-            files,
-            encryption,
-        );
+        let directory = Directory::new(Some((parent.start(), parent.len())), files, encryption);
         Ok(Self {
             mode: ArchiveWriterMode::Encrypted { sender },
             cdc,
@@ -1200,7 +1196,7 @@ impl<W: Write> ArchiveWriter<W> {
     }
 
     fn write_block(&mut self, bytes: &[u8]) -> Result<(), PithosError> {
-        codec::encode_block_marker(&BlockHeader::default(), &mut self.sink)?;
+        crate::format::block::encode_block_marker(&BlockHeader::default(), &mut self.sink)?;
         self.sink.write_all(bytes)?;
         Ok(())
     }
@@ -1257,15 +1253,18 @@ impl<W: Write> ArchiveWriter<W> {
             self.validate_required_access_records()?;
             self.seal_recipient_lists()?;
             self.validate_publishable()?;
-            codec::update_directory_len(&mut self.directory)?;
-            codec::update_directory_crc(&mut self.directory)?;
+            directory::update_directory_len(&mut self.directory)?;
+            directory::update_directory_crc(&mut self.directory)?;
             if let Some(snapshot) = &self.append_snapshot {
                 let span = Span::new(self.sink.offset, self.directory.dir_len)?;
-                let child =
-                    segment_from_wire(&self.directory, span, Some(snapshot.terminal_directory()))?;
+                let child = validated_segment_from_directory(
+                    &self.directory,
+                    span,
+                    Some(snapshot.terminal_directory()),
+                )?;
                 snapshot.validate_prospective_child(child)?;
             }
-            codec::encode_directory(&self.directory, &mut self.sink)?;
+            directory::encode_directory(&self.directory, &mut self.sink)?;
             self.sink.flush()?;
             Ok(())
         })();
@@ -1356,9 +1355,9 @@ impl<W: Write> ArchiveWriter<W> {
             crate::archive::path_validation::validate_entry(path, entry)?;
         }
         if let Some(snapshot) = &self.append_snapshot {
-            validate_wire_hierarchy_with_snapshot(&self.directory.files, snapshot)?;
+            validate_directory_entry_hierarchy_with_snapshot(&self.directory.files, snapshot)?;
         } else {
-            validate_wire_hierarchy_complete(&self.directory.files)?;
+            validate_directory_entry_hierarchy_complete(&self.directory.files)?;
         }
         self.directory
             .validate_references_and_accessible_blocks_with(
@@ -2015,7 +2014,7 @@ mod tests {
     #[test]
     fn file_id_exhaustion_does_not_mutate_or_poison_before_streaming() {
         let mut writer = ArchiveWriter::create(Vec::new(), options()).unwrap();
-        writer.directory.files = WireEntries::with_maximum_id(u64::MAX);
+        writer.directory.files = DirectoryEntries::with_maximum_id(u64::MAX);
         assert!(matches!(
             writer.add_directory(
                 ArchivePath::new("data").unwrap(),
@@ -2087,9 +2086,11 @@ mod tests {
         ));
 
         let bytes = child.finish().unwrap();
-        let directory =
-            codec::decode_directory(&mut Cursor::new(&bytes), &DeserializationLimits::default())
-                .unwrap();
+        let directory = directory::decode_directory(
+            &mut Cursor::new(&bytes),
+            &DeserializationLimits::default(),
+        )
+        .unwrap();
         assert_eq!(directory.files.len(), 0);
         assert_eq!(directory.blocks.len(), 0);
         assert_eq!(directory.encryption.len(), 1);

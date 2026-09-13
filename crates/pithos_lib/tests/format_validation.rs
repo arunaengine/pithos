@@ -138,7 +138,7 @@ fn open_limits_reject_oversized_entry_descriptor_reference_and_relationship_coun
 }
 
 #[test]
-fn adversarial_wire_path_order_stays_within_open_limits() {
+fn reverse_sibling_order_stays_within_open_limits() {
     let sender = PrivateKey::generate();
     let recipient = sender.duplicate();
     let mut writer = ArchiveWriter::create(

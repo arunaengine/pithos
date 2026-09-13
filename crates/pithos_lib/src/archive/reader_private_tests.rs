@@ -7,11 +7,11 @@ use crate::archive::{
 };
 use crate::crypto::{self, FileKey, PrivateKey, PublicKey};
 use crate::error::PithosError;
+use crate::format::block::BlockLocation;
+use crate::format::directory::{Directory, DirectoryEntries};
+use crate::format::encryption::{EncryptionSection, RecipientData, RecipientSection};
+use crate::format::file_entry::{BlockDataState, FileEntry, FileType};
 use crate::format::limits::{DeserializationError, DeserializationLimits};
-use crate::format::wire::{
-    BlockDataState, BlockLocation, Directory, EncryptionSection, FileEntry, FileType,
-    RecipientData, RecipientSection,
-};
 use crate::source::{ArchiveSource, MemorySource, SourceError};
 use indexmap::IndexMap;
 use std::fs::File;
@@ -133,16 +133,16 @@ fn directory_bounds(bytes: &[u8]) -> (usize, usize) {
 fn rewrite_terminal_directory(path: &Path, mutate: impl FnOnce(&mut Directory)) {
     let mut archive = std::fs::read(path).unwrap();
     let (start, _) = directory_bounds(&archive);
-    let mut directory = crate::format::codec::decode_directory(
+    let mut directory = crate::format::directory::decode_directory(
         &mut Cursor::new(&archive[start..]),
         &DeserializationLimits::default(),
     )
     .unwrap();
     mutate(&mut directory);
-    crate::format::codec::update_directory_len(&mut directory).unwrap();
-    crate::format::codec::update_directory_crc(&mut directory).unwrap();
+    crate::format::directory::update_directory_len(&mut directory).unwrap();
+    crate::format::directory::update_directory_crc(&mut directory).unwrap();
     let mut replacement = Vec::new();
-    crate::format::codec::encode_directory(&directory, &mut replacement).unwrap();
+    crate::format::directory::encode_directory(&directory, &mut replacement).unwrap();
     archive.truncate(start);
     archive.extend_from_slice(&replacement);
     std::fs::write(path, archive).unwrap();
@@ -151,7 +151,7 @@ fn rewrite_terminal_directory(path: &Path, mutate: impl FnOnce(&mut Directory)) 
 fn decode_terminal_directory(path: &Path) -> Directory {
     let archive = std::fs::read(path).unwrap();
     let (start, _) = directory_bounds(&archive);
-    crate::format::codec::decode_directory(
+    crate::format::directory::decode_directory(
         &mut Cursor::new(&archive[start..]),
         &DeserializationLimits::default(),
     )
@@ -163,22 +163,22 @@ fn append_empty_directory(path: &Path, relations: Option<Vec<(u64, String)>>) {
     let (parent_start, parent_len) = directory_bounds(&archive);
     let mut directory = Directory::new(
         Some((parent_start as u64, parent_len as u64)),
-        crate::format::entries::WireEntries::new(),
+        DirectoryEntries::new(),
         IndexMap::new(),
     );
     if let Some(relations) = relations {
         directory.relations = relations;
     }
-    crate::format::codec::update_directory_len(&mut directory).unwrap();
-    crate::format::codec::update_directory_crc(&mut directory).unwrap();
-    crate::format::codec::encode_directory(&directory, &mut archive).unwrap();
+    crate::format::directory::update_directory_len(&mut directory).unwrap();
+    crate::format::directory::update_directory_crc(&mut directory).unwrap();
+    crate::format::directory::encode_directory(&directory, &mut archive).unwrap();
     std::fs::write(path, archive).unwrap();
 }
 
 fn append_recipient_directory(path: &Path, mutate: impl FnOnce(&mut RecipientData)) {
     let mut archive = std::fs::read(path).unwrap();
     let (parent_start, parent_len) = directory_bounds(&archive);
-    let parent = crate::format::codec::decode_directory(
+    let parent = crate::format::directory::decode_directory(
         &mut Cursor::new(&archive[parent_start..]),
         &DeserializationLimits::default(),
     )
@@ -195,12 +195,12 @@ fn append_recipient_directory(path: &Path, mutate: impl FnOnce(&mut RecipientDat
     )]);
     let mut child = Directory::new(
         Some((parent_start as u64, parent_len as u64)),
-        crate::format::entries::WireEntries::new(),
+        DirectoryEntries::new(),
         encryption,
     );
-    crate::format::codec::update_directory_len(&mut child).unwrap();
-    crate::format::codec::update_directory_crc(&mut child).unwrap();
-    crate::format::codec::encode_directory(&child, &mut archive).unwrap();
+    crate::format::directory::update_directory_len(&mut child).unwrap();
+    crate::format::directory::update_directory_crc(&mut child).unwrap();
+    crate::format::directory::encode_directory(&child, &mut archive).unwrap();
     std::fs::write(path, archive).unwrap();
 }
 
@@ -265,7 +265,7 @@ fn open_without_keys(path: &Path) -> Result<Archive<MemorySource>, PithosError> 
 fn first_block(path: &Path) -> (u64, u64) {
     let bytes = std::fs::read(path).unwrap();
     let (start, _) = directory_bounds(&bytes);
-    let directory = crate::format::codec::decode_directory(
+    let directory = crate::format::directory::decode_directory(
         &mut Cursor::new(&bytes[start..]),
         &DeserializationLimits::default(),
     )
@@ -312,7 +312,7 @@ fn recover_first_file_key(path: &Path) -> FileKey {
     };
     let shared = crypto::derive_shared(recipient.as_bytes(), sender).unwrap();
     let plaintext = crypto::unwrap_recipient_list(&shared, data).unwrap();
-    let records = crate::format::codec::decode_decrypted_recipient_list(
+    let records = crate::format::encryption::decode_decrypted_recipient_list(
         &plaintext,
         &DeserializationLimits::default(),
     )
@@ -449,7 +449,7 @@ fn appended_standard_relationship_repeats_must_match() {
 
 #[test]
 fn archive_rejects_no_content_sizes_and_undefined_permission_bits() {
-    let mutations: [fn(&mut crate::format::wire::FileEntry); 3] = [
+    let mutations: [fn(&mut crate::format::file_entry::FileEntry); 3] = [
         |entry| {
             entry.file_type = FileType::Directory;
             entry.block_data = BlockDataState::Decrypted(Vec::new().into());
@@ -1027,7 +1027,7 @@ fn direct_block_lists_share_one_decode_budget_within_and_across_directories() {
     let (parent_start, parent_len) = directory_bounds(&bytes);
     let parent = decode_terminal_directory(&appended);
     let (hash, descriptor) = parent.blocks.first().unwrap();
-    let mut files = crate::format::entries::WireEntries::with_maximum_id(0);
+    let mut files = DirectoryEntries::with_maximum_id(0);
     files
         .insert(
             1,
@@ -1049,9 +1049,9 @@ fn direct_block_lists_share_one_decode_budget_within_and_across_directories() {
         files,
         IndexMap::new(),
     );
-    crate::format::codec::update_directory_len(&mut child).unwrap();
-    crate::format::codec::update_directory_crc(&mut child).unwrap();
-    crate::format::codec::encode_directory(&child, &mut bytes).unwrap();
+    crate::format::directory::update_directory_len(&mut child).unwrap();
+    crate::format::directory::update_directory_crc(&mut child).unwrap();
+    crate::format::directory::encode_directory(&child, &mut bytes).unwrap();
     assert_block_reference_limit(Archive::open(
         MemorySource::new(Arc::<[u8]>::from(bytes)),
         OpenOptions::default().with_limits(limits),

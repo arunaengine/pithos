@@ -573,12 +573,12 @@ mod tests {
         AppendFixture { archive, sender }
     }
 
-    fn terminal_directory(path: &Path) -> crate::format::wire::Directory {
+    fn terminal_directory(path: &Path) -> crate::format::directory::Directory {
         let bytes = std::fs::read(path).unwrap();
         let directory_len =
             u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
         let directory_start = bytes.len() - usize::try_from(directory_len).unwrap();
-        crate::format::codec::decode_directory(
+        crate::format::directory::decode_directory(
             &mut Cursor::new(&bytes[directory_start..]),
             &DeserializationLimits::default(),
         )
@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn append_and_grant_use_fresh_wire_senders_and_retain_the_access_key_as_a_recipient() {
+    fn append_and_grant_use_fresh_senders_and_retain_the_access_key_as_a_recipient() {
         let temporary = tempfile::tempdir().unwrap();
         let fixture = append_fixture(&temporary);
         let access_public =
@@ -681,16 +681,16 @@ mod tests {
         let directory_len =
             u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
         let directory_start = bytes.len() - usize::try_from(directory_len).unwrap();
-        let mut directory = crate::format::codec::decode_directory(
+        let mut directory = crate::format::directory::decode_directory(
             &mut Cursor::new(&bytes[directory_start..]),
             &DeserializationLimits::default(),
         )
         .unwrap();
         directory.relations[0].1 = "Conflicts_With_Default".into();
-        crate::format::codec::update_directory_len(&mut directory).unwrap();
-        crate::format::codec::update_directory_crc(&mut directory).unwrap();
+        crate::format::directory::update_directory_len(&mut directory).unwrap();
+        crate::format::directory::update_directory_crc(&mut directory).unwrap();
         let mut replacement = Vec::new();
-        crate::format::codec::encode_directory(&directory, &mut replacement).unwrap();
+        crate::format::directory::encode_directory(&directory, &mut replacement).unwrap();
         bytes.truncate(directory_start);
         bytes.extend_from_slice(&replacement);
         std::fs::write(&archive_path, &bytes).unwrap();

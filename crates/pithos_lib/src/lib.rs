@@ -21,7 +21,7 @@
 //! The Linux filesystem adapter is intentionally host-specific. Core archive reading and writing
 //! remain independent of filesystem traversal and presentation formats.
 //!
-//! Wire records and compatibility modules are deliberately not part of the public API:
+//! Internal format types and compatibility modules are deliberately not part of the public API:
 //!
 //! ```compile_fail
 //! use pithos_lib::model::structs::Directory;
@@ -32,7 +32,7 @@
 //! ```
 //!
 //! ```compile_fail
-//! use pithos_lib::format::wire::FileHeader;
+//! use pithos_lib::format::header::FileHeader;
 //! ```
 
 pub mod adapters;
