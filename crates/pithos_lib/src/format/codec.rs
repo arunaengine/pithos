@@ -253,6 +253,7 @@ fn encode_block_data<W: Write>(
 fn decode_block_data<R: Read>(
     reader: &mut R,
     limits: &DeserializationLimits,
+    remaining_block_references: &mut u64,
 ) -> Result<BlockDataState, DeserializationError> {
     let mut tag = [0];
     reader.read_exact(&mut tag)?;
@@ -270,7 +271,11 @@ fn decode_block_data<R: Read>(
             Ok(BlockDataState::Encrypted(bytes))
         }
         1 => Ok(BlockDataState::Decrypted(
-            decode_decrypted_block_list_reader(reader, limits)?,
+            decode_decrypted_block_list_reader_with_budget(
+                reader,
+                limits,
+                remaining_block_references,
+            )?,
         )),
         value => Err(DeserializationError::InvalidEnumValue(value)),
     }
@@ -304,9 +309,10 @@ fn decode_file_entry<R: Read>(
     reader: &mut R,
     limits: &DeserializationLimits,
     remaining_references: &mut u64,
+    remaining_block_references: &mut u64,
 ) -> Result<FileEntry, DeserializationError> {
     let file_type = decode_file_type(reader)?;
-    let block_data = decode_block_data(reader, limits)?;
+    let block_data = decode_block_data(reader, limits, remaining_block_references)?;
     let created = reader.read_varint::<u64>()?;
     let modified = reader.read_varint::<u64>()?;
     let file_size = reader.read_varint::<u64>()?;
@@ -463,9 +469,19 @@ pub(crate) fn encode_directory<W: Write>(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn decode_directory<R: Read>(
     reader: &mut R,
     limits: &DeserializationLimits,
+) -> Result<Directory, PithosError> {
+    let mut remaining_block_references = limits.max_block_references;
+    decode_directory_with_budget(reader, limits, &mut remaining_block_references)
+}
+
+pub(crate) fn decode_directory_with_budget<R: Read>(
+    reader: &mut R,
+    limits: &DeserializationLimits,
+    remaining_block_references: &mut u64,
 ) -> Result<Directory, PithosError> {
     let mut identifier = [0; 8];
     reader.read_exact(&mut identifier)?;
@@ -506,7 +522,12 @@ pub(crate) fn decode_directory<R: Read>(
         files.insert(
             id,
             path,
-            decode_file_entry(reader, limits, &mut remaining_references)?,
+            decode_file_entry(
+                reader,
+                limits,
+                &mut remaining_references,
+                remaining_block_references,
+            )?,
         )?;
     }
     let block_count = bounded_len(
@@ -576,9 +597,19 @@ pub(crate) fn decode_directory<R: Read>(
     Ok(directory)
 }
 
+#[allow(dead_code)]
 pub(crate) fn decode_complete_directory(
     bytes: &[u8],
     limits: &DeserializationLimits,
+) -> Result<Directory, PithosError> {
+    let mut remaining_block_references = limits.max_block_references;
+    decode_complete_directory_with_budget(bytes, limits, &mut remaining_block_references)
+}
+
+pub(crate) fn decode_complete_directory_with_budget(
+    bytes: &[u8],
+    limits: &DeserializationLimits,
+    remaining_block_references: &mut u64,
 ) -> Result<Directory, PithosError> {
     if bytes.len() < MIN_DIRECTORY_LEN {
         return Err(PithosError::DirectoryLengthMismatch {
@@ -619,7 +650,7 @@ pub(crate) fn decode_complete_directory(
         });
     }
     let mut reader = Cursor::new(bytes);
-    let directory = decode_directory(&mut reader, limits)?;
+    let directory = decode_directory_with_budget(&mut reader, limits, remaining_block_references)?;
     if reader.position() != bytes.len() as u64 {
         return Err(PithosError::DirectoryConsumptionMismatch {
             expected: bytes.len() as u64,
@@ -658,17 +689,28 @@ pub(crate) fn encode_decrypted_block_list<W: Write>(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn decode_decrypted_block_list_reader<R: Read>(
     reader: &mut R,
     limits: &DeserializationLimits,
 ) -> Result<Zeroizing<Vec<BlockDataEntry>>, DeserializationError> {
+    let mut remaining_block_references = limits.max_block_references;
+    decode_decrypted_block_list_reader_with_budget(reader, limits, &mut remaining_block_references)
+}
+
+fn decode_decrypted_block_list_reader_with_budget<R: Read>(
+    reader: &mut R,
+    limits: &DeserializationLimits,
+    remaining_block_references: &mut u64,
+) -> Result<Zeroizing<Vec<BlockDataEntry>>, DeserializationError> {
     let count = bounded_len(
         reader.read_varint::<u64>()?,
-        limits.max_collection_entries,
-        "block index",
+        limits.max_block_references.min(*remaining_block_references),
+        "block references",
     )?;
+    *remaining_block_references -= count as u64;
     let mut entries = Zeroizing::new(Vec::new());
-    reserve(&mut entries, count, "block index")?;
+    reserve(&mut entries, count, "block references")?;
     let mut keys = HashMap::with_capacity(count);
     for _ in 0..count {
         let mut hash = [0; 32];
@@ -686,12 +728,26 @@ pub(crate) fn decode_decrypted_block_list_reader<R: Read>(
     Ok(entries)
 }
 
+#[allow(dead_code)]
 pub(crate) fn decode_decrypted_block_list(
     bytes: &[u8],
     limits: &DeserializationLimits,
 ) -> Result<Zeroizing<Vec<BlockDataEntry>>, DeserializationError> {
+    let mut remaining_block_references = limits.max_block_references;
+    decode_decrypted_block_list_with_budget(bytes, limits, &mut remaining_block_references)
+}
+
+pub(crate) fn decode_decrypted_block_list_with_budget(
+    bytes: &[u8],
+    limits: &DeserializationLimits,
+    remaining_block_references: &mut u64,
+) -> Result<Zeroizing<Vec<BlockDataEntry>>, DeserializationError> {
     let mut reader = Cursor::new(bytes);
-    let entries = decode_decrypted_block_list_reader(&mut reader, limits)?;
+    let entries = decode_decrypted_block_list_reader_with_budget(
+        &mut reader,
+        limits,
+        remaining_block_references,
+    )?;
     if reader.position() != bytes.len() as u64 {
         return Err(DeserializationError::InvalidLength);
     }

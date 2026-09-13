@@ -4,12 +4,12 @@ use super::reader::{
 use crate::archive::{
     ArchivePath, ArchiveWriter, CdcConfig, EntryMetadata, ProcessingOptions, WriteOptions,
 };
-use crate::crypto::{self, PrivateKey, PublicKey};
+use crate::crypto::{self, FileKey, PrivateKey, PublicKey};
 use crate::error::PithosError;
-use crate::format::limits::DeserializationLimits;
+use crate::format::limits::{DeserializationError, DeserializationLimits};
 use crate::format::wire::{
-    BlockDataState, BlockLocation, Directory, EncryptionSection, FileType, RecipientData,
-    RecipientSection,
+    BlockDataState, BlockLocation, Directory, EncryptionSection, FileEntry, FileType,
+    RecipientData, RecipientSection,
 };
 use crate::source::{ArchiveSource, MemorySource, SourceError};
 use indexmap::IndexMap;
@@ -271,6 +271,65 @@ fn first_block(path: &Path) -> (u64, u64) {
     .unwrap();
     let block = directory.blocks.first().unwrap().1;
     (block.offset, block.stored_size)
+}
+
+fn make_block_lists_direct(path: &Path, count: usize) {
+    rewrite_terminal_directory(path, |directory| {
+        let blocks = directory
+            .blocks
+            .iter()
+            .map(|(hash, descriptor)| (*hash, descriptor.original_size))
+            .collect::<Vec<_>>();
+        let mut index = 0usize;
+        directory
+            .files
+            .try_for_each_mut(|_, file| {
+                if index < count {
+                    let (hash, original_size) = blocks[index];
+                    file.block_data = BlockDataState::Decrypted(Zeroizing::new(vec![(
+                        hash,
+                        [index as u8 + 1; 32],
+                    )]));
+                    file.file_size = original_size;
+                    index += 1;
+                }
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(index, count);
+    });
+}
+
+fn recover_first_file_key(path: &Path) -> FileKey {
+    let directory = decode_terminal_directory(path);
+    let recipient = private("recipient1").into_dalek_static_secret();
+    let recipient_public = DalekPublicKey::from(&recipient).to_bytes();
+    let (sender, section) = directory.encryption.first().unwrap();
+    let data = &section.recipients[&recipient_public].recipient_data;
+    let RecipientData::Encrypted(data) = data else {
+        panic!("writer recipient data was not encrypted");
+    };
+    let shared = crypto::derive_shared(recipient.as_bytes(), sender).unwrap();
+    let plaintext = crypto::unwrap_recipient_list(&shared, data).unwrap();
+    let records = crate::format::codec::decode_decrypted_recipient_list(
+        &plaintext,
+        &DeserializationLimits::default(),
+    )
+    .unwrap();
+    FileKey::from_protocol(&records[0].1)
+}
+
+fn assert_block_reference_limit<T>(result: Result<T, PithosError>) {
+    assert!(matches!(
+        result,
+        Err(PithosError::Deserialization(
+            DeserializationError::LimitExceeded {
+                field: "block references",
+                limit: 0,
+                actual: 1,
+            }
+        ))
+    ));
 }
 
 fn corrupt_payload(path: &Path, byte: usize) {
@@ -855,6 +914,125 @@ fn archive_rejects_stored_size_failures_before_sink_output() {
         directory.blocks.first_mut().unwrap().1.stored_size -= 1
     });
     assert_copy_failure_without_sink(&stored);
+}
+
+#[test]
+fn direct_block_list_keys_are_used_without_file_or_recipient_keys() {
+    let (_temporary, path) = fixture_with("encrypted payload with a wrong direct key", 0);
+    rewrite_terminal_directory(&path, |directory| {
+        let hash = *directory.blocks.first().unwrap().0;
+        directory
+            .files
+            .try_for_each_mut(|_, file| {
+                file.block_data = BlockDataState::Decrypted(Zeroizing::new(vec![(hash, [0; 32])]));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+    });
+
+    let archive = open_without_keys(&path).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    assert!(matches!(
+        archive.copy_to("data", &mut sink),
+        Err(PithosError::Crypt(_))
+    ));
+    assert!(sink.0.is_empty());
+}
+
+#[test]
+fn direct_block_lists_share_one_decode_budget_within_and_across_directories() {
+    let limits = OpenLimits {
+        max_accessible_block_references: 1,
+        ..OpenLimits::default()
+    };
+
+    let (_temporary, same_directory) = fixture_entries(&[("first", "one"), ("second", "two")]);
+    make_block_lists_direct(&same_directory, 2);
+    assert_block_reference_limit(Archive::open(
+        MemorySource::new(Arc::<[u8]>::from(std::fs::read(&same_directory).unwrap())),
+        OpenOptions::default().with_limits(limits),
+    ));
+
+    let (_temporary, appended) = fixture_with("shared direct block", 0);
+    make_block_lists_direct(&appended, 1);
+    let mut bytes = std::fs::read(&appended).unwrap();
+    let (parent_start, parent_len) = directory_bounds(&bytes);
+    let parent = decode_terminal_directory(&appended);
+    let (hash, descriptor) = parent.blocks.first().unwrap();
+    let mut files = crate::format::entries::WireEntries::with_maximum_id(0);
+    files
+        .insert(
+            1,
+            "child",
+            FileEntry {
+                file_type: FileType::Data,
+                block_data: BlockDataState::Decrypted(Zeroizing::new(vec![(*hash, [1; 32])])),
+                created: 0,
+                modified: 0,
+                file_size: descriptor.original_size,
+                permissions: 0o644,
+                references: Vec::new(),
+                symlink_target: None,
+            },
+        )
+        .unwrap();
+    let mut child = Directory::new(
+        Some((parent_start as u64, parent_len as u64)),
+        files,
+        IndexMap::new(),
+    );
+    crate::format::codec::update_directory_len(&mut child).unwrap();
+    crate::format::codec::update_directory_crc(&mut child).unwrap();
+    crate::format::codec::encode_directory(&child, &mut bytes).unwrap();
+    assert_block_reference_limit(Archive::open(
+        MemorySource::new(Arc::<[u8]>::from(bytes)),
+        OpenOptions::default().with_limits(limits),
+    ));
+}
+
+#[test]
+fn direct_and_decrypted_encrypted_block_lists_share_one_open_budget() {
+    let (_temporary, path) = fixture_entries(&[("direct", "one"), ("encrypted", "two")]);
+    make_block_lists_direct(&path, 1);
+    let limits = OpenLimits {
+        max_accessible_block_references: 1,
+        ..OpenLimits::default()
+    };
+    assert_block_reference_limit(Archive::open(
+        MemorySource::new(Arc::<[u8]>::from(std::fs::read(path).unwrap())),
+        OpenOptions::default()
+            .with_limits(limits)
+            .with_access_keys(AccessKeys::new().with_key(private("recipient1"))),
+    ));
+}
+
+#[test]
+fn decrypted_encrypted_block_list_accepts_a_non_minimal_count() {
+    let (_temporary, path) = fixture_with("non-minimal encrypted block list", 0);
+    let file_key = recover_first_file_key(&path);
+    rewrite_terminal_directory(&path, |directory| {
+        directory
+            .files
+            .try_for_each_mut(|_, file| {
+                let BlockDataState::Encrypted(encrypted) = &mut file.block_data else {
+                    panic!("writer block list was not encrypted");
+                };
+                let plaintext = crypto::open_file_block_list(&file_key, encrypted).unwrap();
+                assert_eq!(plaintext[0], 1);
+                let mut non_minimal = vec![0x81, 0x00];
+                non_minimal.extend_from_slice(&plaintext[1..]);
+                *encrypted =
+                    crypto::seal_file_block_list_with_nonce(&file_key, &non_minimal, [0x5a; 12])
+                        .unwrap();
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+    });
+
+    let archive = open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+    let mut output = Vec::new();
+    archive.copy_to("data", &mut output).unwrap();
+    assert_eq!(output, b"non-minimal encrypted block list");
 }
 
 #[test]

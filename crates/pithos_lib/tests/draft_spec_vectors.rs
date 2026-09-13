@@ -4,7 +4,7 @@
 
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use crc32fast::hash as crc32;
-use pithos_lib::archive::{Archive, OpenOptions};
+use pithos_lib::archive::{Archive, EntryKind, OpenLimits, OpenOptions};
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
 use std::io::Cursor;
@@ -345,6 +345,49 @@ fn production_reader_opens_the_step_1_canonical_vectors() {
         Archive::open(MemorySource::new(appendix_hex(id)), OpenOptions::default())
             .unwrap_or_else(|error| panic!("production reader rejected {id}: {error}"));
     }
+}
+
+#[test]
+fn production_reader_reads_cv_local_hello_without_access_keys() {
+    let archive = Archive::open(
+        MemorySource::new(appendix_hex("CV-LOCAL-HELLO-279")),
+        OpenOptions::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        archive.entry("hello").unwrap().unwrap().kind,
+        EntryKind::File {
+            size: 5,
+            available: true
+        }
+    ));
+    let mut output = Vec::new();
+    archive.copy_to("hello", &mut output).unwrap();
+    assert_eq!(output, b"hello");
+    output.clear();
+    archive.copy_range_to("hello", 1..4, &mut output).unwrap();
+    assert_eq!(output, b"ell");
+}
+
+#[test]
+fn production_reader_rejects_a_direct_list_before_over_budget_allocation() {
+    let limits = OpenLimits {
+        max_accessible_block_references: 0,
+        ..OpenLimits::default()
+    };
+    assert!(matches!(
+        Archive::open(
+            MemorySource::new(appendix_hex("CV-LOCAL-HELLO-279")),
+            OpenOptions::default().with_limits(limits),
+        ),
+        Err(PithosError::Deserialization(
+            DeserializationError::LimitExceeded {
+                field: "block references",
+                limit: 0,
+                actual: 1,
+            }
+        ))
+    ));
 }
 
 #[test]

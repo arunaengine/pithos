@@ -12,7 +12,7 @@ use crate::block;
 use crate::crypto::{self, FileKey, PrivateKey};
 use crate::error::PithosError;
 use crate::format::limits::DeserializationLimits;
-use crate::format::wire::{BlockDataState, BlockIndexEntry, Directory, FileHeader};
+use crate::format::wire::{BlockDataEntry, BlockDataState, BlockIndexEntry, Directory, FileHeader};
 use crate::source::ArchiveSource;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -32,6 +32,7 @@ struct DecodedDirectoryCounts {
     entries: u64,
     descriptors: u64,
     references: u64,
+    direct_references: u64,
     relationships: u64,
 }
 
@@ -43,6 +44,14 @@ impl DecodedDirectoryCounts {
             .files
             .iter()
             .map(|(_, _, file)| file.references.len() as u64)
+            .sum::<u64>();
+        self.direct_references += directory
+            .files
+            .iter()
+            .map(|(_, _, file)| match &file.block_data {
+                BlockDataState::Decrypted(entries) => entries.len() as u64,
+                BlockDataState::Encrypted(_) => 0,
+            })
             .sum::<u64>();
         self.relationships += directory.relations.len() as u64;
     }
@@ -235,6 +244,7 @@ where
         let mut child_start = archive_len;
         let mut visited = HashSet::new();
         let mut decoded = DecodedDirectoryCounts::default();
+        let mut remaining_block_references = options.limits.max_accessible_block_references;
         while let Some((start, len)) = next {
             validate_directory_len(len, options.limits)?;
             if raw.len() as u64 > options.limits.max_parent_directories {
@@ -266,9 +276,10 @@ where
                 });
             }
             let bytes = Zeroizing::new(read_source(&source, start, len, "directory")?);
-            let directory = crate::format::codec::decode_complete_directory(
+            let directory = crate::format::codec::decode_complete_directory_with_budget(
                 &bytes,
                 &remaining_deserialization_limits(options.limits, &decoded),
+                &mut remaining_block_references,
             )?;
             decoded.record(&directory);
             next = directory.parent_directory_offset;
@@ -308,13 +319,12 @@ where
         }
 
         let mut segments: Vec<ValidatedSegment> = Vec::new();
-        let mut accessible_references = 0u64;
         for (segment_index, (directory, span)) in raw.into_iter().enumerate() {
             let mut directory = directory;
             resolve_block_lists(
                 &mut directory,
                 &mut access,
-                &mut accessible_references,
+                &mut remaining_block_references,
                 options.limits,
             )?;
             let parent = segment_index
@@ -606,6 +616,7 @@ fn deserialization_limits(limits: OpenLimits) -> DeserializationLimits {
         max_collection_entries: limits.max_entries,
         max_file_entries: limits.max_entries,
         max_block_descriptors: limits.max_descriptors,
+        max_block_references: limits.max_accessible_block_references,
         max_references: limits.max_references,
         max_relationships: limits.max_relationships,
         max_opaque_bytes: limits.max_opaque_metadata_bytes,
@@ -622,6 +633,9 @@ fn remaining_deserialization_limits(
     remaining.max_block_descriptors = remaining
         .max_block_descriptors
         .saturating_sub(decoded.descriptors);
+    remaining.max_block_references = remaining
+        .max_block_references
+        .saturating_sub(decoded.direct_references);
     remaining.max_references = remaining.max_references.saturating_sub(decoded.references);
     remaining.max_relationships = remaining
         .max_relationships
@@ -750,42 +764,38 @@ fn resolve_recipients(
 fn resolve_block_lists(
     directory: &mut Directory,
     access: &mut ResolvedAccess,
-    reference_count: &mut u64,
+    remaining_block_references: &mut u64,
     limits: OpenLimits,
 ) -> Result<(), PithosError> {
     directory.files.try_for_each_mut(|id, file| {
-        let Some(file_key) = access.key(FileId(id)) else {
-            return Ok(());
-        };
-        let BlockDataState::Encrypted(bytes) = &file.block_data else {
-            return Ok(());
-        };
-        let mut decoded_limits = deserialization_limits(limits);
-        decoded_limits.max_collection_entries = limits
-            .max_accessible_block_references
-            .saturating_sub(*reference_count);
-        let plaintext = crypto::open_file_block_list(file_key, bytes)?;
-        let entries =
-            crate::format::codec::decode_decrypted_block_list(&plaintext, &decoded_limits)?;
-        *reference_count = reference_count.checked_add(entries.len() as u64).ok_or(
-            PithosError::LimitExceeded {
-                field: "accessible block references",
-                limit: limits.max_accessible_block_references,
-                actual: u64::MAX,
-            },
-        )?;
-        if *reference_count > limits.max_accessible_block_references {
-            return Err(PithosError::LimitExceeded {
-                field: "accessible block references",
-                limit: limits.max_accessible_block_references,
-                actual: *reference_count,
-            });
+        let file_id = FileId(id);
+        match &file.block_data {
+            BlockDataState::Decrypted(entries) => {
+                record_block_keys(access, file_id, entries);
+            }
+            BlockDataState::Encrypted(bytes) => {
+                let Some(file_key) = access.key(file_id) else {
+                    return Ok(());
+                };
+                let mut decoded_limits = deserialization_limits(limits);
+                decoded_limits.max_block_references = *remaining_block_references;
+                let plaintext = crypto::open_file_block_list(file_key, bytes)?;
+                let entries = crate::format::codec::decode_decrypted_block_list_with_budget(
+                    &plaintext,
+                    &decoded_limits,
+                    remaining_block_references,
+                )?;
+                record_block_keys(access, file_id, &entries);
+                file.block_data = BlockDataState::Decrypted(entries);
+            }
         }
-        access.insert_block_keys(
-            FileId(id),
-            entries.iter().map(|(hash, key)| (BlockHash(*hash), key)),
-        );
-        file.block_data = BlockDataState::Decrypted(entries);
         Ok(())
     })
+}
+
+fn record_block_keys(access: &mut ResolvedAccess, file_id: FileId, entries: &[BlockDataEntry]) {
+    access.insert_block_keys(
+        file_id,
+        entries.iter().map(|(hash, key)| (BlockHash(*hash), key)),
+    );
 }
