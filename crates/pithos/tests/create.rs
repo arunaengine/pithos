@@ -89,6 +89,126 @@ fn create_reports_missing_keys_and_invalid_cdc() {
 }
 
 #[test]
+fn plain_create_and_every_read_subcommand_work_without_keys() {
+    let temporary = temporary();
+    let input = temporary.join("input.txt");
+    let archive = temporary.join("plain.pith");
+    fs::write(&input, b"plain cli content").unwrap();
+    assert!(
+        command()
+            .arg("--output")
+            .arg(&archive)
+            .arg("create")
+            .arg("--plain")
+            .arg("--cdc")
+            .arg("64,256,1024")
+            .arg(&input)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    for arguments in [
+        vec!["read", "list", archive.to_str().unwrap()],
+        vec!["read", "info", archive.to_str().unwrap(), "input.txt"],
+        vec!["read", "directory", archive.to_str().unwrap()],
+    ] {
+        assert!(command().args(arguments).status().unwrap().success());
+    }
+    let data = command()
+        .args(["read", "data", archive.to_str().unwrap(), "input.txt"])
+        .output()
+        .unwrap();
+    assert!(data.status.success());
+    assert_eq!(data.stdout, b"plain cli content");
+
+    let extracted = temporary.join("extracted");
+    fs::create_dir(&extracted).unwrap();
+    assert!(
+        command()
+            .arg("--output")
+            .arg(&extracted)
+            .args(["read", "all"])
+            .arg(&archive)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        fs::read(extracted.join("input.txt")).unwrap(),
+        b"plain cli content"
+    );
+    let _ = fs::remove_dir_all(temporary);
+}
+
+#[test]
+fn plain_create_rejects_secret_and_public_key_options() {
+    let temporary = temporary();
+    let input = temporary.join("input");
+    fs::write(&input, b"input").unwrap();
+    let private = workspace_file("keys/sender_private.pem");
+    let public = workspace_file("keys/recipient1_public.pem");
+    for (index, key_args) in [
+        vec!["--secret-key", private.as_str()],
+        vec!["--public-keys", public.as_str()],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = temporary.join(format!("conflict-{index}.pith"));
+        let result = command()
+            .args(key_args)
+            .arg("--output")
+            .arg(&output)
+            .arg("create")
+            .arg("--plain")
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8(result.stderr)
+                .unwrap()
+                .contains("conflict")
+        );
+        assert!(!output.exists());
+    }
+    let _ = fs::remove_dir_all(temporary);
+}
+
+#[test]
+fn encrypted_archives_list_but_do_not_read_without_a_key() {
+    let temporary = temporary();
+    let input = temporary.join("encrypted.txt");
+    let archive = temporary.join("encrypted.pith");
+    fs::write(&input, b"encrypted").unwrap();
+    assert!(create_command(&archive, &input).status().unwrap().success());
+
+    let listing = command()
+        .args(["read", "list", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    assert!(
+        String::from_utf8(listing.stdout)
+            .unwrap()
+            .contains("available: false")
+    );
+
+    let read = command()
+        .args(["read", "data", archive.to_str().unwrap(), "encrypted.txt"])
+        .output()
+        .unwrap();
+    assert!(!read.status.success());
+    assert!(
+        String::from_utf8(read.stderr)
+            .unwrap()
+            .contains("unavailable")
+    );
+    let _ = fs::remove_dir_all(temporary);
+}
+
+#[test]
 fn create_reports_filesystem_errors_and_produces_a_readable_archive() {
     let temporary = temporary();
     let private = workspace_file("keys/sender_private.pem");

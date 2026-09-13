@@ -154,6 +154,8 @@ pub enum PithosError {
     InvalidRecipientDataState(String),
     #[error("archive creation requires at least one recipient")]
     WriterRequiresRecipient,
+    #[error("base writer requires local, uncompressed, unencrypted processing")]
+    BaseWriterRequiresPlainProcessing,
     #[error("granting reader access requires at least one file or metadata id")]
     GrantRequiresFileId,
     #[error("invalid CDC configuration {min_size},{avg_size},{max_size}")]

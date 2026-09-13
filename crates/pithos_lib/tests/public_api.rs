@@ -52,6 +52,7 @@ fn standard_archive_configurations_are_send_and_sync() {
     let _ = OpenOptions::default()
         .with_external_resolver(SendSyncResolver)
         .with_external_access_policy(std::sync::Arc::new(SendSyncPolicy));
+    let _ = WriteOptions::base();
 }
 
 #[test]

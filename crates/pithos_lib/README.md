@@ -1,6 +1,6 @@
 # Pithos library
 
-`pithos_lib` is the public Rust API for creating, opening, reading, extending, extracting, and adapting encrypted Pithos archives. It has no network client or transport policy.
+`pithos_lib` is the public Rust API for creating, opening, reading, extending, extracting, and adapting Pithos archives. It has no network client or transport policy. This branch implements the Pithos 1.0 draft wire rules; Cargo package versioning is separate.
 
 ## Installation
 
@@ -12,6 +12,26 @@ pithos_lib = "0.8"
 ```
 
 ## Create an archive
+
+A base archive needs no keys and accepts only local, uncompressed, unencrypted content:
+
+```rust,no_run
+use pithos_lib::archive::{ArchivePath, ArchiveWriter, EntryMetadata, ProcessingOptions, WriteOptions};
+use std::fs::File;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = ArchiveWriter::create(File::create("report.pith")?, WriteOptions::base())?;
+    writer.add_file(
+        ArchivePath::new("report.txt")?,
+        EntryMetadata::new(0, 0, 0o644),
+        ProcessingOptions::new(false, 0)?,
+        None,
+        File::open("report.txt")?,
+    )?;
+    writer.finish()?;
+    Ok(())
+}
+```
 
 This example encrypts a local file for its owner. The recipient public key is derived from the private key only for a self-contained example; production applications should provide the intended recipients' public keys.
 
@@ -54,7 +74,7 @@ See [`examples/create.rs`](examples/create.rs) for the maintained version and th
 
 Compiled examples are included with the package: [`create`](examples/create.rs), [`open_list`](examples/open_list.rs), [`read_ranges`](examples/read_ranges.rs), [`extract`](examples/extract.rs), [`append`](examples/append.rs), [`grant_readers`](examples/grant_readers.rs), [`ro_crate`](examples/ro_crate.rs), and [`crypt4gh`](examples/crypt4gh.rs). They are local-only and return errors to their caller.
 
-Version 0.8 deliberately removes old model, helper, and wire-record access from the public API. Use the typed archive API instead. The [format draft](https://github.com/arunaengine/pithos/blob/main/spec/PITHOS_1.0.0_draft.md) is background information, not a complete interoperability guarantee.
+The typed archive API deliberately keeps old model, helper, and wire-record access private. Use `WriteOptions::base` for plain output or `WriteOptions::new` for encrypted output.
 
 ## Read and extract semantics
 

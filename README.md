@@ -13,7 +13,7 @@
 
 <p align="center">A secure archive format and Rust implementation for research-data packaging.</p>
 
-Pithos packages files into an encrypted, chunked archive that can be read sequentially or by byte range. The Rust implementation supports streaming creation, validated opening, filesystem ingestion and extraction, archive extension, RO-Crate conversion, and Crypt4GH export.
+Pithos packages files into a chunked base or encrypted archive that can be read sequentially or by byte range. The Rust implementation supports streaming creation, validated opening, filesystem ingestion and extraction, archive extension, RO-Crate conversion, and Crypt4GH export.
 
 ## Get started
 
@@ -56,4 +56,4 @@ The filesystem operations are Linux-only and require destination filesystem supp
 
 Version 0.8 is a source break from 0.7. Use the selected public API in `pithos_lib::archive`, `crypto`, `source`, `fs`, and `adapters`; old model, helper, and wire-record paths are not compatibility APIs.
 
-The [Pithos 1.0 draft](spec/PITHOS_1.0.0_draft.md) is useful format background, but it is not a complete interoperability guarantee. Current library behavior and tests define the 0.8 implementation.
+This branch implements the wire rules in the [Pithos 1.0 draft](spec/PITHOS_1.0.0_draft.md). Cargo package versioning is maintained separately from the wire-format version.

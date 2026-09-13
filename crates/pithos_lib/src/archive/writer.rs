@@ -161,18 +161,31 @@ pub struct WrittenEntry {
     pub id: u64,
 }
 
-/// Creation options. A writer always has one sender and at least one recipient.
+enum WriteMode {
+    Base,
+    Encrypted {
+        sender: PrivateKey,
+        recipients: Vec<PublicKey>,
+    },
+}
+
+/// Creation options for a base or encrypted archive.
 pub struct WriteOptions {
-    sender: PrivateKey,
-    recipients: Vec<PublicKey>,
+    mode: WriteMode,
     cdc: CdcConfig,
 }
 
 impl WriteOptions {
     pub fn new(sender: PrivateKey, recipients: Vec<PublicKey>) -> Self {
         Self {
-            sender,
-            recipients,
+            mode: WriteMode::Encrypted { sender, recipients },
+            cdc: CdcConfig::default(),
+        }
+    }
+
+    pub fn base() -> Self {
+        Self {
+            mode: WriteMode::Base,
             cdc: CdcConfig::default(),
         }
     }
@@ -184,16 +197,17 @@ impl WriteOptions {
 
     /// Check all creation metadata before taking ownership of an output sink.
     pub fn validate(&self) -> Result<(), PithosError> {
-        if self.recipients.is_empty() {
-            return Err(PithosError::WriterRequiresRecipient);
-        }
-        let mut recipients = HashSet::with_capacity(self.recipients.len());
-        if self
-            .recipients
-            .iter()
-            .any(|recipient| !recipients.insert(recipient))
-        {
-            return Err(PithosError::DuplicateRecipientKey);
+        if let WriteMode::Encrypted { recipients, .. } = &self.mode {
+            if recipients.is_empty() {
+                return Err(PithosError::WriterRequiresRecipient);
+            }
+            let mut unique_recipients = HashSet::with_capacity(recipients.len());
+            if recipients
+                .iter()
+                .any(|recipient| !unique_recipients.insert(recipient))
+            {
+                return Err(PithosError::DuplicateRecipientKey);
+            }
         }
         Ok(())
     }
@@ -517,7 +531,7 @@ impl<W: Write> Write for CountingSink<W> {
 
 /// A streaming archive writer. Dropping it leaves an intentionally incomplete sink.
 pub struct ArchiveWriter<W: Write> {
-    sender: StaticSecret,
+    mode: ArchiveWriterMode,
     cdc: CdcConfig,
     sink: CountingSink<W>,
     directory: crate::format::wire::Directory,
@@ -527,6 +541,17 @@ pub struct ArchiveWriter<W: Write> {
     append_next_id: Option<Option<u64>>,
     planned_ids: Option<HashSet<u64>>,
     granted_access_ids: Option<HashSet<u64>>,
+}
+
+enum ArchiveWriterMode {
+    Base,
+    Encrypted { sender: StaticSecret },
+}
+
+impl ArchiveWriterMode {
+    fn is_base(&self) -> bool {
+        matches!(self, Self::Base)
+    }
 }
 
 #[cfg(test)]
@@ -544,16 +569,22 @@ impl<W: Write> ArchiveWriter<W> {
         if let Err(error) = options.validate() {
             return Err(CreateError { error, sink });
         }
-        let sender = options.sender.into_dalek_static_secret();
-        let recipients = options
-            .recipients
-            .into_iter()
-            .map(PublicKey::into_dalek_public_key)
-            .collect::<Vec<_>>();
-        let encryption = IndexMap::from_iter([(
-            LegacyPublicKey::from(&sender).to_bytes(),
-            EncryptionSection::new(&recipients),
-        )]);
+        let WriteOptions { mode, cdc } = options;
+        let (mode, encryption) = match mode {
+            WriteMode::Base => (ArchiveWriterMode::Base, IndexMap::new()),
+            WriteMode::Encrypted { sender, recipients } => {
+                let sender = sender.into_dalek_static_secret();
+                let recipients = recipients
+                    .into_iter()
+                    .map(PublicKey::into_dalek_public_key)
+                    .collect::<Vec<_>>();
+                let encryption = IndexMap::from_iter([(
+                    LegacyPublicKey::from(&sender).to_bytes(),
+                    EncryptionSection::new(&recipients),
+                )]);
+                (ArchiveWriterMode::Encrypted { sender }, encryption)
+            }
+        };
         let directory = crate::format::wire::Directory::new(None, WireEntries::new(), encryption);
         let mut sink = CountingSink { sink, offset: 0 };
         if let Err(error) = codec::encode_header(&FileHeader::default(), &mut sink) {
@@ -563,8 +594,8 @@ impl<W: Write> ArchiveWriter<W> {
             });
         }
         Ok(Self {
-            sender,
-            cdc: options.cdc,
+            mode,
+            cdc,
             sink,
             directory,
             poisoned: false,
@@ -605,7 +636,7 @@ impl<W: Write> ArchiveWriter<W> {
             encryption,
         );
         Ok(Self {
-            sender,
+            mode: ArchiveWriterMode::Encrypted { sender },
             cdc,
             sink: CountingSink {
                 sink,
@@ -813,6 +844,9 @@ impl<W: Write> ArchiveWriter<W> {
         content: R,
     ) -> Result<WrittenEntry, WriterError> {
         self.ensure_open()?;
+        if self.mode.is_base() && (processing.encrypted() || processing.compression_level() != 0) {
+            return Err(PithosError::BaseWriterRequiresPlainProcessing.into());
+        }
         let mut delta = self.stage_entry(file_type, path, metadata, 0, None)?;
         let mut stream = StreamCDC::with_level(
             content,
@@ -919,21 +953,23 @@ impl<W: Write> ArchiveWriter<W> {
         if let Err(error) = self.validate_unsealed_content(&delta) {
             return self.poison(error);
         }
-        let file_key = match self.runtime.file_key() {
-            Ok(file_key) => file_key,
-            Err(error) => return self.poison(error),
-        };
-        let nonce = match self.runtime.block_list_nonce() {
-            Ok(nonce) => nonce,
-            Err(error) => return self.poison(error),
-        };
-        if let Err(error) =
-            self.runtime
-                .seal_block_list(&mut delta.entry.block_data, &file_key, nonce)
-        {
-            return self.poison(error);
+        if !self.mode.is_base() {
+            let file_key = match self.runtime.file_key() {
+                Ok(file_key) => file_key,
+                Err(error) => return self.poison(error),
+            };
+            let nonce = match self.runtime.block_list_nonce() {
+                Ok(nonce) => nonce,
+                Err(error) => return self.poison(error),
+            };
+            if let Err(error) =
+                self.runtime
+                    .seal_block_list(&mut delta.entry.block_data, &file_key, nonce)
+            {
+                return self.poison(error);
+            }
+            delta.recipient_access = Some((delta.id, file_key));
         }
-        delta.recipient_access = Some((delta.id, file_key));
         // Block bytes may already be orphaned on failure, so preparation failures
         // poison while every live metadata collection remains unchanged.
         if let Err(error) = self.prepare_delta(&delta) {
@@ -1245,6 +1281,11 @@ impl<W: Write> ArchiveWriter<W> {
     fn validate_publishable(&self) -> Result<(), PithosError> {
         self.validate_entry_state()?;
         validate_relationships(&self.directory)?;
+        if self.mode.is_base() && !self.directory.encryption.is_empty() {
+            return Err(PithosError::InvalidRecipientDataState(
+                "base writer has an encryption map".into(),
+            ));
+        }
         if let Some(snapshot) = &self.append_snapshot {
             snapshot.validate_prospective_recipient_pairs(&self.directory.encryption)?;
             let relationships = self
@@ -1255,10 +1296,12 @@ impl<W: Write> ArchiveWriter<W> {
                 .collect::<Vec<_>>();
             snapshot.validate_child_relationships(&relationships)?;
         }
-        for section in self.directory.encryption.values() {
-            for recipient in section.recipients.values() {
-                if matches!(recipient.recipient_data, RecipientData::Decrypted(_)) {
-                    return Err(PithosError::WriterUnsealedRecipientList);
+        if !self.mode.is_base() {
+            for section in self.directory.encryption.values() {
+                for recipient in section.recipients.values() {
+                    if matches!(recipient.recipient_data, RecipientData::Decrypted(_)) {
+                        return Err(PithosError::WriterUnsealedRecipientList);
+                    }
                 }
             }
         }
@@ -1266,14 +1309,17 @@ impl<W: Write> ArchiveWriter<W> {
     }
 
     fn seal_recipient_lists(&mut self) -> Result<(), PithosError> {
-        let sender = LegacyPublicKey::from(&self.sender).to_bytes();
-        let Some(section) = self.directory.encryption.get_mut(&sender) else {
+        let ArchiveWriterMode::Encrypted { sender } = &self.mode else {
+            return Ok(());
+        };
+        let sender_public = LegacyPublicKey::from(sender).to_bytes();
+        let Some(section) = self.directory.encryption.get_mut(&sender_public) else {
             return Ok(());
         };
         for (recipient_key, recipient) in &mut section.recipients {
             let recipient_key = LegacyPublicKey::from(*recipient_key);
             let shared_key =
-                crate::crypto::derive_shared(self.sender.as_bytes(), recipient_key.as_bytes())?;
+                crate::crypto::derive_shared(sender.as_bytes(), recipient_key.as_bytes())?;
             let nonce = self.runtime.recipient_list_nonce()?;
             self.runtime
                 .seal_recipient_list(&mut recipient.recipient_data, shared_key, nonce)?;
@@ -1284,16 +1330,26 @@ impl<W: Write> ArchiveWriter<W> {
     fn validate_entry_state(&self) -> Result<(), PithosError> {
         for (_, _, entry) in self.directory.files.iter() {
             match entry.file_type {
-                FileType::Data | FileType::Metadata
-                    if !matches!(entry.block_data, BlockDataState::Encrypted(_)) =>
-                {
-                    return Err(PithosError::WriterUnsealedBlockList);
+                FileType::Data | FileType::Metadata => {
+                    let valid = if self.mode.is_base() {
+                        matches!(entry.block_data, BlockDataState::Decrypted(_))
+                    } else {
+                        matches!(entry.block_data, BlockDataState::Encrypted(_))
+                    };
+                    if !valid {
+                        return Err(if self.mode.is_base() {
+                            PithosError::InvalidBlockDataState(
+                                "base content must have a decrypted block list".into(),
+                            )
+                        } else {
+                            PithosError::WriterUnsealedBlockList
+                        });
+                    }
                 }
                 FileType::Directory | FileType::Symlink => match &entry.block_data {
                     BlockDataState::Decrypted(entries) if entries.is_empty() => {}
                     _ => return Err(PithosError::WriterNoContentHasBlockMaterial),
                 },
-                _ => {}
             }
         }
         for (_, path, entry) in self.directory.files.iter() {
@@ -1337,6 +1393,15 @@ impl<W: Write> ArchiveWriter<W> {
     }
 
     fn validate_required_access_records(&self) -> Result<(), PithosError> {
+        if self.mode.is_base() {
+            return if self.directory.encryption.is_empty() {
+                Ok(())
+            } else {
+                Err(PithosError::InvalidRecipientDataState(
+                    "base writer has recipient access records".into(),
+                ))
+            };
+        }
         let mut content_ids = self
             .directory
             .files

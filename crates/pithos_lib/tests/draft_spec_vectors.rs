@@ -4,7 +4,10 @@
 
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use crc32fast::hash as crc32;
-use pithos_lib::archive::{Archive, EntryKind, OpenLimits, OpenOptions};
+use pithos_lib::archive::{
+    Archive, ArchivePath, ArchiveWriter, EntryKind, EntryMetadata, OpenLimits, OpenOptions,
+    ProcessingOptions, WriteOptions,
+};
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
 use std::io::Cursor;
@@ -367,6 +370,21 @@ fn production_reader_reads_cv_local_hello_without_access_keys() {
     output.clear();
     archive.copy_range_to("hello", 1..4, &mut output).unwrap();
     assert_eq!(output, b"ell");
+}
+
+#[test]
+fn production_base_writer_reproduces_cv_local_hello() {
+    let mut writer = ArchiveWriter::create(Vec::new(), WriteOptions::base()).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("hello").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(false, 0).unwrap(),
+            Some(5),
+            Cursor::new(b"hello"),
+        )
+        .unwrap();
+    assert_eq!(writer.finish().unwrap(), appendix_hex("CV-LOCAL-HELLO-279"));
 }
 
 #[test]

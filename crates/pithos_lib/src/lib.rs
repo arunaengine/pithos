@@ -1,11 +1,12 @@
 //! Pithos archive reading, writing, Linux filesystem operations, and presentation adapters.
 //!
-//! # Public 0.8 boundary
+//! # Public archive API
 //!
 //! Create archives with [`archive::ArchiveWriter`], then open them through
-//! [`archive::Archive`] and an immutable [`source::ArchiveSource`]. Writer construction requires
-//! a sender key and one or more recipient public keys; opening encrypted content requires the
-//! matching recipient private key in [`archive::AccessKeys`].
+//! [`archive::Archive`] and an immutable [`source::ArchiveSource`]. Create either a base archive
+//! with [`archive::WriteOptions::base`] for local, uncompressed, unencrypted content, or an
+//! encrypted archive with a sender key and one or more recipient public keys. Opening encrypted
+//! content requires the matching recipient private key in [`archive::AccessKeys`].
 //!
 //! Payload integrity is checked when bytes are read, not when the archive is opened. In
 //! particular, [`archive::Archive::copy_to`] and [`archive::Archive::copy_range_to`] verify each
