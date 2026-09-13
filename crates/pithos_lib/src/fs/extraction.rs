@@ -2,9 +2,33 @@ use super::FsError;
 use crate::archive::{Archive, EntryKind, ExternalBlockResolver};
 use crate::source::ArchiveSource;
 use cap_std::fs::Dir;
-use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat};
+use rustix::fs::{AtFlags, Mode, OFlags, fchmod, linkat, openat};
+use std::cmp::Reverse;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+
+/// Options controlling filesystem extraction behavior.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExtractionOptions {
+    special_permissions: bool,
+}
+
+impl ExtractionOptions {
+    /// Opt in to restoring setuid, setgid, and sticky permission bits.
+    pub fn with_special_permissions(mut self) -> Self {
+        self.special_permissions = true;
+        self
+    }
+}
+
+fn applied_mode(stored_permissions: u32, options: ExtractionOptions) -> Mode {
+    let mask = if options.special_permissions {
+        0o7777
+    } else {
+        0o0777
+    };
+    Mode::from(stored_permissions & mask)
+}
 
 fn open_dir_no_follow(parent: &Dir, component: &Path) -> io::Result<Dir> {
     rustix::fs::openat(
@@ -27,6 +51,25 @@ where
     S: ArchiveSource,
     E: ExternalBlockResolver,
 {
+    extract_with_options(
+        archive,
+        archive_path,
+        destination,
+        ExtractionOptions::default(),
+    )
+}
+
+/// Extract one validated archive entry with explicit extraction options.
+pub fn extract_with_options<S, E>(
+    archive: &Archive<S, E>,
+    archive_path: &str,
+    destination: &Path,
+    options: ExtractionOptions,
+) -> Result<(), FsError>
+where
+    S: ArchiveSource,
+    E: ExternalBlockResolver,
+{
     let entry = archive
         .entry(archive_path)
         .map_err(|source| FsError::Archive {
@@ -44,6 +87,7 @@ where
             )),
         })?;
     let root = ExtractionRoot::open(destination, true, archive_path)?;
+    let mode = applied_mode(entry.permissions, options);
     match entry.kind {
         EntryKind::File { .. } | EntryKind::Metadata { .. } => {
             let pending = root.pending_file(archive_path)?;
@@ -51,10 +95,68 @@ where
             archive
                 .copy_to(archive_path, &mut writer)
                 .map_err(|source| root.archive_error("copy", archive_path, source))?;
-            pending.commit(archive_path)?;
+            pending.commit(archive_path, mode)?;
         }
-        EntryKind::Directory => root.create_dir(archive_path)?,
+        EntryKind::Directory => root.create_dir(archive_path, mode)?,
         EntryKind::Symlink { target } => root.create_symlink(archive_path, &target)?,
+    }
+    Ok(())
+}
+
+/// Extract every archive entry in declaration order through one destination root.
+pub fn extract_all<S, E>(archive: &Archive<S, E>, destination: &Path) -> Result<(), FsError>
+where
+    S: ArchiveSource,
+    E: ExternalBlockResolver,
+{
+    extract_all_with_options(archive, destination, ExtractionOptions::default())
+}
+
+/// Extract every archive entry in declaration order with explicit options.
+pub fn extract_all_with_options<S, E>(
+    archive: &Archive<S, E>,
+    destination: &Path,
+    options: ExtractionOptions,
+) -> Result<(), FsError>
+where
+    S: ArchiveSource,
+    E: ExternalBlockResolver,
+{
+    let root = ExtractionRoot::open(destination, true, "<all>")?;
+    let mut directories = Vec::new();
+
+    for entry in archive.entries() {
+        let path = entry.path;
+        let mode = applied_mode(entry.permissions, options);
+        match entry.kind {
+            EntryKind::File { .. } | EntryKind::Metadata { .. } => {
+                let pending = root.pending_file(&path)?;
+                let mut writer = pending.writer(&path)?;
+                archive
+                    .copy_to(&path, &mut writer)
+                    .map_err(|source| root.archive_error("copy", &path, source))?;
+                pending.commit(&path, mode)?;
+            }
+            EntryKind::Directory => {
+                let directory = root.create_dir_open(&path)?;
+                fchmod(&directory, Mode::RWXU).map_err(|source| {
+                    root.operation("set temporary directory permissions", &path, source.into())
+                })?;
+                directories.push(PendingDirectory {
+                    path,
+                    directory,
+                    mode,
+                });
+            }
+            EntryKind::Symlink { target } => root.create_symlink(&path, &target)?,
+        }
+    }
+
+    directories.sort_by_key(|directory| Reverse(directory.path.split('/').count()));
+    for directory in directories {
+        fchmod(&directory.directory, directory.mode).map_err(|source| {
+            root.operation("set directory permissions", &directory.path, source.into())
+        })?;
     }
     Ok(())
 }
@@ -208,15 +310,25 @@ impl ExtractionRoot {
         Ok((dir, final_name.to_string()))
     }
 
-    pub(crate) fn create_dir(&self, path: &str) -> Result<(), FsError> {
+    fn create_dir_open(&self, path: &str) -> Result<Dir, FsError> {
         let (parent, name) = self.parents(path)?;
         match parent.symlink_metadata(&name) {
             Ok(_) => Err(self.collision(path, "final entry already exists")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => parent
-                .create_dir(&name)
-                .map_err(|source| self.operation("create directory", path, source)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                parent
+                    .create_dir(&name)
+                    .map_err(|source| self.operation("create directory", path, source))?;
+                open_dir_no_follow(&parent, Path::new(&name))
+                    .map_err(|source| self.operation("open directory", path, source))
+            }
             Err(source) => Err(self.operation("inspect destination entry", path, source)),
         }
+    }
+
+    fn create_dir(&self, path: &str, mode: Mode) -> Result<(), FsError> {
+        let directory = self.create_dir_open(path)?;
+        fchmod(&directory, mode)
+            .map_err(|source| self.operation("set directory permissions", path, source.into()))
     }
 
     pub(crate) fn create_symlink(&self, path: &str, target: &str) -> Result<(), FsError> {
@@ -274,7 +386,13 @@ impl PendingFile {
         })
     }
 
-    pub(crate) fn commit(self, archive_path: &str) -> Result<(), FsError> {
+    pub(crate) fn commit(self, archive_path: &str, mode: Mode) -> Result<(), FsError> {
+        fchmod(&self.file, mode).map_err(|source| FsError::Operation {
+            operation: "set staged file permissions",
+            archive_path: archive_path.to_owned(),
+            destination: self.destination.clone(),
+            source: source.into(),
+        })?;
         self.file.sync_all().map_err(|source| FsError::Operation {
             operation: "sync staged file",
             archive_path: archive_path.to_owned(),
@@ -304,6 +422,12 @@ impl PendingFile {
             }),
         }
     }
+}
+
+struct PendingDirectory {
+    path: String,
+    directory: Dir,
+    mode: Mode,
 }
 
 impl Write for PendingFile {
@@ -353,7 +477,7 @@ mod tests {
         std::fs::write(temporary.path().join("data"), b"sentinel").unwrap();
 
         assert!(matches!(
-            pending.commit("data"),
+            pending.commit("data", Mode::RUSR | Mode::WUSR),
             Err(FsError::ExtractionCollision { .. })
         ));
 
@@ -376,12 +500,45 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
 
-        pending.commit("data").unwrap();
+        pending.commit("data", Mode::RUSR | Mode::WUSR).unwrap();
 
         assert_eq!(
             std::fs::read(temporary.path().join("data")).unwrap(),
             b"verified"
         );
+    }
+
+    #[test]
+    fn extraction_modes_strip_special_bits_unless_explicitly_enabled() {
+        assert_eq!(
+            applied_mode(0o7777, ExtractionOptions::default()).bits(),
+            0o0777
+        );
+        assert_eq!(
+            applied_mode(
+                0o7777,
+                ExtractionOptions::default().with_special_permissions(),
+            )
+            .bits(),
+            0o7777
+        );
+    }
+
+    #[test]
+    fn staged_file_mode_failure_prevents_publication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ExtractionRoot::open(temporary.path(), false, "data").unwrap();
+        let mut pending = root.pending_file("data").unwrap();
+        pending.file = cap_std::fs::File::from_std(std::fs::File::open("/dev/null").unwrap());
+
+        assert!(matches!(
+            pending.commit("data", Mode::RUSR),
+            Err(FsError::Operation {
+                operation: "set staged file permissions",
+                ..
+            })
+        ));
+        assert!(!temporary.path().join("data").exists());
     }
 
     #[test]

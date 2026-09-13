@@ -7,7 +7,7 @@ use pithos_lib::archive::{
     WriteOptions,
 };
 use pithos_lib::error::PithosError;
-use pithos_lib::fs::extract;
+use pithos_lib::fs::{ExtractionOptions, extract, extract_all, extract_all_with_options};
 
 #[test]
 fn public_reader_lists_copies_ranges_extracts_and_exports() {
@@ -140,6 +140,13 @@ fn extraction_is_no_clobber_no_follow_and_staged() {
             )
             .unwrap();
     }
+    writer
+        .add_symlink(
+            ArchivePath::new("dangling").unwrap(),
+            EntryMetadata::new(0, 0, 0o777),
+            "missing",
+        )
+        .unwrap();
     writer.finish().unwrap();
     let archive = open(&path, AccessKeys::new().with_key(private_key("recipient1")));
     let root = temporary.path().join("output");
@@ -152,5 +159,34 @@ fn extraction_is_no_clobber_no_follow_and_staged() {
     std::fs::create_dir(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, root.join("nested")).unwrap();
     assert!(extract(&archive, "nested/data", &root).is_err());
+    assert!(!outside.join("data").exists());
+    extract(&archive, "dangling", &root).unwrap();
+    assert_eq!(
+        std::fs::read_link(root.join("dangling")).unwrap(),
+        std::path::Path::new("missing")
+    );
+
+    let batch = temporary.path().join("batch");
+    std::fs::create_dir(&batch).unwrap();
+    extract_all(&archive, &batch).unwrap();
+    assert_eq!(std::fs::read(batch.join("data")).unwrap(), b"payload");
+    assert_eq!(
+        std::fs::read(batch.join("nested/data")).unwrap(),
+        b"nested payload"
+    );
+    assert_eq!(
+        std::fs::read_link(batch.join("dangling")).unwrap(),
+        std::path::Path::new("missing")
+    );
+    assert!(extract_all(&archive, &batch).is_err());
+    assert_eq!(std::fs::read(batch.join("data")).unwrap(), b"payload");
+
+    let batch_no_follow = temporary.path().join("batch-no-follow");
+    std::fs::create_dir(&batch_no_follow).unwrap();
+    std::os::unix::fs::symlink(&outside, batch_no_follow.join("nested")).unwrap();
+    assert!(
+        extract_all_with_options(&archive, &batch_no_follow, ExtractionOptions::default(),)
+            .is_err()
+    );
     assert!(!outside.join("data").exists());
 }

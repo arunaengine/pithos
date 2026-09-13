@@ -6,13 +6,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pithos_lib::adapters::crypt4gh;
 use pithos_lib::adapters::crypt4gh::Crypt4GHError;
 use pithos_lib::archive::{
-    AccessKeys, AppendDurability, AppendOptions, Archive, ArchiveWriter, CdcConfig, EntryKind,
-    OpenOptions, ProcessingOptions, WriteOptions, WriterError,
+    AccessKeys, AppendDurability, AppendOptions, Archive, ArchiveWriter, CdcConfig, OpenOptions,
+    ProcessingOptions, WriteOptions, WriterError,
 };
 use pithos_lib::crypto::{PrivateKey, PublicKey, generate_private_key};
 use pithos_lib::error::PithosError;
 use pithos_lib::fs::ingest::build_input_manifest;
-use pithos_lib::fs::{FsError, append_files, extract, grant_readers};
+use pithos_lib::fs::{FsError, append_files, extract_all, grant_readers};
 use pithos_lib::source::FileSource;
 use rustix::fs::{AtFlags, Mode, OFlags, fchmod, linkat, open, openat, unlinkat};
 use std::ffi::OsString;
@@ -322,11 +322,7 @@ fn run() -> Result<(), PithosCliError> {
                     .output
                     .as_deref()
                     .unwrap_or_else(|| std::path::Path::new("."));
-                let mut entries = archive.entries().collect::<Vec<_>>();
-                entries.sort_by_key(|entry| !matches!(entry.kind, EntryKind::Directory));
-                for entry in entries {
-                    extract(&archive, &entry.path, output)?;
-                }
+                extract_all(&archive, output)?;
             }
             ReadCommands::Data {
                 file,

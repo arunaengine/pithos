@@ -4,7 +4,7 @@ use pithos_lib::archive::{
 };
 use pithos_lib::crypto::PrivateKey;
 use pithos_lib::fs::ingest::{InputManifest, build_input_manifest};
-use pithos_lib::fs::{FsError, extract};
+use pithos_lib::fs::{ExtractionOptions, FsError, extract, extract_all, extract_with_options};
 use pithos_lib::source::MemorySource;
 use std::fs::{self, File, FileTimes};
 use std::os::unix::fs::PermissionsExt;
@@ -136,7 +136,7 @@ fn extraction_preserves_files_directories_and_contained_dangling_symlinks() {
 }
 
 #[test]
-fn extraction_uses_host_defaults_instead_of_archived_mode_and_timestamps() {
+fn extraction_applies_exact_ordinary_modes_without_restoring_timestamps() {
     let sender = PrivateKey::generate();
     let mut writer = ArchiveWriter::create(
         Vec::new(),
@@ -144,9 +144,15 @@ fn extraction_uses_host_defaults_instead_of_archived_mode_and_timestamps() {
     )
     .unwrap();
     writer
+        .add_directory(
+            ArchivePath::new("directory").unwrap(),
+            EntryMetadata::new(1, 1, 0o751),
+        )
+        .unwrap();
+    writer
         .add_file(
             ArchivePath::new("data.bin").unwrap(),
-            EntryMetadata::new(1, 1, 0o111),
+            EntryMetadata::new(1, 1, 0o411),
             ProcessingOptions::default(),
             Some(7),
             std::io::Cursor::new(b"content"),
@@ -160,11 +166,20 @@ fn extraction_uses_host_defaults_instead_of_archived_mode_and_timestamps() {
     let temporary = tempfile::tempdir().unwrap();
 
     extract(&archive, "data.bin", temporary.path()).unwrap();
+    extract(&archive, "directory", temporary.path()).unwrap();
 
     let output = temporary.path().join("data.bin");
     assert_eq!(fs::read(&output).unwrap(), b"content");
     let metadata = fs::metadata(output).unwrap();
-    assert_eq!(metadata.permissions().mode() & 0o111, 0);
+    assert_eq!(metadata.permissions().mode() & 0o7777, 0o411);
+    assert_eq!(
+        fs::metadata(temporary.path().join("directory"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o751
+    );
     assert!(
         metadata
             .modified()
@@ -174,6 +189,152 @@ fn extraction_uses_host_defaults_instead_of_archived_mode_and_timestamps() {
             .as_secs()
             > 1
     );
+}
+
+#[test]
+fn extraction_strips_special_bits_by_default_and_can_restore_sticky_directories() {
+    let mut writer = ArchiveWriter::create(Vec::new(), WriteOptions::base()).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("special-file").unwrap(),
+            EntryMetadata::new(0, 0, 0o6754),
+            ProcessingOptions::new(false, 0).unwrap(),
+            Some(4),
+            std::io::Cursor::new(b"mode"),
+        )
+        .unwrap();
+    writer
+        .add_directory(
+            ArchivePath::new("sticky-default").unwrap(),
+            EntryMetadata::new(0, 0, 0o1751),
+        )
+        .unwrap();
+    writer
+        .add_directory(
+            ArchivePath::new("sticky-opt-in").unwrap(),
+            EntryMetadata::new(0, 0, 0o1755),
+        )
+        .unwrap();
+    let archive = Archive::open(
+        MemorySource::new(writer.finish().unwrap()),
+        OpenOptions::default(),
+    )
+    .unwrap();
+    let temporary = tempfile::tempdir().unwrap();
+
+    extract(&archive, "special-file", temporary.path()).unwrap();
+    extract(&archive, "sticky-default", temporary.path()).unwrap();
+    extract_with_options(
+        &archive,
+        "sticky-opt-in",
+        temporary.path(),
+        ExtractionOptions::default().with_special_permissions(),
+    )
+    .unwrap();
+
+    for (path, expected) in [
+        ("special-file", 0o754),
+        ("sticky-default", 0o751),
+        ("sticky-opt-in", 0o1755),
+    ] {
+        assert_eq!(
+            fs::symlink_metadata(temporary.path().join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            expected
+        );
+    }
+}
+
+fn restrictive_directory_archive() -> Archive<MemorySource> {
+    let mut writer = ArchiveWriter::create(Vec::new(), WriteOptions::base()).unwrap();
+    writer
+        .add_directory(
+            ArchivePath::new("locked").unwrap(),
+            EntryMetadata::new(0, 0, 0o555),
+        )
+        .unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("locked/child").unwrap(),
+            EntryMetadata::new(0, 0, 0o640),
+            ProcessingOptions::new(false, 0).unwrap(),
+            Some(5),
+            std::io::Cursor::new(b"child"),
+        )
+        .unwrap();
+    Archive::open(
+        MemorySource::new(writer.finish().unwrap()),
+        OpenOptions::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn batch_extraction_defers_restrictive_directory_modes_until_children_exist() {
+    let temporary = tempfile::tempdir().unwrap();
+    extract_all(&restrictive_directory_archive(), temporary.path()).unwrap();
+    assert_eq!(
+        fs::read(temporary.path().join("locked/child")).unwrap(),
+        b"child"
+    );
+    assert_eq!(
+        fs::metadata(temporary.path().join("locked"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o555
+    );
+    assert_eq!(
+        fs::metadata(temporary.path().join("locked/child"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o640
+    );
+}
+
+#[test]
+fn batch_extraction_restores_modes_under_restrictive_umask() {
+    const CHILD: &str = "PITHOS_TEST_RESTRICTIVE_UMASK";
+    if std::env::var_os(CHILD).is_some() {
+        // This process runs only this test, so changing its process-global umask is isolated.
+        unsafe { libc::umask(0o077) };
+        let temporary = tempfile::tempdir().unwrap();
+        extract_all(&restrictive_directory_archive(), temporary.path()).unwrap();
+        assert_eq!(
+            fs::metadata(temporary.path().join("locked"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o555
+        );
+        assert_eq!(
+            fs::metadata(temporary.path().join("locked/child"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o640
+        );
+        return;
+    }
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "batch_extraction_restores_modes_under_restrictive_umask",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]

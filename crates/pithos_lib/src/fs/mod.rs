@@ -3,8 +3,10 @@
 //! Ingestion, extraction, append, and reader grants are Linux-only host operations.
 //! They keep no-follow traversal, retained source identity, metadata normalization,
 //! and filesystem error context out of the core archive and format layers. Extraction
-//! stages regular files and publishes without clobbering an existing destination;
-//! append and grants use an advisory lock that coordinates only participating writers.
+//! stages regular files and publishes without clobbering an existing destination.
+//! On Linux, symlink permission bits are retained as archive metadata but are not
+//! applied to the symlink itself. Append and grants use an advisory lock that coordinates
+//! only participating writers.
 
 mod append;
 mod extraction;
@@ -93,4 +95,6 @@ pub enum FsError {
     UnsupportedEntry { path: PathBuf, kind: &'static str },
 }
 
-pub use extraction::extract;
+pub use extraction::{
+    ExtractionOptions, extract, extract_all, extract_all_with_options, extract_with_options,
+};

@@ -8,7 +8,10 @@ use pithos_lib::archive::{
 };
 use pithos_lib::crypto::{CryptoError, PrivateKey, PublicKey};
 use pithos_lib::error::PithosError;
-use pithos_lib::fs::{FsError, ingest::InputManifest};
+use pithos_lib::fs::{
+    ExtractionOptions, FsError, extract_all, extract_all_with_options, extract_with_options,
+    ingest::InputManifest,
+};
 use pithos_lib::source::{ArchiveSource, FileSource, MemorySource, SourceError};
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -53,6 +56,10 @@ fn standard_archive_configurations_are_send_and_sync() {
         .with_external_resolver(SendSyncResolver)
         .with_external_access_policy(std::sync::Arc::new(SendSyncPolicy));
     let _ = WriteOptions::base();
+    let _ = ExtractionOptions::default().with_special_permissions();
+    let _ = extract_with_options::<MemorySource, NoExternalBlocks>;
+    let _ = extract_all::<MemorySource, NoExternalBlocks>;
+    let _ = extract_all_with_options::<MemorySource, NoExternalBlocks>;
 }
 
 #[test]

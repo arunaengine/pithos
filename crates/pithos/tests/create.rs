@@ -208,6 +208,62 @@ fn encrypted_archives_list_but_do_not_read_without_a_key() {
     let _ = fs::remove_dir_all(temporary);
 }
 
+#[cfg(unix)]
+#[test]
+fn read_all_restores_archived_file_and_directory_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = temporary();
+    let source = temporary.join("source");
+    let nested = source.join("nested");
+    let child = nested.join("child");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(&child, b"permissions").unwrap();
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o640)).unwrap();
+    let archive = temporary.join("modes.pith");
+    assert!(
+        command()
+            .arg("--output")
+            .arg(&archive)
+            .args(["create", "--plain"])
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let output = temporary.join("output");
+    fs::create_dir(&output).unwrap();
+    assert!(
+        command()
+            .arg("--output")
+            .arg(&output)
+            .args(["read", "all"])
+            .arg(&archive)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        fs::metadata(output.join("nested"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o555
+    );
+    assert_eq!(
+        fs::metadata(output.join("nested/child"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o640
+    );
+    let _ = fs::remove_dir_all(temporary);
+}
+
 #[test]
 fn create_reports_filesystem_errors_and_produces_a_readable_archive() {
     let temporary = temporary();
