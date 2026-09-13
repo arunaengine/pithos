@@ -56,6 +56,15 @@ pub(crate) fn segment_from_wire(
     validate_relationships(directory)?;
     let mut descriptors = Vec::new();
     for (hash, wire) in &directory.blocks {
+        let processing = Processing::from_byte(wire.flags.0)?;
+        if matches!(wire.location, WireBlockLocation::Local)
+            && processing.to_byte() & 0x08 != 0
+            && wire.stored_size < 28
+        {
+            return Err(PithosError::InvalidBlockDescriptor(
+                "encrypted local block payload is shorter than 28 bytes",
+            ));
+        }
         let stored_size_with_marker =
             wire.stored_size
                 .checked_add(4)
@@ -75,7 +84,7 @@ pub(crate) fn segment_from_wire(
             BlockDescriptor {
                 stored_size: wire.stored_size,
                 original_size: wire.original_size,
-                processing: Processing::from_byte(wire.flags.0)?,
+                processing,
                 location,
             },
         ));

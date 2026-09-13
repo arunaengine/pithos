@@ -5,6 +5,7 @@ use crate::archive::types::{
 };
 use crate::archive::validation::{IndexLimits, validate_aggregate, validate_entry};
 use crate::error::PithosError;
+use crate::format::wire::FileHeader;
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -26,6 +27,7 @@ pub(crate) struct ArchiveIndex {
     descriptors: IndexMap<BlockHash, BlockDescriptor>,
     relationships: BTreeMap<RelationId, Arc<str>>,
     segment_spans: Vec<Span>,
+    local_spans: Vec<Span>,
     maximum_id: Option<FileId>,
 }
 
@@ -65,6 +67,10 @@ impl ArchiveIndex {
 
     pub(crate) fn relationship(&self, id: RelationId) -> Option<&str> {
         self.relationships.get(&id).map(Arc::as_ref)
+    }
+
+    pub(crate) fn local_block_spans(&self) -> impl Iterator<Item = Span> + '_ {
+        self.local_spans.iter().copied()
     }
 
     #[cfg(test)]
@@ -109,6 +115,7 @@ pub(crate) fn build_effective_index(
 
     for segment in segments {
         validate_segment_chain(segment, &segment_spans)?;
+        let block_region = block_data_region(segment)?;
         segment_spans.insert(segment.span);
         for (id, name) in &segment.relationships {
             match relationships.get(id) {
@@ -132,6 +139,7 @@ pub(crate) fn build_effective_index(
                     });
                 }
             } else {
+                validate_descriptor(descriptor, archive_len, block_region)?;
                 descriptors.insert(*hash, descriptor.clone());
             }
         }
@@ -177,10 +185,21 @@ pub(crate) fn build_effective_index(
     }
 
     let segment_spans = segment_spans.into_iter().collect::<Vec<_>>();
-    for segment in segments {
-        for (_, descriptor) in &segment.descriptors {
-            validate_descriptor(descriptor, archive_len, &segment_spans)?;
-        }
+    let mut local_spans = descriptors
+        .values()
+        .filter_map(|descriptor| match descriptor.location {
+            crate::archive::types::BlockLocation::Local(span) => Some(span),
+            crate::archive::types::BlockLocation::External(_) => None,
+        })
+        .collect::<Vec<_>>();
+    local_spans.sort_unstable_by_key(|span| span.start());
+    if local_spans
+        .windows(2)
+        .any(|spans| spans[0].overlaps(spans[1]))
+    {
+        return Err(PithosError::InvalidDirectoryRange {
+            operation: "validate block overlap",
+        });
     }
     validate_references_and_content(&entries, &by_id, &relationships, &descriptors)?;
     let maximum_id = entries.iter().map(|entry| entry.id).max();
@@ -192,6 +211,7 @@ pub(crate) fn build_effective_index(
         descriptors,
         relationships,
         segment_spans,
+        local_spans,
         maximum_id,
     })
 }
@@ -227,27 +247,32 @@ fn validate_segment_chain(
     Ok(())
 }
 
+fn block_data_region(segment: &ValidatedSegment) -> Result<Span, PithosError> {
+    let start = segment
+        .parent
+        .map_or(FileHeader::ENCODED_LEN as u64, Span::end);
+    let end = segment.span.start();
+    let len = end
+        .checked_sub(start)
+        .ok_or(PithosError::InvalidDirectoryRange {
+            operation: "validate block data region",
+        })?;
+    Span::new(start, len)
+}
+
 fn validate_descriptor(
     descriptor: &BlockDescriptor,
     archive_len: u64,
-    directory_spans: &[Span],
+    block_region: Span,
 ) -> Result<(), PithosError> {
-    if let crate::archive::types::BlockLocation::Local(span) = descriptor.location {
-        if span.end() > archive_len {
-            return Err(PithosError::InvalidDirectoryRange {
-                operation: "validate block range",
-            });
-        }
-        let directory_index =
-            directory_spans.partition_point(|directory| directory.end() <= span.start());
-        if directory_spans
-            .get(directory_index)
-            .is_some_and(|directory| span.overlaps(*directory))
-        {
-            return Err(PithosError::InvalidDirectoryRange {
-                operation: "validate block overlap",
-            });
-        }
+    if let crate::archive::types::BlockLocation::Local(span) = descriptor.location
+        && (span.start() < block_region.start()
+            || span.end() > block_region.end()
+            || span.end() > archive_len)
+    {
+        return Err(PithosError::InvalidDirectoryRange {
+            operation: "validate block extent",
+        });
     }
     Ok(())
 }

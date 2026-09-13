@@ -51,6 +51,8 @@ pub enum PithosError {
     },
     #[error("Invalid block data state: {0}")]
     InvalidBlockDataState(String),
+    #[error("invalid block descriptor: {0}")]
+    InvalidBlockDescriptor(&'static str),
     #[error("invalid entry combination for {path}: {reason}")]
     InvalidEntryCombination { path: String, reason: String },
     #[error("content is unavailable with the supplied access keys")]

@@ -64,6 +64,15 @@ mod tests {
         }
     }
 
+    fn local_descriptor(span: Span) -> BlockDescriptor {
+        BlockDescriptor {
+            stored_size: span.len().saturating_sub(4),
+            original_size: 1,
+            processing: Processing::from_byte(0).unwrap(),
+            location: BlockLocation::Local(span),
+        }
+    }
+
     fn segment(entries: Vec<SegmentEntry>) -> ValidatedSegment {
         segment_at(100, None, entries)
     }
@@ -174,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn non_winning_compatible_descriptors_still_validate_every_local_range() {
+    fn non_winning_compatible_descriptors_do_not_impose_extent_checks() {
         let hash = BlockHash([9; 32]);
         let older = ValidatedSegment {
             span: Span::new(10, 5).unwrap(),
@@ -194,11 +203,120 @@ mod tests {
                 relationships: Vec::new(),
             };
 
-            assert!(matches!(
-                build_effective_index(&[older.clone(), newer], 1_000, IndexLimits::default()),
-                Err(crate::error::PithosError::InvalidDirectoryRange { .. })
-            ));
+            let index =
+                build_effective_index(&[older.clone(), newer], 1_000, IndexLimits::default())
+                    .unwrap();
+            assert_eq!(index.descriptor(hash), Some(&older.descriptors[0].1));
         }
+    }
+
+    #[test]
+    fn local_descriptors_must_stay_in_their_declaring_segment_region() {
+        let cases = [
+            (
+                "base descriptor begins before the header ends",
+                vec![ValidatedSegment {
+                    span: Span::new(20, 10).unwrap(),
+                    parent: None,
+                    entries: Vec::new(),
+                    descriptors: vec![(
+                        BlockHash([1; 32]),
+                        local_descriptor(Span::new(5, 4).unwrap()),
+                    )],
+                    relationships: Vec::new(),
+                }],
+            ),
+            (
+                "base descriptor extends into its directory",
+                vec![ValidatedSegment {
+                    span: Span::new(20, 10).unwrap(),
+                    parent: None,
+                    entries: Vec::new(),
+                    descriptors: vec![(
+                        BlockHash([1; 32]),
+                        local_descriptor(Span::new(10, 11).unwrap()),
+                    )],
+                    relationships: Vec::new(),
+                }],
+            ),
+            (
+                "appended descriptor points into the base block region",
+                vec![
+                    segment_at(20, None, Vec::new()),
+                    ValidatedSegment {
+                        span: Span::new(60, 10).unwrap(),
+                        parent: Some(Span::new(20, 10).unwrap()),
+                        entries: Vec::new(),
+                        descriptors: vec![(
+                            BlockHash([1; 32]),
+                            local_descriptor(Span::new(10, 4).unwrap()),
+                        )],
+                        relationships: Vec::new(),
+                    },
+                ],
+            ),
+            (
+                "appended descriptor extends into its own directory",
+                vec![
+                    segment_at(20, None, Vec::new()),
+                    ValidatedSegment {
+                        span: Span::new(60, 10).unwrap(),
+                        parent: Some(Span::new(20, 10).unwrap()),
+                        entries: Vec::new(),
+                        descriptors: vec![(
+                            BlockHash([1; 32]),
+                            local_descriptor(Span::new(50, 11).unwrap()),
+                        )],
+                        relationships: Vec::new(),
+                    },
+                ],
+            ),
+        ];
+
+        for (case, segments) in cases {
+            assert!(
+                build_effective_index(&segments, 100, IndexLimits::default()).is_err(),
+                "accepted {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_effective_local_descriptors_are_rejected() {
+        let mut value = segment_at(30, None, Vec::new());
+        value.descriptors = vec![
+            (
+                BlockHash([1; 32]),
+                local_descriptor(Span::new(6, 10).unwrap()),
+            ),
+            (
+                BlockHash([2; 32]),
+                local_descriptor(Span::new(12, 10).unwrap()),
+            ),
+        ];
+
+        assert!(build_effective_index(&[value], 40, IndexLimits::default()).is_err());
+    }
+
+    #[test]
+    fn adjacent_effective_local_descriptors_are_valid() {
+        let first = Span::new(6, 10).unwrap();
+        let second = Span::new(16, 14).unwrap();
+        let mut value = segment_at(30, None, Vec::new());
+        value.descriptors = vec![
+            (BlockHash([1; 32]), local_descriptor(first)),
+            (BlockHash([2; 32]), local_descriptor(second)),
+        ];
+
+        let index = build_effective_index(&[value], 40, IndexLimits::default()).unwrap();
+        assert_eq!(
+            index.descriptor(BlockHash([1; 32])).unwrap().location,
+            BlockLocation::Local(first)
+        );
+        assert_eq!(
+            index.descriptor(BlockHash([2; 32])).unwrap().location,
+            BlockLocation::Local(second)
+        );
     }
 
     #[test]

@@ -207,6 +207,22 @@ impl Write for RecordingSink {
     }
 }
 
+struct RecordingSource {
+    bytes: Arc<[u8]>,
+    reads: Arc<Mutex<Vec<(u64, usize)>>>,
+}
+
+impl ArchiveSource for RecordingSource {
+    fn len(&self) -> Result<u64, SourceError> {
+        Ok(self.bytes.len() as u64)
+    }
+
+    fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> Result<(), SourceError> {
+        self.reads.lock().unwrap().push((offset, output.len()));
+        MemorySource::new(Arc::clone(&self.bytes)).read_exact_at(offset, output)
+    }
+}
+
 #[test]
 fn writers_emit_only_the_required_standard_relationship_table() {
     let (_temporary, path) = fixture();
@@ -664,6 +680,86 @@ fn archive_rejects_stored_size_failures_before_sink_output() {
         directory.blocks.first_mut().unwrap().1.stored_size -= 1
     });
     assert_copy_failure_without_sink(&stored);
+}
+
+#[test]
+fn archive_open_validates_local_markers_without_reading_payloads_or_access_keys() {
+    let (_temporary, path) = fixture_with("marker validation payload", 0);
+    let (offset, stored_size) = first_block(&path);
+    let bytes = Arc::<[u8]>::from(std::fs::read(&path).unwrap());
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    Archive::open(
+        RecordingSource {
+            bytes,
+            reads: Arc::clone(&reads),
+        },
+        OpenOptions::default(),
+    )
+    .unwrap();
+    let reads = reads.lock().unwrap();
+    assert!(
+        reads.contains(&(offset, 4)),
+        "local marker was not read at open"
+    );
+    let payload_start = offset + 4;
+    let payload_end = payload_start + stored_size;
+    assert!(
+        reads.iter().all(|(start, len)| {
+            let end = start.saturating_add(*len as u64);
+            end <= payload_start || *start >= payload_end
+        }),
+        "archive open read local payload bytes"
+    );
+}
+
+#[test]
+fn archive_open_rejects_missing_or_changed_local_block_markers_without_access_keys() {
+    for missing in [false, true] {
+        let (_temporary, path) = fixture_with("invalid marker payload", 0);
+        if missing {
+            rewrite_terminal_directory(&path, |directory| {
+                let descriptor = directory.blocks.first_mut().unwrap().1;
+                descriptor.offset += 1;
+                descriptor.stored_size -= 1;
+            });
+        } else {
+            let (offset, _) = first_block(&path);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[offset as usize..offset as usize + 4].copy_from_slice(b"NOPE");
+            std::fs::write(&path, bytes).unwrap();
+        }
+
+        let error = match open_without_keys(&path) {
+            Ok(_) => panic!("archive with an invalid local block marker opened"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("block marker"));
+    }
+}
+
+#[test]
+fn encrypted_local_descriptor_stored_size_has_a_28_byte_minimum() {
+    for stored_size in [0, 27] {
+        let (_temporary, path) = fixture_with("encrypted descriptor size boundary", 0);
+        rewrite_terminal_directory(&path, |directory| {
+            let descriptor = directory.blocks.first_mut().unwrap().1;
+            assert!(descriptor.flags.is_encrypted());
+            descriptor.stored_size = stored_size;
+        });
+        let error = match open_without_keys(&path) {
+            Ok(_) => panic!("encrypted descriptor with stored size {stored_size} opened"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("block descriptor"));
+    }
+
+    let (_temporary, path) = fixture_with("encrypted descriptor size boundary", 0);
+    rewrite_terminal_directory(&path, |directory| {
+        let descriptor = directory.blocks.first_mut().unwrap().1;
+        assert!(descriptor.flags.is_encrypted());
+        descriptor.stored_size = 28;
+    });
+    open_without_keys(&path).unwrap();
 }
 
 #[test]

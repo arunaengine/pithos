@@ -313,6 +313,11 @@ where
             max_segments: options.limits.max_parent_directories.saturating_add(1),
         };
         let index = build_effective_index(&segments, archive_len, index_limits)?;
+        for span in index.local_block_spans() {
+            let mut marker = [0; 4];
+            source.read_exact_at(span.start(), &mut marker)?;
+            crate::format::codec::decode_block_marker(&mut marker.as_slice())?;
+        }
 
         Ok(Self {
             source,
@@ -471,9 +476,15 @@ where
                 let mut marker = [0; 4];
                 self.source.read_exact_at(span.start(), &mut marker)?;
                 crate::format::codec::decode_block_marker(&mut marker.as_slice())?;
+                let payload_start =
+                    span.start()
+                        .checked_add(4)
+                        .ok_or(PithosError::InvalidDirectoryRange {
+                            operation: "read block payload",
+                        })?;
                 read_source(
                     &self.source,
-                    span.start() + 4,
+                    payload_start,
                     planned.descriptor.stored_size,
                     "block",
                 )?

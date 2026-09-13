@@ -1,24 +1,11 @@
 mod common;
 
-use common::util::{fixture, open, private_key};
-use pithos_lib::archive::AccessKeys;
-use std::io::Write;
-
-struct RecordingSink(Vec<u8>);
-
-impl Write for RecordingSink {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
+use common::util::fixture;
+use pithos_lib::archive::{Archive, OpenOptions};
+use pithos_lib::source::FileSource;
 
 #[test]
-fn public_archive_rejects_a_bad_block_marker_without_sink_output() {
+fn public_archive_rejects_a_bad_block_marker_during_keyless_open() {
     let temporary = tempfile::tempdir().unwrap();
     let path = fixture(&temporary, "recipient1");
     let mut bytes = std::fs::read(&path).unwrap();
@@ -28,8 +15,8 @@ fn public_archive_rejects_a_bad_block_marker_without_sink_output() {
         .unwrap();
     bytes[marker] ^= 1;
     std::fs::write(&path, bytes).unwrap();
-    let archive = open(&path, AccessKeys::new().with_key(private_key("recipient1")));
-    let mut sink = RecordingSink(Vec::new());
-    assert!(archive.copy_to("data", &mut sink).is_err());
-    assert!(sink.0.is_empty());
+    assert!(
+        Archive::open(FileSource::open(&path).unwrap(), OpenOptions::default()).is_err(),
+        "bad local marker was accepted during keyless open"
+    );
 }

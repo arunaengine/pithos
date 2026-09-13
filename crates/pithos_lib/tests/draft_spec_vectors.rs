@@ -150,6 +150,17 @@ fn replace_hello_bytes(range: std::ops::RangeInclusive<usize>, replacement: &[u8
     bytes
 }
 
+fn mutate_hello_byte(offset: usize, replacement: u8) -> Vec<u8> {
+    let mut bytes = hello();
+    bytes[offset] = replacement;
+    let crc_offset = bytes.len() - 4;
+    let directory_start = bytes.len()
+        - u64::from_be_bytes(bytes[crc_offset - 8..crc_offset].try_into().unwrap()) as usize;
+    let checksum = crc32(&bytes[directory_start..crc_offset]);
+    bytes[crc_offset..].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
 fn read_uleb(bytes: &[u8], cursor: &mut usize) -> Result<u64, &'static str> {
     let mut value = 0_u64;
     for shift in (0..64).step_by(7) {
@@ -367,6 +378,19 @@ fn production_reader_rejects_rv_symlink_and_permissions() {
             "RV-PERMISSIONS",
             replace_hello_bytes(0x66..=0x67, &[0x80, 0x20]),
         ),
+    ] {
+        assert!(
+            Archive::open(MemorySource::new(bytes), OpenOptions::default()).is_err(),
+            "production reader accepted {id}"
+        );
+    }
+}
+
+#[test]
+fn production_reader_rejects_rv_extent_and_short_encrypted() {
+    for (id, bytes) in [
+        ("RV-EXTENT", mutate_hello_byte(139, 0x0f)),
+        ("RV-SHORT-ENCRYPTED", mutate_hello_byte(142, 0x08)),
     ] {
         assert!(
             Archive::open(MemorySource::new(bytes), OpenOptions::default()).is_err(),
