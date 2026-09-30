@@ -10,7 +10,7 @@
 
 ## Compatibility And Tests
 
-- Current public structs and tests define 0.8 behavior; the Pithos 1.0 draft is background, not an interoperability guarantee. Do not expose old `model`, `helpers`, or wire-record paths.
+- This branch implements the Pithos 1.0 draft wire rules; Cargo package versioning is separate. Do not expose old `model`, `helpers`, or wire-record paths.
 - Treat changes under `src/format/`, archive validation/indexing, encryption, compression, flags, indexes, or directory layout as on-disk compatibility changes. Do not casually normalize the currently inconsistent `.pto`, `.pith`, and `.pithos` extensions.
 - `pithos_lib` integration tests use committed fixtures and test-only PEM keys in `crates/pithos_lib/tests/data/`; reuse helpers from `tests/common/`.
 - Put wire-format unit coverage in `src/format/`, reader-internal coverage in `src/archive/reader_private_tests.rs`, and public extraction/range coverage in `crates/pithos_lib/tests/reader.rs`. Keep RO-Crate tests in the `ro_crate_{directory,zip,conversion}` integration targets.

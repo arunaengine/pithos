@@ -1,19 +1,20 @@
 use crate::archive::access::ResolvedAccess;
 use crate::archive::index::{ArchiveIndex, build_effective_index};
 use crate::archive::types::{
-    ArchivePath, BlockDescriptor, BlockHash, Entry, FileId, Span, ValidatedSegment,
+    ArchivePath, BlockDescriptor, BlockHash, Entry, FileId, RecipientPair, Span, ValidatedSegment,
 };
 use crate::archive::validation::IndexLimits;
-use crate::crypto::FileKey;
+use crate::crypto::{FileKey, PublicKey};
 use crate::error::PithosError;
+use crate::format::encryption::EncryptionSection;
 use indexmap::IndexMap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// The secret-contained state needed to safely plan a direct append or grant.
 ///
 /// This is intentionally derived only from a fully opened archive. It retains validated
-/// segments for pure prospective merge, but not the source, wire directories, or reader facade.
+/// segments for pure prospective merge, but not the source, decoded directories, or reader facade.
 pub(crate) struct AppendSnapshot {
     archive_len: u64,
     terminal_directory: Span,
@@ -26,6 +27,7 @@ pub(crate) struct AppendSnapshot {
     segments: Vec<ValidatedSegment>,
     index_limits: IndexLimits,
     access: ResolvedAccess,
+    occupied_recipient_pairs: HashSet<RecipientPair>,
 }
 
 pub(crate) struct SnapshotEntry {
@@ -58,6 +60,10 @@ impl AppendSnapshot {
             .map(|(id, name)| (id.0, Arc::from(name)))
             .collect();
         let (index_entries, descriptors, maximum_id) = index.into_append_snapshot_parts();
+        let occupied_recipient_pairs = segments
+            .iter()
+            .flat_map(|segment| segment.recipient_pairs.iter().copied())
+            .collect();
         let mut entries = BTreeMap::new();
         let mut paths = HashMap::new();
         let mut hierarchy = BTreeMap::new();
@@ -90,6 +96,7 @@ impl AppendSnapshot {
             segments,
             index_limits,
             access,
+            occupied_recipient_pairs,
         }
     }
 
@@ -152,6 +159,14 @@ impl AppendSnapshot {
                 });
             }
         }
+        self.ensure_candidate_successor(path, is_directory)
+    }
+
+    pub(crate) fn ensure_candidate_successor(
+        &self,
+        path: &ArchivePath,
+        is_directory: bool,
+    ) -> Result<(), PithosError> {
         if !is_directory
             && let Some((successor, _)) = self.hierarchy.range(path.clone()..).next()
             && path.is_ancestor_of(successor)
@@ -191,6 +206,32 @@ impl AppendSnapshot {
         let mut segments = self.segments.clone();
         segments.push(child);
         build_effective_index(&segments, archive_len, self.index_limits).map(|_| ())
+    }
+
+    pub(crate) fn sender_pair_is_occupied(
+        &self,
+        sender: [u8; 32],
+        recipients: &[PublicKey],
+    ) -> bool {
+        recipients.iter().any(|recipient| {
+            self.occupied_recipient_pairs
+                .contains(&(sender, recipient.into_dalek_public_key().to_bytes()))
+        })
+    }
+
+    pub(crate) fn validate_prospective_recipient_pairs(
+        &self,
+        encryption: &IndexMap<[u8; 32], EncryptionSection>,
+    ) -> Result<(), PithosError> {
+        if encryption.iter().any(|(sender, section)| {
+            section.recipients.keys().any(|recipient| {
+                self.occupied_recipient_pairs
+                    .contains(&(*sender, *recipient))
+            })
+        }) {
+            return Err(PithosError::ConflictingRecipientGrant);
+        }
+        Ok(())
     }
 
     /// Borrows an opaque, zeroizing recovered file key only for content entries.
@@ -379,7 +420,7 @@ mod tests {
         let first_len =
             u64::from_be_bytes(first[first.len() - 12..first.len() - 4].try_into().unwrap());
         let first_start = first.len() - usize::try_from(first_len).unwrap();
-        let first_directory = crate::format::codec::decode_directory(
+        let first_directory = crate::format::directory::decode_directory(
             &mut Cursor::new(&first[first_start..]),
             &DeserializationLimits::default(),
         )
@@ -395,7 +436,7 @@ mod tests {
         .into_append_snapshot();
         let child = ArchiveWriter::append(
             Vec::new(),
-            sender,
+            PrivateKey::generate(),
             vec![recipient.public_key()],
             crate::archive::CdcConfig::default(),
             snapshot,
@@ -407,7 +448,7 @@ mod tests {
         bytes.extend_from_slice(&child);
         let len = u64::from_be_bytes(bytes[bytes.len() - 12..bytes.len() - 4].try_into().unwrap());
         let start = bytes.len() - usize::try_from(len).unwrap();
-        let mut directory = crate::format::codec::decode_directory(
+        let mut directory = crate::format::directory::decode_directory(
             &mut Cursor::new(&bytes[start..]),
             &DeserializationLimits::default(),
         )
@@ -416,10 +457,10 @@ mod tests {
         let mut newer = earliest.clone();
         newer.stored_size -= 1;
         directory.blocks.insert(hash.0, newer);
-        crate::format::codec::update_directory_len(&mut directory).unwrap();
-        crate::format::codec::update_directory_crc(&mut directory).unwrap();
+        crate::format::directory::update_directory_len(&mut directory).unwrap();
+        crate::format::directory::update_directory_crc(&mut directory).unwrap();
         let mut replacement = Vec::new();
-        crate::format::codec::encode_directory(&directory, &mut replacement).unwrap();
+        crate::format::directory::encode_directory(&directory, &mut replacement).unwrap();
         bytes.truncate(start);
         bytes.write_all(&replacement).unwrap();
 
@@ -463,5 +504,31 @@ mod tests {
             wrong.with_file_key(FileId(0), |_| ()),
             Err(PithosError::SnapshotContentUnavailable(0))
         ));
+    }
+
+    #[test]
+    fn prospective_append_rejects_an_ancestor_sender_recipient_pair_before_publication() {
+        let (bytes, sender, recipient) = archive_with_entries();
+        let snapshot =
+            open(bytes, AccessKeys::new().with_key(recipient.duplicate())).into_append_snapshot();
+        let child = ArchiveWriter::append(
+            Vec::new(),
+            sender,
+            vec![recipient.public_key()],
+            crate::archive::CdcConfig::default(),
+            snapshot,
+        )
+        .unwrap();
+
+        let failure = match child.finish() {
+            Ok(_) => panic!("append repeated an ancestor sender/recipient pair"),
+            Err(failure) => failure,
+        };
+        let (error, suffix) = failure.into_parts();
+        assert_eq!(format!("{error:?}"), "ConflictingRecipientGrant");
+        assert!(
+            suffix.is_empty(),
+            "conflicting child was partially published"
+        );
     }
 }

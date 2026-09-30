@@ -16,7 +16,7 @@ fn public_open_rejects_invalid_header() {
 
 #[test]
 fn public_open_rejects_a_footer_claiming_an_impossible_directory() {
-    let mut bytes = b"PITH\x80\x02".to_vec();
+    let mut bytes = b"PITH\x01\x00".to_vec();
     bytes.extend_from_slice(&u64::MAX.to_be_bytes());
     bytes.extend_from_slice(&0u32.to_be_bytes());
     assert!(matches!(
@@ -24,6 +24,20 @@ fn public_open_rejects_a_footer_claiming_an_impossible_directory() {
         Err(PithosError::LimitExceeded {
             field: "directory",
             ..
+        })
+    ));
+}
+
+#[test]
+fn public_open_rejects_the_legacy_varint_header() {
+    let (mut bytes, _) = archive_with_entries(Vec::new());
+    bytes[..6].copy_from_slice(b"PITH\x80\x02");
+
+    assert!(matches!(
+        Archive::open(MemorySource::new(bytes), OpenOptions::default()),
+        Err(PithosError::UnsupportedFileVersion {
+            supported: 0x0100,
+            actual: 0x8002,
         })
     ));
 }
@@ -124,7 +138,7 @@ fn open_limits_reject_oversized_entry_descriptor_reference_and_relationship_coun
 }
 
 #[test]
-fn adversarial_wire_path_order_stays_within_open_limits() {
+fn reverse_sibling_order_stays_within_open_limits() {
     let sender = PrivateKey::generate();
     let recipient = sender.duplicate();
     let mut writer = ArchiveWriter::create(
@@ -132,6 +146,12 @@ fn adversarial_wire_path_order_stays_within_open_limits() {
         WriteOptions::new(sender, vec![recipient.public_key()]),
     )
     .unwrap();
+    writer
+        .add_directory(
+            ArchivePath::new("root").unwrap(),
+            EntryMetadata::new(0, 0, 0o755),
+        )
+        .unwrap();
     for index in (0..100).rev() {
         writer
             .add_directory(
@@ -140,12 +160,6 @@ fn adversarial_wire_path_order_stays_within_open_limits() {
             )
             .unwrap();
     }
-    writer
-        .add_directory(
-            ArchivePath::new("root").unwrap(),
-            EntryMetadata::new(0, 0, 0o755),
-        )
-        .unwrap();
     let archive = Archive::open(
         MemorySource::new(writer.finish().unwrap()),
         OpenOptions::default()

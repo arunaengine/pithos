@@ -169,8 +169,8 @@ fn bench_archive_path(c: &mut Criterion) {
             workloads::ConflictDirection::ExistingAncestor,
         ),
         (
-            "existing-descendants",
-            workloads::ConflictDirection::ExistingDescendants,
+            "missing-ancestor",
+            workloads::ConflictDirection::MissingAncestor,
         ),
     ] {
         let workload = format!("archive_path/conflicts/{name}/1000");
@@ -197,20 +197,12 @@ fn bench_archive_path(c: &mut Criterion) {
             )
         });
     }
-    for (name, order) in [
-        ("ancestor-first", workloads::InsertionOrder::AncestorFirst),
-        (
-            "descendant-first",
-            workloads::InsertionOrder::DescendantFirst,
-        ),
-    ] {
-        bench_build(
-            c,
-            format!("archive_path/incremental/{name}/1000"),
-            &sender,
-            |key| workloads::build_incremental(key, recipient, 1_000, order),
-        );
-    }
+    bench_build(
+        c,
+        "archive_path/incremental/ancestor-first/1000".into(),
+        &sender,
+        |key| workloads::build_incremental(key, recipient, 1_000),
+    );
     for count in [100, 1_000] {
         bench_build(
             c,

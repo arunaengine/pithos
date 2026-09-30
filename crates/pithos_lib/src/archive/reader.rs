@@ -1,6 +1,6 @@
 use super::{
     AccessProvenance, AppendSnapshot, FileId, ResolvedAccess, Span, build_effective_index,
-    segment_from_wire,
+    decode_validated_directory, validated_segment_from_directory,
 };
 use crate::archive::index::ArchiveIndex;
 use crate::archive::types::{
@@ -11,11 +11,18 @@ use crate::archive::validation::IndexLimits;
 use crate::block;
 use crate::crypto::{self, FileKey, PrivateKey};
 use crate::error::PithosError;
+use crate::format::block::{
+    BlockIndexEntry, BlockLocation as FormatBlockLocation, ProcessingFlags,
+};
+use crate::format::directory::Directory;
+use crate::format::encryption::RecipientData;
+use crate::format::file_entry::{BlockDataEntry, BlockDataState};
+use crate::format::header::FileHeader;
 use crate::format::limits::DeserializationLimits;
-use crate::format::wire::{BlockDataState, BlockIndexEntry, Directory, FileHeader};
 use crate::source::ArchiveSource;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
+use std::sync::Arc;
 
 /// Distinguishes archive failures from a presentation callback failure without
 /// making the archive core depend on the callback's error type.
@@ -32,6 +39,7 @@ struct DecodedDirectoryCounts {
     entries: u64,
     descriptors: u64,
     references: u64,
+    direct_references: u64,
     relationships: u64,
 }
 
@@ -43,6 +51,14 @@ impl DecodedDirectoryCounts {
             .files
             .iter()
             .map(|(_, _, file)| file.references.len() as u64)
+            .sum::<u64>();
+        self.direct_references += directory
+            .files
+            .iter()
+            .map(|(_, _, file)| match &file.block_data {
+                BlockDataState::Decrypted(entries) => entries.len() as u64,
+                BlockDataState::Encrypted(_) => 0,
+            })
             .sum::<u64>();
         self.relationships += directory.relations.len() as u64;
     }
@@ -103,13 +119,46 @@ impl AccessKeys {
 }
 
 /// Resolves an opaque external block location to exactly one framed `BLCK` value.
+///
+/// The resolver owns interpretation of the opaque location and selection of concrete
+/// access targets. It must call the supplied policy before its initial access and before
+/// every redirect. The [`ExternalLocation`] is archive-owned opaque data and is not
+/// necessarily itself a concrete policy target.
 pub trait ExternalBlockResolver {
     fn resolve(
         &self,
+        policy: &dyn ExternalBlockAccessPolicy,
         location: &ExternalLocation,
         expected_len: u64,
         max_response_size: u64,
     ) -> Result<Vec<u8>, PithosError>;
+}
+
+/// Describes a feature that prevents content access without changing archive structure.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ArchiveFeature {
+    Compression,
+    BlockEncryption,
+    EncryptedBlockList,
+    EncryptedRecipientList,
+    ExternalStorage,
+}
+
+/// Decides whether an external resolver may access a concrete target.
+///
+/// Resolvers select concrete targets from an opaque [`ExternalLocation`] and must call
+/// this policy before the initial access and before every redirect. The policy is not
+/// called by the archive core for the opaque location itself.
+pub trait ExternalBlockAccessPolicy: Send + Sync {
+    fn allows(&self, target: &str) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentAvailability {
+    Available,
+    MissingAccess,
+    Unsupported(ArchiveFeature),
 }
 
 /// The default resolver rejects external block reads.
@@ -119,11 +168,14 @@ pub struct NoExternalBlocks;
 impl ExternalBlockResolver for NoExternalBlocks {
     fn resolve(
         &self,
+        _policy: &dyn ExternalBlockAccessPolicy,
         _location: &ExternalLocation,
         _expected_len: u64,
         _max_response_size: u64,
     ) -> Result<Vec<u8>, PithosError> {
-        Err(PithosError::ExternalBlockSourceRequired)
+        Err(PithosError::UnsupportedFeature(
+            ArchiveFeature::ExternalStorage,
+        ))
     }
 }
 
@@ -132,6 +184,8 @@ pub struct OpenOptions<E = NoExternalBlocks> {
     limits: OpenLimits,
     keys: AccessKeys,
     external: E,
+    external_resolver_supplied: bool,
+    external_access_policy: Option<Arc<dyn ExternalBlockAccessPolicy>>,
 }
 
 impl Default for OpenOptions<NoExternalBlocks> {
@@ -140,6 +194,8 @@ impl Default for OpenOptions<NoExternalBlocks> {
             limits: OpenLimits::default(),
             keys: AccessKeys::default(),
             external: NoExternalBlocks,
+            external_resolver_supplied: false,
+            external_access_policy: None,
         }
     }
 }
@@ -160,7 +216,17 @@ impl<E> OpenOptions<E> {
             limits: self.limits,
             keys: self.keys,
             external,
+            external_resolver_supplied: true,
+            external_access_policy: self.external_access_policy,
         }
+    }
+
+    pub fn with_external_access_policy(
+        mut self,
+        policy: Arc<dyn ExternalBlockAccessPolicy>,
+    ) -> Self {
+        self.external_access_policy = Some(policy);
+        self
     }
 }
 
@@ -200,6 +266,7 @@ pub struct ArchiveReference {
 pub struct Archive<S, E = NoExternalBlocks> {
     source: S,
     external: E,
+    external_access_policy: Option<Arc<dyn ExternalBlockAccessPolicy>>,
     archive_len: u64,
     terminal_directory: Span,
     index: ArchiveIndex,
@@ -208,6 +275,7 @@ pub struct Archive<S, E = NoExternalBlocks> {
     access: ResolvedAccess,
     access_keys: AccessKeys,
     limits: OpenLimits,
+    content_availability: BTreeMap<FileId, ContentAvailability>,
 }
 
 impl<S, E> Archive<S, E>
@@ -218,9 +286,9 @@ where
     /// Opens, frames, validates, resolves access metadata, and indexes an archive.
     pub fn open(source: S, options: OpenOptions<E>) -> Result<Self, PithosError> {
         let archive_len = source.len()?;
-        let mut header = [0; 6];
+        let mut header = [0; FileHeader::ENCODED_LEN];
         source.read_exact_at(0, &mut header)?;
-        let header = crate::format::codec::decode_header(&mut header.as_slice())?;
+        let header = crate::format::header::decode_header(&mut header.as_slice())?;
         if header.version != FileHeader::SUPPORTED_VERSION {
             return Err(PithosError::UnsupportedFileVersion {
                 supported: FileHeader::SUPPORTED_VERSION,
@@ -235,6 +303,7 @@ where
         let mut child_start = archive_len;
         let mut visited = HashSet::new();
         let mut decoded = DecodedDirectoryCounts::default();
+        let mut remaining_block_references = options.limits.max_accessible_block_references;
         while let Some((start, len)) = next {
             validate_directory_len(len, options.limits)?;
             if raw.len() as u64 > options.limits.max_parent_directories {
@@ -266,9 +335,10 @@ where
                 });
             }
             let bytes = Zeroizing::new(read_source(&source, start, len, "directory")?);
-            let directory = crate::format::codec::decode_complete_directory(
+            let directory = decode_validated_directory(
                 &bytes,
                 &remaining_deserialization_limits(options.limits, &decoded),
+                &mut remaining_block_references,
             )?;
             decoded.record(&directory);
             next = directory.parent_directory_offset;
@@ -276,6 +346,23 @@ where
             raw.push((directory, span));
         }
         raw.reverse();
+
+        let mut first_grants = HashMap::new();
+        for (directory, _) in &raw {
+            for (sender, section) in &directory.encryption {
+                for (recipient, recipient_section) in &section.recipients {
+                    let pair = (*sender, *recipient);
+                    if let Some(first) = first_grants.get(&pair)
+                        && *first != &recipient_section.recipient_data
+                    {
+                        return Err(PithosError::ConflictingRecipientGrant);
+                    }
+                    first_grants
+                        .entry(pair)
+                        .or_insert(&recipient_section.recipient_data);
+                }
+            }
+        }
 
         let mut access = ResolvedAccess::new();
         let mut recovery_order = 0usize;
@@ -291,19 +378,18 @@ where
         }
 
         let mut segments: Vec<ValidatedSegment> = Vec::new();
-        let mut accessible_references = 0u64;
         for (segment_index, (directory, span)) in raw.into_iter().enumerate() {
             let mut directory = directory;
             resolve_block_lists(
                 &mut directory,
                 &mut access,
-                &mut accessible_references,
+                &mut remaining_block_references,
                 options.limits,
             )?;
             let parent = segment_index
                 .checked_sub(1)
                 .map(|index| segments[index].span);
-            segments.push(segment_from_wire(&directory, span, parent)?);
+            segments.push(validated_segment_from_directory(&directory, span, parent)?);
         }
         let index_limits = IndexLimits {
             max_entries: options.limits.max_entries,
@@ -313,10 +399,21 @@ where
             max_segments: options.limits.max_parent_directories.saturating_add(1),
         };
         let index = build_effective_index(&segments, archive_len, index_limits)?;
+        let content_availability = classify_content_availability(
+            &index,
+            options.external_resolver_supplied,
+            options.external_access_policy.is_some(),
+        )?;
+        for span in index.local_block_spans() {
+            let mut marker = [0; 4];
+            source.read_exact_at(span.start(), &mut marker)?;
+            crate::format::block::decode_block_marker(&mut marker.as_slice())?;
+        }
 
         Ok(Self {
             source,
             external: options.external,
+            external_access_policy: options.external_access_policy,
             archive_len,
             terminal_directory: Span::new(terminal_start, terminal_len)?,
             index,
@@ -325,13 +422,14 @@ where
             access,
             access_keys: options.keys,
             limits: options.limits,
+            content_availability,
         })
     }
 
     pub fn entries(&self) -> impl ExactSizeIterator<Item = ArchiveEntry> + '_ {
         self.index
             .entries()
-            .map(|entry| archive_entry(&self.index, entry))
+            .map(|entry| archive_entry(&self.index, entry, &self.content_availability))
     }
 
     /// Consumes the reader and transfers its validated state to append/grant planning.
@@ -360,11 +458,12 @@ where
         Ok(self
             .index
             .entry_at_path(&path)
-            .map(|entry| archive_entry(&self.index, entry)))
+            .map(|entry| archive_entry(&self.index, entry, &self.content_availability)))
     }
 
     pub fn copy_to<W: Write + ?Sized>(&self, path: &str, sink: &mut W) -> Result<(), PithosError> {
         let (id, _) = self.content_id(path)?;
+        self.require_content_available(id)?;
         self.copy_plan(id, self.index.full_file_plan(id)?, sink)
     }
 
@@ -376,6 +475,7 @@ where
     ) -> Result<(), PithosError> {
         let (id, size) = self.content_id(path)?;
         let range = ReadRange::new(range, size)?;
+        self.require_content_available(id)?;
         self.copy_plan(id, self.index.range_plan(id, range)?, sink)
     }
 
@@ -385,6 +485,8 @@ where
         operation: impl FnOnce(FileId, &PrivateKey, &FileKey) -> Result<T, CallbackError>,
     ) -> Result<T, ContentOperationError<CallbackError>> {
         let (id, _) = self.content_id(path).map_err(ContentOperationError::Core)?;
+        self.require_content_available(id)
+            .map_err(ContentOperationError::Core)?;
         let key = self
             .access
             .key(id)
@@ -409,6 +511,8 @@ where
         id: FileId,
         mut operation: impl FnMut(Zeroizing<Vec<u8>>) -> Result<(), CallbackError>,
     ) -> Result<(), ContentOperationError<CallbackError>> {
+        self.require_content_available(id)
+            .map_err(ContentOperationError::Core)?;
         let plan = self
             .index
             .full_file_plan(id)
@@ -432,6 +536,19 @@ where
             PithosError::InvalidBlockDataState("only data/metadata entries have content".into())
         })?;
         Ok((entry.id, content.size))
+    }
+
+    pub(crate) fn require_content_available(&self, id: FileId) -> Result<(), PithosError> {
+        match self.content_availability.get(&id).copied() {
+            Some(ContentAvailability::Available) => Ok(()),
+            Some(ContentAvailability::MissingAccess) => Err(PithosError::ContentUnavailable),
+            Some(ContentAvailability::Unsupported(feature)) => {
+                Err(PithosError::UnsupportedFeature(feature))
+            }
+            None => Err(PithosError::InvalidBlockDataState(
+                "only data/metadata entries have content".into(),
+            )),
+        }
     }
 
     fn copy_plan<W: Write + ?Sized>(
@@ -470,10 +587,16 @@ where
             BlockLocation::Local(span) => {
                 let mut marker = [0; 4];
                 self.source.read_exact_at(span.start(), &mut marker)?;
-                crate::format::codec::decode_block_marker(&mut marker.as_slice())?;
+                crate::format::block::decode_block_marker(&mut marker.as_slice())?;
+                let payload_start =
+                    span.start()
+                        .checked_add(4)
+                        .ok_or(PithosError::InvalidDirectoryRange {
+                            operation: "read block payload",
+                        })?;
                 read_source(
                     &self.source,
-                    span.start() + 4,
+                    payload_start,
                     planned.descriptor.stored_size,
                     "block",
                 )?
@@ -488,6 +611,9 @@ where
                             PithosError::ExternalBlockFraming("response size overflow".into())
                         })?;
                 let response = self.external.resolve(
+                    self.external_access_policy.as_deref().ok_or(
+                        PithosError::UnsupportedFeature(ArchiveFeature::ExternalStorage),
+                    )?,
                     location,
                     expected_len,
                     self.limits
@@ -503,7 +629,7 @@ where
                     ));
                 }
                 let (mut marker, stored) = response.split_at(4);
-                crate::format::codec::decode_block_marker(&mut marker)?;
+                crate::format::block::decode_block_marker(&mut marker)?;
                 stored.to_vec()
             }
         };
@@ -511,10 +637,8 @@ where
             offset: 0,
             stored_size: planned.descriptor.stored_size,
             original_size: planned.descriptor.original_size,
-            flags: crate::format::wire::ProcessingFlags::from_byte(
-                planned.descriptor.processing.to_byte(),
-            ),
-            location: crate::format::wire::BlockLocation::Local,
+            flags: ProcessingFlags::from_byte(planned.descriptor.processing.to_byte()),
+            location: FormatBlockLocation::Local,
         };
         let key = self
             .access
@@ -533,15 +657,25 @@ where
     }
 }
 
-fn entry_kind(entry: &Entry) -> EntryKind {
+fn entry_kind(
+    entry: &Entry,
+    id: FileId,
+    content_availability: &BTreeMap<FileId, ContentAvailability>,
+) -> EntryKind {
     match entry {
         Entry::File(content) => EntryKind::File {
             size: content.size,
-            available: matches!(content.content, ContentState::Available(_)),
+            available: matches!(
+                content_availability.get(&id),
+                Some(ContentAvailability::Available)
+            ),
         },
         Entry::Metadata(content) => EntryKind::Metadata {
             size: content.size,
-            available: matches!(content.content, ContentState::Available(_)),
+            available: matches!(
+                content_availability.get(&id),
+                Some(ContentAvailability::Available)
+            ),
         },
         Entry::Directory(_) => EntryKind::Directory,
         Entry::Symlink { target, .. } => EntryKind::Symlink {
@@ -550,12 +684,16 @@ fn entry_kind(entry: &Entry) -> EntryKind {
     }
 }
 
-fn archive_entry(index: &ArchiveIndex, entry: &super::index::IndexedEntry) -> ArchiveEntry {
+fn archive_entry(
+    index: &ArchiveIndex,
+    entry: &super::index::IndexedEntry,
+    content_availability: &BTreeMap<FileId, ContentAvailability>,
+) -> ArchiveEntry {
     let metadata = entry.entry.metadata();
     ArchiveEntry {
         id: entry.id.0,
         path: entry.path.as_str().to_owned(),
-        kind: entry_kind(&entry.entry),
+        kind: entry_kind(&entry.entry, entry.id, content_availability),
         created: metadata.created,
         modified: metadata.modified,
         permissions: metadata.permissions,
@@ -573,11 +711,47 @@ fn archive_entry(index: &ArchiveIndex, entry: &super::index::IndexedEntry) -> Ar
     }
 }
 
+fn classify_content_availability(
+    index: &ArchiveIndex,
+    external_resolver_supplied: bool,
+    external_access_policy_supplied: bool,
+) -> Result<BTreeMap<FileId, ContentAvailability>, PithosError> {
+    let external_supported = external_resolver_supplied && external_access_policy_supplied;
+    let mut availability = BTreeMap::new();
+    for entry in index.entries() {
+        let Some(content) = entry.entry.content() else {
+            continue;
+        };
+        let state = match &content.content {
+            ContentState::Unavailable => ContentAvailability::MissingAccess,
+            ContentState::Available(references) => {
+                let has_external_block = references.iter().any(|hash| {
+                    matches!(
+                        index.descriptor(hash),
+                        Some(crate::archive::types::BlockDescriptor {
+                            location: BlockLocation::External(_),
+                            ..
+                        })
+                    )
+                });
+                if has_external_block && !external_supported {
+                    ContentAvailability::Unsupported(ArchiveFeature::ExternalStorage)
+                } else {
+                    ContentAvailability::Available
+                }
+            }
+        };
+        availability.insert(entry.id, state);
+    }
+    Ok(availability)
+}
+
 fn deserialization_limits(limits: OpenLimits) -> DeserializationLimits {
     DeserializationLimits {
         max_collection_entries: limits.max_entries,
         max_file_entries: limits.max_entries,
         max_block_descriptors: limits.max_descriptors,
+        max_block_references: limits.max_accessible_block_references,
         max_references: limits.max_references,
         max_relationships: limits.max_relationships,
         max_opaque_bytes: limits.max_opaque_metadata_bytes,
@@ -594,6 +768,9 @@ fn remaining_deserialization_limits(
     remaining.max_block_descriptors = remaining
         .max_block_descriptors
         .saturating_sub(decoded.descriptors);
+    remaining.max_block_references = remaining
+        .max_block_references
+        .saturating_sub(decoded.direct_references);
     remaining.max_references = remaining.max_references.saturating_sub(decoded.references);
     remaining.max_relationships = remaining
         .max_relationships
@@ -673,31 +850,30 @@ fn resolve_recipients(
         let secret = key.as_dalek_static_secret();
         let recipient = DalekPublicKey::from(&secret).to_bytes();
         for (sender_section, (sender, section)) in directory.encryption.iter().enumerate() {
-            let candidates: Vec<(&[u8; 32], &crate::format::wire::RecipientData)> =
-                if sender == &recipient {
-                    section
-                        .recipients
-                        .iter()
-                        .map(|(recipient, section)| (recipient, &section.recipient_data))
-                        .collect()
-                } else {
-                    section
-                        .recipients
-                        .get(&recipient)
-                        .map(|section| vec![(sender, &section.recipient_data)])
-                        .unwrap_or_default()
-                };
+            let candidates: Vec<(&[u8; 32], &RecipientData)> = if sender == &recipient {
+                section
+                    .recipients
+                    .iter()
+                    .map(|(recipient, section)| (recipient, &section.recipient_data))
+                    .collect()
+            } else {
+                section
+                    .recipients
+                    .get(&recipient)
+                    .map(|section| vec![(sender, &section.recipient_data)])
+                    .unwrap_or_default()
+            };
             for (recipient_section, (peer, data)) in candidates.into_iter().enumerate() {
                 let shared = crypto::derive_shared(secret.as_bytes(), peer)?;
                 let entries = match data {
-                    crate::format::wire::RecipientData::Encrypted(bytes) => {
+                    RecipientData::Encrypted(bytes) => {
                         let plaintext = crypto::unwrap_recipient_list(&shared, bytes)?;
-                        crate::format::codec::decode_decrypted_recipient_list(
+                        crate::format::encryption::decode_decrypted_recipient_list(
                             &plaintext,
                             &decoded_limits,
                         )?
                     }
-                    crate::format::wire::RecipientData::Decrypted(entries) => entries.clone(),
+                    RecipientData::Decrypted(entries) => entries.clone(),
                 };
                 for (file_id, file_key) in entries.iter() {
                     access.insert(
@@ -722,42 +898,38 @@ fn resolve_recipients(
 fn resolve_block_lists(
     directory: &mut Directory,
     access: &mut ResolvedAccess,
-    reference_count: &mut u64,
+    remaining_block_references: &mut u64,
     limits: OpenLimits,
 ) -> Result<(), PithosError> {
     directory.files.try_for_each_mut(|id, file| {
-        let Some(file_key) = access.key(FileId(id)) else {
-            return Ok(());
-        };
-        let BlockDataState::Encrypted(bytes) = &file.block_data else {
-            return Ok(());
-        };
-        let mut decoded_limits = deserialization_limits(limits);
-        decoded_limits.max_collection_entries = limits
-            .max_accessible_block_references
-            .saturating_sub(*reference_count);
-        let plaintext = crypto::open_file_block_list(file_key, bytes)?;
-        let entries =
-            crate::format::codec::decode_decrypted_block_list(&plaintext, &decoded_limits)?;
-        *reference_count = reference_count.checked_add(entries.len() as u64).ok_or(
-            PithosError::LimitExceeded {
-                field: "accessible block references",
-                limit: limits.max_accessible_block_references,
-                actual: u64::MAX,
-            },
-        )?;
-        if *reference_count > limits.max_accessible_block_references {
-            return Err(PithosError::LimitExceeded {
-                field: "accessible block references",
-                limit: limits.max_accessible_block_references,
-                actual: *reference_count,
-            });
+        let file_id = FileId(id);
+        match &file.block_data {
+            BlockDataState::Decrypted(entries) => {
+                record_block_keys(access, file_id, entries);
+            }
+            BlockDataState::Encrypted(bytes) => {
+                let Some(file_key) = access.key(file_id) else {
+                    return Ok(());
+                };
+                let mut decoded_limits = deserialization_limits(limits);
+                decoded_limits.max_block_references = *remaining_block_references;
+                let plaintext = crypto::open_file_block_list(file_key, bytes)?;
+                let entries = crate::format::file_entry::decode_decrypted_block_list_with_budget(
+                    &plaintext,
+                    &decoded_limits,
+                    remaining_block_references,
+                )?;
+                record_block_keys(access, file_id, &entries);
+                file.block_data = BlockDataState::Decrypted(entries);
+            }
         }
-        access.insert_block_keys(
-            FileId(id),
-            entries.iter().map(|(hash, key)| (BlockHash(*hash), key)),
-        );
-        file.block_data = BlockDataState::Decrypted(entries);
         Ok(())
     })
+}
+
+fn record_block_keys(access: &mut ResolvedAccess, file_id: FileId, entries: &[BlockDataEntry]) {
+    access.insert_block_keys(
+        file_id,
+        entries.iter().map(|(hash, key)| (BlockHash(*hash), key)),
+    );
 }

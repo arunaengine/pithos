@@ -2,7 +2,7 @@
 
 use crate::crypto::{self, BlockKey};
 use crate::error::PithosError;
-use crate::format::wire::{BlockIndexEntry, ProcessingFlags};
+use crate::format::block::{BlockIndexEntry, ProcessingFlags};
 use std::fmt;
 use zeroize::Zeroizing;
 use zstd::bulk;
@@ -153,7 +153,7 @@ fn decompress(input: &[u8], expected_size: u64) -> Result<Vec<u8>, PithosError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::wire::BlockLocation;
+    use crate::format::block::BlockLocation;
 
     fn descriptor(encoded: &EncodedBlock, original_size: usize) -> BlockIndexEntry {
         BlockIndexEntry {

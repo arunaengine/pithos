@@ -1,3 +1,4 @@
+use crate::archive::ArchiveFeature;
 use crate::crypto::CryptoError;
 use crate::source::SourceError;
 use std::io;
@@ -8,6 +9,7 @@ pub use crate::format::limits::DeserializationError;
 
 /// Custom top-level error type for all of Pithos
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum PithosError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -51,8 +53,16 @@ pub enum PithosError {
     },
     #[error("Invalid block data state: {0}")]
     InvalidBlockDataState(String),
+    #[error("invalid block descriptor: {0}")]
+    InvalidBlockDescriptor(&'static str),
+    #[error("invalid entry combination for {path}: {reason}")]
+    InvalidEntryCombination { path: String, reason: String },
     #[error("content is unavailable with the supplied access keys")]
     ContentUnavailable,
+    #[error("archive uses unsupported feature: {0:?}")]
+    UnsupportedFeature(ArchiveFeature),
+    #[error("external block access denied by policy")]
+    ExternalBlockAccessDenied,
     #[error("append snapshot does not contain file id {0}")]
     SnapshotFileIdNotFound(u64),
     #[error("content for snapshot file id {0} is unavailable with the supplied access keys")]
@@ -61,8 +71,6 @@ pub enum PithosError {
     SnapshotDirectoryHasNoContent(u64),
     #[error("snapshot file id {0} is a symlink and has no content key")]
     SnapshotSymlinkHasNoContent(u64),
-    #[error("external block source required")]
-    ExternalBlockSourceRequired,
     #[error("external block framing error: {0}")]
     ExternalBlockFraming(String),
     #[error("Block hash not found: {0:?}")]
@@ -81,6 +89,10 @@ pub enum PithosError {
     ReservedProcessingBits(u8),
     #[error("conflicting relationship definition for id {0}")]
     ConflictingRelationshipDefinition(u64),
+    #[error("invalid relationship definition for id {id}: {reason}")]
+    InvalidRelationshipDefinition { id: u64, reason: String },
+    #[error("invalid permissions: {0:#o}")]
+    InvalidPermissions(u32),
     #[error("unknown relationship id {0}")]
     UnknownRelationshipId(u64),
     #[error("missing reference target file id {0}")]
@@ -93,6 +105,8 @@ pub enum PithosError {
     AccessibleFileSizeMismatch { expected: u64, actual: u64 },
     #[error("conflicting recovered file key")]
     ConflictingRecoveredFileKey,
+    #[error("conflicting recipient grant")]
+    ConflictingRecipientGrant,
     #[error("invalid half-open read range {start}..{end} for file size {file_size}")]
     InvalidReadRange {
         start: u64,
@@ -140,6 +154,8 @@ pub enum PithosError {
     InvalidRecipientDataState(String),
     #[error("archive creation requires at least one recipient")]
     WriterRequiresRecipient,
+    #[error("base writer requires local, uncompressed, unencrypted processing")]
+    BaseWriterRequiresPlainProcessing,
     #[error("granting reader access requires at least one file or metadata id")]
     GrantRequiresFileId,
     #[error("invalid CDC configuration {min_size},{avg_size},{max_size}")]

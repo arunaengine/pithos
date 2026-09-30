@@ -41,6 +41,7 @@ pub struct DeserializationLimits {
     pub max_collection_entries: u64,
     pub max_file_entries: u64,
     pub max_block_descriptors: u64,
+    pub max_block_references: u64,
     pub max_references: u64,
     pub max_relationships: u64,
 }
@@ -53,6 +54,7 @@ impl Default for DeserializationLimits {
             max_collection_entries: 1_000_000,
             max_file_entries: 1_000_000,
             max_block_descriptors: 1_000_000,
+            max_block_references: 1_000_000,
             max_references: 1_000_000,
             max_relationships: 1_000_000,
         }

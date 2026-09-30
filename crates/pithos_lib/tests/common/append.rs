@@ -125,6 +125,14 @@ pub fn archive_with_entry(temporary: &tempfile::TempDir, path: &str) -> PathBuf 
         WriteOptions::new(sender, vec![public_key("sender"), public_key("recipient1")]),
     )
     .unwrap();
+    for (index, _) in path.match_indices('/') {
+        writer
+            .add_directory(
+                ArchivePath::new(&path[..index]).unwrap(),
+                EntryMetadata::new(0, 0, 0o755),
+            )
+            .unwrap();
+    }
     writer
         .add_file(
             ArchivePath::new(path).unwrap(),

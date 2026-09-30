@@ -1,7 +1,7 @@
 //! Validated, immutable archive state.
 //!
 //! This module deliberately has no filesystem, adapter, or writer-input
-//! dependency. `Archive` is the public reader boundary; wire records and
+//! dependency. `Archive` is the public reader boundary; internal format types and
 //! recovered access material remain crate-private.
 
 mod access;
@@ -21,17 +21,30 @@ pub(crate) use access::{AccessProvenance, ResolvedAccess};
 pub use append::{AppendDurability, AppendObservation, AppendOptions};
 pub(crate) use index::build_effective_index;
 pub(crate) use path_validation::{
-    validate_new_candidate, validate_symlink_target, validate_wire_map,
+    validate_directory_entries, validate_new_candidate, validate_symlink_target,
 };
 pub(crate) use reader::ContentOperationError;
 pub use reader::{
-    AccessKeys, Archive, ArchiveEntry, ArchiveReference, EntryKind, ExternalBlockResolver,
-    NoExternalBlocks, OpenLimits, OpenOptions,
+    AccessKeys, Archive, ArchiveEntry, ArchiveFeature, ArchiveReference, EntryKind,
+    ExternalBlockAccessPolicy, ExternalBlockResolver, NoExternalBlocks, OpenLimits, OpenOptions,
 };
 pub(crate) use snapshot::AppendSnapshot;
 pub use types::{ArchivePath, ExternalLocation};
 pub(crate) use types::{FileId, Span};
-pub(crate) use validation::segment_from_wire;
+pub(crate) use validation::validated_segment_from_directory;
+
+pub(crate) fn decode_validated_directory(
+    bytes: &[u8],
+    limits: &crate::format::limits::DeserializationLimits,
+    remaining_block_references: &mut u64,
+) -> Result<crate::format::directory::Directory, crate::error::PithosError> {
+    crate::format::directory::decode_complete_directory_with_validation_and_budget(
+        bytes,
+        limits,
+        remaining_block_references,
+        |directory| validate_directory_entries(&directory.files),
+    )
+}
 pub use writer::{
     ArchiveWriter, CdcConfig, CreateError, EntryMetadata, EntryReference, FinishError,
     IncompleteWriter, ProcessingOptions, WriteOptions, WriterError, WrittenEntry,
@@ -64,18 +77,36 @@ mod tests {
         }
     }
 
+    fn local_descriptor(span: Span) -> BlockDescriptor {
+        BlockDescriptor {
+            stored_size: span.len().saturating_sub(4),
+            original_size: 1,
+            processing: Processing::from_byte(0).unwrap(),
+            location: BlockLocation::Local(span),
+        }
+    }
+
     fn segment(entries: Vec<SegmentEntry>) -> ValidatedSegment {
+        segment_at(100, None, entries)
+    }
+
+    fn segment_at(
+        start: u64,
+        parent: Option<Span>,
+        entries: Vec<SegmentEntry>,
+    ) -> ValidatedSegment {
         ValidatedSegment {
-            span: Span::new(100, 10).unwrap(),
-            parent: None,
+            span: Span::new(start, 10).unwrap(),
+            parent,
             entries,
             descriptors: Vec::new(),
             relationships: Vec::new(),
+            recipient_pairs: Vec::new(),
         }
     }
 
     #[test]
-    fn index_preserves_wire_order_and_component_hierarchy() {
+    fn index_preserves_segment_entry_order_and_component_hierarchy() {
         let entries = vec![
             SegmentEntry {
                 id: FileId(7),
@@ -128,6 +159,7 @@ mod tests {
             entries: Vec::new(),
             descriptors: vec![(hash, descriptor(4))],
             relationships: Vec::new(),
+            recipient_pairs: Vec::new(),
         };
         let mut newer_descriptor = descriptor(4);
         newer_descriptor.stored_size = 99;
@@ -137,6 +169,7 @@ mod tests {
             entries: Vec::new(),
             descriptors: vec![(hash, newer_descriptor)],
             relationships: Vec::new(),
+            recipient_pairs: Vec::new(),
         };
         let older_before = older.clone();
         let newer_before = newer.clone();
@@ -166,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn non_winning_compatible_descriptors_still_validate_every_local_range() {
+    fn non_winning_compatible_descriptors_do_not_impose_extent_checks() {
         let hash = BlockHash([9; 32]);
         let older = ValidatedSegment {
             span: Span::new(10, 5).unwrap(),
@@ -174,6 +207,7 @@ mod tests {
             entries: Vec::new(),
             descriptors: vec![(hash, descriptor(4))],
             relationships: Vec::new(),
+            recipient_pairs: Vec::new(),
         };
         for invalid_span in [Span::new(995, 10).unwrap(), Span::new(20, 5).unwrap()] {
             let mut later = descriptor(4);
@@ -184,13 +218,127 @@ mod tests {
                 entries: Vec::new(),
                 descriptors: vec![(hash, later)],
                 relationships: Vec::new(),
+                recipient_pairs: Vec::new(),
             };
 
-            assert!(matches!(
-                build_effective_index(&[older.clone(), newer], 1_000, IndexLimits::default()),
-                Err(crate::error::PithosError::InvalidDirectoryRange { .. })
-            ));
+            let index =
+                build_effective_index(&[older.clone(), newer], 1_000, IndexLimits::default())
+                    .unwrap();
+            assert_eq!(index.descriptor(hash), Some(&older.descriptors[0].1));
         }
+    }
+
+    #[test]
+    fn local_descriptors_must_stay_in_their_declaring_segment_region() {
+        let cases = [
+            (
+                "base descriptor begins before the header ends",
+                vec![ValidatedSegment {
+                    span: Span::new(20, 10).unwrap(),
+                    parent: None,
+                    entries: Vec::new(),
+                    descriptors: vec![(
+                        BlockHash([1; 32]),
+                        local_descriptor(Span::new(5, 4).unwrap()),
+                    )],
+                    relationships: Vec::new(),
+                    recipient_pairs: Vec::new(),
+                }],
+            ),
+            (
+                "base descriptor extends into its directory",
+                vec![ValidatedSegment {
+                    span: Span::new(20, 10).unwrap(),
+                    parent: None,
+                    entries: Vec::new(),
+                    descriptors: vec![(
+                        BlockHash([1; 32]),
+                        local_descriptor(Span::new(10, 11).unwrap()),
+                    )],
+                    relationships: Vec::new(),
+                    recipient_pairs: Vec::new(),
+                }],
+            ),
+            (
+                "appended descriptor points into the base block region",
+                vec![
+                    segment_at(20, None, Vec::new()),
+                    ValidatedSegment {
+                        span: Span::new(60, 10).unwrap(),
+                        parent: Some(Span::new(20, 10).unwrap()),
+                        entries: Vec::new(),
+                        descriptors: vec![(
+                            BlockHash([1; 32]),
+                            local_descriptor(Span::new(10, 4).unwrap()),
+                        )],
+                        relationships: Vec::new(),
+                        recipient_pairs: Vec::new(),
+                    },
+                ],
+            ),
+            (
+                "appended descriptor extends into its own directory",
+                vec![
+                    segment_at(20, None, Vec::new()),
+                    ValidatedSegment {
+                        span: Span::new(60, 10).unwrap(),
+                        parent: Some(Span::new(20, 10).unwrap()),
+                        entries: Vec::new(),
+                        descriptors: vec![(
+                            BlockHash([1; 32]),
+                            local_descriptor(Span::new(50, 11).unwrap()),
+                        )],
+                        relationships: Vec::new(),
+                        recipient_pairs: Vec::new(),
+                    },
+                ],
+            ),
+        ];
+
+        for (case, segments) in cases {
+            assert!(
+                build_effective_index(&segments, 100, IndexLimits::default()).is_err(),
+                "accepted {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_effective_local_descriptors_are_rejected() {
+        let mut value = segment_at(30, None, Vec::new());
+        value.descriptors = vec![
+            (
+                BlockHash([1; 32]),
+                local_descriptor(Span::new(6, 10).unwrap()),
+            ),
+            (
+                BlockHash([2; 32]),
+                local_descriptor(Span::new(12, 10).unwrap()),
+            ),
+        ];
+
+        assert!(build_effective_index(&[value], 40, IndexLimits::default()).is_err());
+    }
+
+    #[test]
+    fn adjacent_effective_local_descriptors_are_valid() {
+        let first = Span::new(6, 10).unwrap();
+        let second = Span::new(16, 14).unwrap();
+        let mut value = segment_at(30, None, Vec::new());
+        value.descriptors = vec![
+            (BlockHash([1; 32]), local_descriptor(first)),
+            (BlockHash([2; 32]), local_descriptor(second)),
+        ];
+
+        let index = build_effective_index(&[value], 40, IndexLimits::default()).unwrap();
+        assert_eq!(
+            index.descriptor(BlockHash([1; 32])).unwrap().location,
+            BlockLocation::Local(first)
+        );
+        assert_eq!(
+            index.descriptor(BlockHash([2; 32])).unwrap().location,
+            BlockLocation::Local(second)
+        );
     }
 
     #[test]
@@ -338,6 +486,58 @@ mod tests {
             },
         ];
         assert!(build_effective_index(&[segment(adjacent)], 1_000, IndexLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn hierarchy_requires_earlier_directory_ancestors_across_segments() {
+        let directory = |id, path: &str| SegmentEntry {
+            id: FileId(id),
+            path: ArchivePath::new(path).unwrap(),
+            entry: Entry::Directory(metadata()),
+        };
+        let file = |id, path: &str| SegmentEntry {
+            id: FileId(id),
+            path: ArchivePath::new(path).unwrap(),
+            entry: Entry::File(ContentEntry {
+                metadata: metadata(),
+                size: 0,
+                content: ContentState::Available(BlockReferences::new(Vec::new())),
+            }),
+        };
+
+        for entries in [
+            vec![file(1, "parent/child")],
+            vec![file(1, "top/middle/child")],
+            vec![file(1, "parent"), file(2, "parent/child")],
+            vec![directory(2, "parent/child"), directory(1, "parent")],
+        ] {
+            assert!(
+                build_effective_index(&[segment(entries)], 1_000, IndexLimits::default()).is_err()
+            );
+        }
+
+        assert!(
+            build_effective_index(
+                &[segment(vec![
+                    directory(1, "parent"),
+                    file(2, "parent/child"),
+                ])],
+                1_000,
+                IndexLimits::default(),
+            )
+            .is_ok()
+        );
+
+        let base = segment_at(100, None, vec![directory(1, "parent")]);
+        let child = segment_at(200, Some(base.span), vec![file(2, "parent/child")]);
+        assert!(build_effective_index(&[base, child], 1_000, IndexLimits::default()).is_ok());
+
+        let early_child = segment_at(100, None, vec![file(2, "parent/child")]);
+        let late_parent = segment_at(200, Some(early_child.span), vec![directory(1, "parent")]);
+        assert!(
+            build_effective_index(&[early_child, late_parent], 1_000, IndexLimits::default(),)
+                .is_err()
+        );
     }
 
     proptest! {

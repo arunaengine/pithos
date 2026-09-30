@@ -6,13 +6,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pithos_lib::adapters::crypt4gh;
 use pithos_lib::adapters::crypt4gh::Crypt4GHError;
 use pithos_lib::archive::{
-    AccessKeys, AppendDurability, AppendOptions, Archive, ArchiveWriter, CdcConfig, EntryKind,
-    OpenOptions, ProcessingOptions, WriteOptions, WriterError,
+    AccessKeys, AppendDurability, AppendOptions, Archive, ArchiveWriter, CdcConfig, OpenOptions,
+    ProcessingOptions, WriteOptions, WriterError,
 };
 use pithos_lib::crypto::{PrivateKey, PublicKey, generate_private_key};
 use pithos_lib::error::PithosError;
 use pithos_lib::fs::ingest::build_input_manifest;
-use pithos_lib::fs::{FsError, append_files, extract, grant_readers};
+use pithos_lib::fs::{FsError, append_files, extract_all, grant_readers};
 use pithos_lib::source::FileSource;
 use rustix::fs::{AtFlags, Mode, OFlags, fchmod, linkat, open, openat, unlinkat};
 use std::ffi::OsString;
@@ -113,6 +113,9 @@ enum PithosCommands {
         /// Set values for content-defined chunking
         #[arg(long="cdc", value_parser=parse_cdc_input, value_name = "MIN,AVG,MAX")]
         cdc: Option<CdcConfig>,
+        /// Create a local, uncompressed, unencrypted base archive
+        #[arg(long, conflicts_with_all = ["secret_key", "public_keys"])]
+        plain: bool,
         /// Input files
         #[arg(value_name = "FILES")]
         files: Vec<PathBuf>,
@@ -301,29 +304,25 @@ fn run() -> Result<(), PithosCliError> {
                 let path_str = path.to_str().ok_or_else(|| {
                     PithosCliError::InvalidArgumentError("archive path is not valid UTF-8".into())
                 })?;
-                let archive = open_archive(&file, required_private_key(&cli.secret_key)?)?;
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
                 match archive.entry(path_str)? {
                     Some(entry) => write_stdout(format_args!("{entry:#?}"))?,
                     None => Err(PithosError::FileNotFound(path_str.to_string()))?,
                 }
             }
             ReadCommands::List { file } => {
-                let archive = open_archive(&file, required_private_key(&cli.secret_key)?)?;
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
                 for entry in archive.entries() {
                     write_stdout(format_args!("{} {:?} {}", entry.id, entry.kind, entry.path))?;
                 }
             }
             ReadCommands::All { file } => {
-                let archive = open_archive(&file, required_private_key(&cli.secret_key)?)?;
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
                 let output = cli
                     .output
                     .as_deref()
                     .unwrap_or_else(|| std::path::Path::new("."));
-                let mut entries = archive.entries().collect::<Vec<_>>();
-                entries.sort_by_key(|entry| !matches!(entry.kind, EntryKind::Directory));
-                for entry in entries {
-                    extract(&archive, &entry.path, output)?;
-                }
+                extract_all(&archive, output)?;
             }
             ReadCommands::Data {
                 file,
@@ -340,7 +339,7 @@ fn run() -> Result<(), PithosCliError> {
                         "a file output accepts exactly one archive path".into(),
                     ));
                 }
-                let archive = open_archive(&file, required_private_key(&cli.secret_key)?)?;
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
                 if let Some(output_path) = cli.output.as_ref() {
                     if let Some(path) = paths.first() {
                         let path = path.to_str().ok_or_else(|| {
@@ -396,32 +395,46 @@ fn run() -> Result<(), PithosCliError> {
                 }
             }
             ReadCommands::Directory { file } => {
-                let archive = open_archive(&file, required_private_key(&cli.secret_key)?)?;
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
                 for entry in archive.entries() {
                     write_stdout(format_args!("{entry:#?}"))?;
                 }
             }
         },
-        PithosCommands::Create { cdc, files } => {
+        PithosCommands::Create { cdc, plain, files } => {
+            if plain && (cli.secret_key.is_some() || cli.public_keys.is_some()) {
+                return Err(PithosCliError::InvalidArgumentError(
+                    "--plain conflicts with --secret-key and --public-keys".into(),
+                ));
+            }
             if files.is_empty() {
                 return Err(PithosCliError::InvalidArgumentError(
                     "No files provided".to_string(),
                 ));
             }
 
-            let sender_key = required_private_key(&cli.secret_key)?;
-            let reader_keys: Result<Vec<PublicKey>, PithosCliError> = cli
-                .public_keys
-                .ok_or_else(|| {
-                    PithosCliError::InvalidArgumentError(
-                        "at least one recipient key is required".into(),
-                    )
-                })?
-                .iter()
-                .map(|path| load_public_key_from_pem(path))
-                .collect();
-            let options =
-                WriteOptions::new(sender_key, reader_keys?).with_cdc(cdc.unwrap_or_default());
+            let (options, processing) = if plain {
+                (
+                    WriteOptions::base().with_cdc(cdc.unwrap_or_default()),
+                    ProcessingOptions::new(false, 0).expect("zero compression is valid"),
+                )
+            } else {
+                let sender_key = required_private_key(&cli.secret_key)?;
+                let reader_keys: Result<Vec<PublicKey>, PithosCliError> = cli
+                    .public_keys
+                    .ok_or_else(|| {
+                        PithosCliError::InvalidArgumentError(
+                            "at least one recipient key is required".into(),
+                        )
+                    })?
+                    .iter()
+                    .map(|path| load_public_key_from_pem(path))
+                    .collect();
+                (
+                    WriteOptions::new(sender_key, reader_keys?).with_cdc(cdc.unwrap_or_default()),
+                    ProcessingOptions::default(),
+                )
+            };
             options.validate()?;
             let manifest = build_input_manifest(&files)?;
 
@@ -453,7 +466,7 @@ fn run() -> Result<(), PithosCliError> {
                 discard_incomplete_writer(writer);
                 return Err(error.into());
             }
-            if let Err(error) = manifest.ingest(&mut writer, ProcessingOptions::default()) {
+            if let Err(error) = manifest.ingest(&mut writer, processing) {
                 discard_incomplete_writer(writer);
                 return Err(error.into());
             }
@@ -552,7 +565,7 @@ fn run() -> Result<(), PithosCliError> {
                 .map(|path| load_public_key_from_pem(path))
                 .collect();
 
-            let archive = open_archive(&file, sender_key)?;
+            let archive = open_archive(&file, Some(sender_key))?;
 
             if let Some(destination) = cli.output {
                 let mut output = StagedOutput::create(
@@ -590,6 +603,12 @@ fn required_private_key(path: &Option<PathBuf>) -> Result<PrivateKey, PithosCliE
         .as_ref()
         .ok_or_else(|| PithosCliError::InvalidArgumentError("private key is required".into()))?;
     load_private_key_from_pem(path)
+}
+
+fn optional_private_key(path: &Option<PathBuf>) -> Result<Option<PrivateKey>, PithosCliError> {
+    path.as_ref()
+        .map(|path| load_private_key_from_pem(path))
+        .transpose()
 }
 
 fn validate_keypair_prefix(prefix: Option<String>) -> Result<String, PithosCliError> {
@@ -944,11 +963,12 @@ fn fail_after_create_for_test() -> Result<(), PithosError> {
 
 fn open_archive(
     path: &std::path::Path,
-    key: PrivateKey,
+    key: Option<PrivateKey>,
 ) -> Result<Archive<FileSource>, PithosError> {
+    let access_keys = key.map_or_else(AccessKeys::new, |key| AccessKeys::new().with_key(key));
     Archive::open(
         FileSource::open(path)?,
-        OpenOptions::default().with_access_keys(AccessKeys::new().with_key(key)),
+        OpenOptions::default().with_access_keys(access_keys),
     )
 }
 

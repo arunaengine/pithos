@@ -1,6 +1,8 @@
+use crate::archive::{AppendSnapshot, ArchivePath};
 use crate::error::PithosError;
-use crate::format::entries::WireEntries;
-use crate::format::wire::{BlockDataState, FileEntry, FileType};
+use crate::format::directory::DirectoryEntries;
+use crate::format::file_entry::{BlockDataState, FileEntry, FileType, VALID_PERMISSION_BITS};
+use std::collections::HashMap;
 
 fn invalid_path(path: &str, reason: impl Into<String>) -> PithosError {
     PithosError::InvalidArchivePath {
@@ -90,51 +92,101 @@ pub(crate) fn validate_symlink_target(path: &str, target: &str) -> Result<(), Pi
 
 pub(crate) fn validate_entry(path: &str, entry: &FileEntry) -> Result<(), PithosError> {
     validate_entry_path(path)?;
-    match (&entry.file_type, &entry.symlink_target, &entry.block_data) {
-        (FileType::Symlink, Some(target), BlockDataState::Decrypted(blocks))
-            if blocks.is_empty() =>
-        {
-            validate_symlink_target(path, target)
-        }
-        (FileType::Symlink, None, _) => Err(PithosError::InvalidSymlinkEntry {
-            path: path.into(),
-            reason: "missing target".into(),
-        }),
-        (FileType::Symlink, Some(_), BlockDataState::Decrypted(blocks)) if !blocks.is_empty() => {
-            Err(PithosError::InvalidSymlinkEntry {
-                path: path.into(),
-                reason: "symlink has block references".into(),
-            })
-        }
-        (FileType::Symlink, Some(_), BlockDataState::Encrypted(_)) => {
-            Err(PithosError::InvalidSymlinkEntry {
-                path: path.into(),
-                reason: "encrypted symlink block data".into(),
-            })
-        }
-        (_, Some(_), _) => Err(PithosError::InvalidSymlinkEntry {
-            path: path.into(),
-            reason: "non-symlink has a target".into(),
-        }),
-        _ => Ok(()),
+    if entry.permissions & !VALID_PERMISSION_BITS != 0 {
+        return Err(PithosError::InvalidPermissions(entry.permissions));
     }
+    match entry.file_type {
+        FileType::Data | FileType::Metadata => {
+            if entry.symlink_target.is_some() {
+                return Err(PithosError::InvalidSymlinkEntry {
+                    path: path.into(),
+                    reason: "non-symlink has a target".into(),
+                });
+            }
+        }
+        FileType::Directory => {
+            if entry.file_size != 0 {
+                return Err(PithosError::InvalidEntryCombination {
+                    path: path.into(),
+                    reason: "directory has nonzero file size".into(),
+                });
+            }
+            if entry.symlink_target.is_some() {
+                return Err(PithosError::InvalidSymlinkEntry {
+                    path: path.into(),
+                    reason: "non-symlink has a target".into(),
+                });
+            }
+            if !matches!(&entry.block_data, BlockDataState::Decrypted(blocks) if blocks.is_empty())
+            {
+                return Err(PithosError::InvalidBlockDataState(
+                    "directory has block material".into(),
+                ));
+            }
+        }
+        FileType::Symlink => {
+            if entry.file_size != 0 {
+                return Err(PithosError::InvalidEntryCombination {
+                    path: path.into(),
+                    reason: "symlink has nonzero file size".into(),
+                });
+            }
+            let target = entry.symlink_target.as_deref().ok_or_else(|| {
+                PithosError::InvalidSymlinkEntry {
+                    path: path.into(),
+                    reason: "missing target".into(),
+                }
+            })?;
+            if !matches!(&entry.block_data, BlockDataState::Decrypted(blocks) if blocks.is_empty())
+            {
+                return Err(PithosError::InvalidSymlinkEntry {
+                    path: path.into(),
+                    reason: "symlink has block material".into(),
+                });
+            }
+            validate_symlink_target(path, target)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_candidate_hierarchy(
-    map: &WireEntries,
+    map: &DirectoryEntries,
+    snapshot: Option<&AppendSnapshot>,
     path: &str,
     entry: &FileEntry,
 ) -> Result<(), PithosError> {
     for (index, _) in path.match_indices('/') {
         let ancestor = &path[..index];
-        if map
-            .get_by_path(ancestor)
-            .is_some_and(|existing| existing.file_type != FileType::Directory)
-        {
-            return Err(PithosError::InvalidArchivePath {
-                path: path.into(),
-                reason: format!("file entry {ancestor} is an ancestor"),
-            });
+        if let Some(existing) = map.get_by_path(ancestor) {
+            if existing.file_type != FileType::Directory {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("file entry {ancestor} is an ancestor"),
+                });
+            }
+            continue;
+        }
+        let ancestor_path = ArchivePath::new(ancestor)?;
+        match snapshot.and_then(|snapshot| snapshot.entry_at_path(&ancestor_path)) {
+            Some(existing)
+                if !matches!(
+                    existing.kind,
+                    crate::archive::snapshot::SnapshotEntryKind::Directory
+                ) =>
+            {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("file entry {ancestor} is an ancestor"),
+                });
+            }
+            Some(_) => {}
+            None => {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("missing directory ancestor {ancestor}"),
+                });
+            }
         }
     }
 
@@ -154,16 +206,16 @@ fn validate_candidate_hierarchy(
 
 #[cfg(test)]
 pub(crate) fn validate_existing_candidate(
-    map: &WireEntries,
+    map: &DirectoryEntries,
     path: &str,
     entry: &FileEntry,
 ) -> Result<(), PithosError> {
     validate_entry(path, entry)?;
-    validate_candidate_hierarchy(map, path, entry)
+    validate_candidate_hierarchy(map, None, path, entry)
 }
 
 pub(crate) fn validate_new_candidate(
-    map: &WireEntries,
+    map: &DirectoryEntries,
     path: &str,
     entry: &FileEntry,
 ) -> Result<(), PithosError> {
@@ -173,38 +225,124 @@ pub(crate) fn validate_new_candidate(
             "File path already occupied: {path}"
         )));
     }
-    validate_candidate_hierarchy(map, path, entry)
+    validate_candidate_hierarchy(map, None, path, entry)
 }
 
-pub(crate) fn validate_wire_map(map: &WireEntries) -> Result<(), PithosError> {
+pub(crate) fn validate_new_candidate_with_snapshot(
+    map: &DirectoryEntries,
+    path: &str,
+    entry: &FileEntry,
+    snapshot: &AppendSnapshot,
+) -> Result<(), PithosError> {
+    validate_entry(path, entry)?;
+    if map.get_by_path(path).is_some() {
+        return Err(PithosError::PathOccupied(format!(
+            "File path already occupied: {path}"
+        )));
+    }
+    validate_candidate_hierarchy(map, Some(snapshot), path, entry)
+}
+
+pub(crate) fn validate_directory_entries(map: &DirectoryEntries) -> Result<(), PithosError> {
     for (_, path, entry) in map.iter() {
         validate_entry(path, entry)?;
     }
 
-    validate_wire_hierarchy(map)
+    validate_directory_entry_hierarchy(map)
 }
 
-pub(crate) fn validate_wire_hierarchy(map: &WireEntries) -> Result<(), PithosError> {
-    let mut entries = map.iter_ordered();
-    let Some((mut previous_path, mut previous_entry)) = entries.next() else {
-        return Ok(());
-    };
-
-    for (path, entry) in entries {
-        if previous_entry.file_type != FileType::Directory
-            && path.starts_with(previous_path)
-            && path.as_bytes().get(previous_path.len()) == Some(&b'/')
-        {
-            return Err(PithosError::InvalidArchivePath {
-                path: previous_path.into(),
-                reason: format!("entry is an ancestor of {path}"),
-            });
+pub(crate) fn validate_directory_entry_hierarchy(
+    map: &DirectoryEntries,
+) -> Result<(), PithosError> {
+    let mut earlier: HashMap<&str, &FileEntry> = HashMap::new();
+    for (_, path, entry) in map.iter() {
+        for (offset, _) in path.match_indices('/') {
+            let ancestor = &path[..offset];
+            if let Some(existing) = earlier.get(ancestor) {
+                if existing.file_type != FileType::Directory {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.into(),
+                        reason: format!("file entry {ancestor} is an ancestor"),
+                    });
+                }
+            } else if map.get_by_path(ancestor).is_some() {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("ancestor {ancestor} is declared after its child"),
+                });
+            }
         }
-
-        previous_path = path;
-        previous_entry = entry;
+        earlier.insert(path, entry);
     }
+    Ok(())
+}
 
+pub(crate) fn validate_directory_entry_hierarchy_complete(
+    map: &DirectoryEntries,
+) -> Result<(), PithosError> {
+    let mut earlier: HashMap<&str, &FileEntry> = HashMap::new();
+    for (_, path, entry) in map.iter() {
+        for (offset, _) in path.match_indices('/') {
+            let ancestor = &path[..offset];
+            let Some(existing) = earlier.get(ancestor) else {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("missing directory ancestor {ancestor}"),
+                });
+            };
+            if existing.file_type != FileType::Directory {
+                return Err(PithosError::InvalidArchivePath {
+                    path: path.into(),
+                    reason: format!("file entry {ancestor} is an ancestor"),
+                });
+            }
+        }
+        earlier.insert(path, entry);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_directory_entry_hierarchy_with_snapshot(
+    map: &DirectoryEntries,
+    snapshot: &AppendSnapshot,
+) -> Result<(), PithosError> {
+    let mut earlier: HashMap<&str, &FileEntry> = HashMap::new();
+    for (_, path, entry) in map.iter() {
+        for (offset, _) in path.match_indices('/') {
+            let ancestor = &path[..offset];
+            if let Some(existing) = earlier.get(ancestor) {
+                if existing.file_type != FileType::Directory {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.into(),
+                        reason: format!("file entry {ancestor} is an ancestor"),
+                    });
+                }
+                continue;
+            }
+            let ancestor_path = ArchivePath::new(ancestor)?;
+            match snapshot.entry_at_path(&ancestor_path) {
+                Some(existing)
+                    if !matches!(
+                        existing.kind,
+                        crate::archive::snapshot::SnapshotEntryKind::Directory
+                    ) =>
+                {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.into(),
+                        reason: format!("file entry {ancestor} is an ancestor"),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    return Err(PithosError::InvalidArchivePath {
+                        path: path.into(),
+                        reason: format!("missing directory ancestor {ancestor}"),
+                    });
+                }
+            }
+        }
+        earlier.insert(path, entry);
+    }
     Ok(())
 }
 
@@ -213,13 +351,23 @@ mod tests {
     use super::*;
 
     fn entry(file_type: FileType, target: Option<&str>, blocks: BlockDataState) -> FileEntry {
+        configured_entry(file_type, target, blocks, 0, 0o644)
+    }
+
+    fn configured_entry(
+        file_type: FileType,
+        target: Option<&str>,
+        blocks: BlockDataState,
+        file_size: u64,
+        permissions: u32,
+    ) -> FileEntry {
         FileEntry {
             file_type,
             block_data: blocks,
             created: 0,
             modified: 0,
-            file_size: 0,
-            permissions: 0o644,
+            file_size,
+            permissions,
             references: vec![],
             symlink_target: target.map(str::to_owned),
         }
@@ -328,6 +476,141 @@ mod tests {
     }
 
     #[test]
+    fn entry_semantics_cover_every_file_type_combination() {
+        for valid in [
+            configured_entry(
+                FileType::Data,
+                None,
+                BlockDataState::Encrypted(vec![1]),
+                12,
+                0o644,
+            ),
+            configured_entry(
+                FileType::Metadata,
+                None,
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o600,
+            ),
+            configured_entry(
+                FileType::Directory,
+                None,
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                Some("target"),
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o777,
+            ),
+        ] {
+            assert!(validate_entry("entry", &valid).is_ok(), "{valid:?}");
+        }
+
+        for invalid in [
+            configured_entry(
+                FileType::Data,
+                Some("target"),
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o644,
+            ),
+            configured_entry(
+                FileType::Metadata,
+                Some("target"),
+                BlockDataState::Encrypted(vec![]),
+                0,
+                0o644,
+            ),
+            configured_entry(
+                FileType::Directory,
+                None,
+                BlockDataState::Encrypted(vec![]),
+                0,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Directory,
+                None,
+                BlockDataState::Decrypted(vec![([1; 32], [2; 32])].into()),
+                0,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Directory,
+                Some("target"),
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Directory,
+                None,
+                BlockDataState::Decrypted(vec![].into()),
+                1,
+                0o755,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                None,
+                BlockDataState::Decrypted(vec![].into()),
+                0,
+                0o777,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                Some("target"),
+                BlockDataState::Encrypted(vec![]),
+                0,
+                0o777,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                Some("target"),
+                BlockDataState::Decrypted(vec![([1; 32], [2; 32])].into()),
+                0,
+                0o777,
+            ),
+            configured_entry(
+                FileType::Symlink,
+                Some("target"),
+                BlockDataState::Decrypted(vec![].into()),
+                1,
+                0o777,
+            ),
+        ] {
+            assert!(validate_entry("entry", &invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn entry_permissions_accept_only_the_defined_twelve_bits() {
+        for permissions in [0, 0o7777] {
+            let entry = configured_entry(
+                FileType::Data,
+                None,
+                BlockDataState::Encrypted(vec![]),
+                0,
+                permissions,
+            );
+            assert!(validate_entry("entry", &entry).is_ok(), "{permissions:#o}");
+        }
+        for permissions in [0o10000, u32::MAX] {
+            let entry = configured_entry(
+                FileType::Data,
+                None,
+                BlockDataState::Encrypted(vec![]),
+                0,
+                permissions,
+            );
+            assert!(validate_entry("entry", &entry).is_err(), "{permissions:#o}");
+        }
+    }
+
+    #[test]
     fn archive_path_candidate_and_map_conflicts_are_order_independent() {
         let file = entry(
             FileType::Data,
@@ -347,7 +630,7 @@ mod tests {
 
         for (ancestor_path, ancestor) in [("a", file.clone()), ("a", link.clone())] {
             for order in [0, 1] {
-                let mut map = WireEntries::new();
+                let mut map = DirectoryEntries::new();
                 if order == 0 {
                     map.insert(0, ancestor_path, ancestor.clone()).unwrap();
                     map.insert(1, "a/child", file.clone()).unwrap();
@@ -355,12 +638,12 @@ mod tests {
                     map.insert(0, "a/child", file.clone()).unwrap();
                     map.insert(1, ancestor_path, ancestor.clone()).unwrap();
                 }
-                assert!(validate_wire_map(&map).is_err());
+                assert!(validate_directory_entries(&map).is_err());
             }
         }
 
         for order in [0, 1] {
-            let mut map = WireEntries::new();
+            let mut map = DirectoryEntries::new();
             if order == 0 {
                 map.insert(0, "a/child", file.clone()).unwrap();
                 map.insert(1, "a", file.clone()).unwrap();
@@ -368,20 +651,18 @@ mod tests {
                 map.insert(0, "a", file.clone()).unwrap();
                 map.insert(1, "a/child", file.clone()).unwrap();
             }
-            assert!(validate_wire_map(&map).is_err());
+            assert!(validate_directory_entries(&map).is_err());
         }
 
-        for order in [0, 1] {
-            let mut map = WireEntries::new();
-            if order == 0 {
-                map.insert(0, "a", directory.clone()).unwrap();
-                map.insert(1, "a/child", file.clone()).unwrap();
-            } else {
-                map.insert(0, "a/child", file.clone()).unwrap();
-                map.insert(1, "a", directory.clone()).unwrap();
-            }
-            assert!(validate_wire_map(&map).is_ok());
-        }
+        let mut parent_first = DirectoryEntries::new();
+        parent_first.insert(0, "a", directory.clone()).unwrap();
+        parent_first.insert(1, "a/child", file.clone()).unwrap();
+        assert!(validate_directory_entries(&parent_first).is_ok());
+
+        let mut child_first = DirectoryEntries::new();
+        child_first.insert(0, "a/child", file.clone()).unwrap();
+        child_first.insert(1, "a", directory.clone()).unwrap();
+        assert!(validate_directory_entries(&child_first).is_err());
     }
 
     #[test]
@@ -397,19 +678,23 @@ mod tests {
             BlockDataState::Decrypted(vec![].into()),
         );
 
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "a", file.clone()).unwrap();
         assert!(validate_new_candidate(&map, "a/child", &file).is_err());
 
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "a/child", file.clone()).unwrap();
         assert!(validate_new_candidate(&map, "a", &file).is_err());
 
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "a", directory.clone()).unwrap();
         assert!(validate_new_candidate(&map, "a/child", &file).is_ok());
 
-        let mut map = WireEntries::new();
+        let map = DirectoryEntries::new();
+        assert!(validate_new_candidate(&map, "a/child", &file).is_err());
+        assert!(validate_new_candidate(&map, "a/b/child", &file).is_err());
+
+        let mut map = DirectoryEntries::new();
         for (id, path) in [(0, "ab"), (1, "a!"), (2, "a.b"), (3, "a/child")] {
             map.insert(id, path, file.clone()).unwrap();
         }
@@ -418,7 +703,7 @@ mod tests {
         assert!(validate_new_candidate(&map, "a.bx", &file).is_ok());
         assert!(validate_new_candidate(&map, "abx", &file).is_ok());
 
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "ユニコード", file.clone()).unwrap();
         assert!(validate_new_candidate(&map, "ユニコード/子", &file).is_err());
 
@@ -427,7 +712,7 @@ mod tests {
             .collect::<Vec<_>>();
         let ancestor = deep.join("/");
         let descendant = format!("{ancestor}/leaf");
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, descendant, file.clone()).unwrap();
         assert!(validate_new_candidate(&map, &ancestor, &file).is_err());
     }
@@ -439,7 +724,7 @@ mod tests {
             None,
             BlockDataState::Decrypted(vec![].into()),
         );
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         map.insert(0, "occupied", file.clone()).unwrap();
 
         assert!(validate_existing_candidate(&map, "occupied", &file).is_ok());
@@ -456,7 +741,7 @@ mod tests {
             None,
             BlockDataState::Decrypted(vec![].into()),
         );
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         for (id, path) in [(0, "a"), (1, "a!"), (2, "a/child")] {
             map.insert(id, path, file.clone()).unwrap();
         }
@@ -465,17 +750,17 @@ mod tests {
             map.iter_ordered().map(|(path, _)| path).collect::<Vec<_>>(),
             ["a", "a/child", "a!"]
         );
-        assert!(validate_wire_map(&map).is_err());
+        assert!(validate_directory_entries(&map).is_err());
     }
 
     #[test]
-    fn descending_wire_paths_keep_component_order_without_vector_insertion() {
+    fn descending_insertions_produce_component_path_order() {
         let file = entry(
             FileType::Data,
             None,
             BlockDataState::Decrypted(vec![].into()),
         );
-        let mut map = WireEntries::new();
+        let mut map = DirectoryEntries::new();
         for id in (0..10_000u64).rev() {
             map.insert(id, format!("entry-{id:05}"), file.clone())
                 .unwrap();

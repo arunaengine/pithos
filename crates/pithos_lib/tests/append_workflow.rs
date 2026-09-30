@@ -172,7 +172,7 @@ fn append_streams_multiblock_content_and_writes_one_child_directory_without_a_he
     assert_eq!(
         updated
             .windows(6)
-            .filter(|window| *window == b"PITH\x80\x02")
+            .filter(|window| *window == b"PITH\x01\x00")
             .count(),
         1
     );
