@@ -625,7 +625,7 @@ fn specification_consistency_has_navigation_and_review_coverage() {
         "CV-LOCAL-HELLO-279",
         "### 1.1 Reader's Guide",
         "**Illustrative data model.**",
-        "+-- base segment",
+        "|<--------------- base segment ------------>|",
         "### B.5 Validation Index",
         "[Section 4.2.5]",
         "**Valid ordering example:**",

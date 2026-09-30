@@ -72,16 +72,23 @@ this document governs.
 A Pithos file MUST have the following structure:
 
 ```
-+-- base segment --------------------+ +-- appended terminal segment -------------------+
-| [FileHeader][Base Blocks][Base Dir] | | [Appended Blocks][Terminal Dir ... dir_len || crc32] | EOF
-+-------------------------------------+ +-----------------------------------------------------+
-                                      ^                                      |
-                                      +-- parent (start, len) <-------------+
-                                                                    `dir_len || crc32` = final 12 bytes
+File start                                                                  EOF
+    |                                                                        |
+    v                                                                        v
++------------+-------------+----------------+-----------------+--------------------+
+| FileHeader | Base blocks | Base Directory | Appended blocks | Terminal Directory |
++------------+-------------+----------------+-----------------+--------------------+
+|<--------------- base segment ------------>|<-------- appended segment ---------->|
+
+Directory chain:
+
+[Base Directory] <- [Directory] <- ... <- [Terminal Directory]
+        parent_directory_offset links each Directory to its predecessor
 ```
 
 Each segment ends immediately after its Directory. Encryption sections, when
-present, are items in that Directory's `encryption` vector.
+present, are items in that Directory's `encryption` vector. The final 12 bytes
+of every Directory are `dir_len:u64be || crc32:u32be`.
 
 ### 3.1 Common Encoding Rules
 
