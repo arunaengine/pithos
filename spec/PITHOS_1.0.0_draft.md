@@ -849,7 +849,9 @@ encrypts the decrypted recipient list with ChaCha20-Poly1305:
   ones stored in the Directory: the EncryptionSection key and the recipient
   record key.
 
-Each version 1.1 grant therefore has its own key, bound to both public keys.
+Each version 1.1 grant key is therefore bound to both public keys and to the
+grant nonce. Grants with different nonces have different keys; a repeated nonce
+for the same key pair repeats the key (Section 7).
 Implementations MUST reject non-contributory X25519 public keys.
 
 An implementation MUST generate every nonce independently and uniformly at
@@ -930,9 +932,13 @@ its AEAD key, with no KDF, label, or AAD. That construction has no domain
 separation, and each static sender-recipient key pair has one nonce-collision
 scope across all archives that use it. Version 1.1 derives every wrapping key
 with HKDF-SHA256 from the shared secret, the grant's random nonce and both public
-keys. This adds domain separation and gives each grant its own key, so a nonce
-can only collide within one grant. Appends to version 1.0 archives keep the
-version 1.0 construction. The plaintext-derived Directory block hash exposes
+keys. This adds domain separation and binds each wrapping key to its sender and
+recipient. It does not shrink the nonce-collision scope: the nonce is the HKDF
+salt, so a repeated grant nonce for the same sender and recipient key pair
+repeats both the derived key and the AEAD nonce. Each key pair therefore still
+has one nonce-collision scope across all archives that use it. A fresh sender
+key for each archive or piece keeps that scope small. Appends to version 1.0
+archives keep the version 1.0 construction. The plaintext-derived Directory block hash exposes
 block equality, and equal plaintext also derives the same convergent block key.
 
 Pieces are joined in the order the Directory stores them. Their strictly
