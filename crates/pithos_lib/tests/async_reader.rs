@@ -974,3 +974,49 @@ fn encrypted_compressed_blocks_reserve_the_decrypted_bytes() {
         assert_eq!(output, compressible(1));
     }
 }
+
+#[test]
+fn repeated_adjacent_blocks_are_read_in_file_order() {
+    // Blocks A B B B C: the writer stores B once, right after A, and C after B.
+    let content = [[0u8; 16], [1; 16], [1; 16], [1; 16], [2; 16]].concat();
+    let key = private_key("sender");
+    let options = WriteOptions::new(key.duplicate(), vec![key.public_key()])
+        .with_chunking(Chunking::Fixed(16));
+    let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("data").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(true, 0).unwrap(),
+            Some(content.len() as u64),
+            std::io::Cursor::new(content.clone()),
+        )
+        .unwrap();
+    let bytes = writer.finish().unwrap();
+    for (max_buffered_bytes, range) in [(1 << 20, 0..80), (1 << 20, 20..60), (1, 0..80)] {
+        let limits = ReadLimits {
+            max_in_flight: 4,
+            max_buffered_bytes,
+            max_request_bytes: 1024,
+        };
+        let (archive, probe, _) = open_as(&bytes, sender(), limits);
+        let (output, error) = drain(archive.read_range("data", range.clone()).unwrap(), &probe);
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(output, content[range.start as usize..range.end as usize]);
+        // Each request covers distinct stored bytes of the archive.
+        let reads = probe.reads.lock().unwrap()[3..].to_vec();
+        let stored = planned(&archive, range.clone())
+            .iter()
+            .map(|block| (block.offset, block.framed))
+            .collect::<HashSet<_>>();
+        assert!(reads.len() <= planned(&archive, range).len());
+        for (offset, len) in reads {
+            let covered = stored
+                .iter()
+                .filter(|(start, framed)| *start >= offset && start + framed <= offset + len)
+                .map(|(_, framed)| framed)
+                .sum::<u64>();
+            assert_eq!(covered, len);
+        }
+    }
+}
