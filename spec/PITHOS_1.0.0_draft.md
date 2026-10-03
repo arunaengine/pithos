@@ -1172,9 +1172,13 @@ This appendix suggests writer choices only. It does not define archive
 conformance or reader behavior.
 
 **Recommended block size:** fixed 4 MiB (4,194,304 byte) blocks. Every block
-of a file has this size except the last, which may be shorter. Block boundaries
-then depend only on byte offsets, not on how the input was read. This suits
-object storage and multipart uploads, where parts are written independently.
+of an independently encoded part has this size except its last, which may be
+shorter. A file written in one pass therefore has at most one short block, at
+its end. A file joined from pieces has one possible short block at the end of
+each piece: two 5 MiB pieces give blocks of 4, 1, 4 and 1 MiB. Block boundaries
+depend only on byte offsets within a part, not on how the input was read. This
+suits object storage and multipart uploads, where parts are written
+independently.
 Content-defined chunking (for example FastCDC) is optional. It can find more
 repeated blocks when content shifts, at the cost of variable block sizes.
 
