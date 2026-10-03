@@ -46,6 +46,21 @@ pithos read data plain.pith report.txt
 
 `read data` also accepts `--ranges START:END,...` for half-open byte ranges. Use `read info` to inspect an entry and `read directory` to inspect every entry's metadata.
 
+## Block and encryption options
+
+`create` and `append files` accept these options:
+
+- `--block-size BYTES` sets the size of fixed blocks. The default is 4 MiB (4194304 bytes). It cannot be combined with `--cdc`.
+- `--cdc MIN,AVG,MAX` uses content-defined chunking instead of fixed blocks.
+- `--cipher chacha20-poly1305|aes-256-gcm` selects the cipher for new encrypted blocks. The default is `chacha20-poly1305`.
+- `--unique-keys` gives every block its own random key. Equal blocks are then stored again instead of once, so their equality stays hidden.
+
+`--unique-keys` and `--cipher aes-256-gcm` need encryption, so they fail with `--plain`. When appending, they also need a version 1.1 archive.
+
+```bash
+pithos --secret-key keys/owner.sec.pem --public-keys keys/owner.pub.pem --output private.pith create --cipher aes-256-gcm --unique-keys --block-size 1048576 input
+```
+
 ## More operations
 
 - `append files` adds filesystem input to an existing archive.

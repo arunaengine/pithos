@@ -52,6 +52,11 @@ impl AppendOptions {
         self
     }
 
+    /// The processing used for appended content.
+    pub fn processing(&self) -> ProcessingOptions {
+        self.processing
+    }
+
     pub(crate) fn validate_recipients(&self) -> Result<(), PithosError> {
         WriteOptions::new(self.access_key.duplicate(), self.recipients.clone()).validate()
     }

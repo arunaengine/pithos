@@ -500,3 +500,147 @@ fn create_rejects_unreadable_input_before_publication_when_permissions_apply() {
     fs::set_permissions(&input, fs::Permissions::from_mode(0o644)).unwrap();
     let _ = fs::remove_dir_all(temporary);
 }
+
+fn read_back(archive: &std::path::Path, path: &str) -> Vec<u8> {
+    let output = command()
+        .arg("--secret-key")
+        .arg(workspace_file("keys/recipient1_private.pem"))
+        .args(["read", "data"])
+        .arg(archive)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[test]
+fn create_block_options_round_trip() {
+    let temporary = temporary();
+    let input = temporary.join("input.bin");
+    let content: Vec<u8> = (0..3000_u32).map(|value| (value % 251) as u8).collect();
+    fs::write(&input, &content).unwrap();
+    for (index, options) in [
+        vec!["--cipher", "chacha20-poly1305"],
+        vec!["--cipher", "aes-256-gcm"],
+        vec!["--unique-keys"],
+        vec!["--block-size", "1024"],
+        vec![
+            "--unique-keys",
+            "--cipher",
+            "aes-256-gcm",
+            "--block-size",
+            "512",
+        ],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let archive = temporary.join(format!("options-{index}.pith"));
+        let output = create_command(&archive, &input)
+            .args(&options)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{options:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(read_back(&archive, "input.bin"), content, "{options:?}");
+    }
+    let _ = fs::remove_dir_all(temporary);
+}
+
+#[test]
+fn block_size_splits_and_unique_keys_store_equal_blocks() {
+    let temporary = temporary();
+    let distinct = temporary.join("distinct.bin");
+    let content: Vec<u8> = (0..4_u8).flat_map(|value| [value; 1024]).collect();
+    fs::write(&distinct, &content).unwrap();
+    let markers = |block_size: Option<&str>| {
+        let archive = temporary.join(format!("plain-{block_size:?}.pith"));
+        let mut create = command();
+        create
+            .arg("--output")
+            .arg(&archive)
+            .args(["create", "--plain"]);
+        if let Some(size) = block_size {
+            create.args(["--block-size", size]);
+        }
+        assert!(create.arg(&distinct).status().unwrap().success());
+        let bytes = fs::read(&archive).unwrap();
+        bytes.windows(4).filter(|window| window == b"BLCK").count()
+    };
+    assert_eq!(markers(None), 1);
+    assert_eq!(markers(Some("1024")), 4);
+
+    let equal = temporary.join("equal.bin");
+    fs::write(&equal, [7_u8; 4096]).unwrap();
+    let archive_len = |unique: bool| {
+        let archive = temporary.join(format!("equal-{unique}.pith"));
+        let mut create = create_command(&archive, &equal);
+        create.args(["--block-size", "1024"]);
+        if unique {
+            create.arg("--unique-keys");
+        }
+        assert!(create.status().unwrap().success());
+        assert_eq!(read_back(&archive, "equal.bin"), [7_u8; 4096]);
+        fs::metadata(&archive).unwrap().len()
+    };
+    // Three more stored blocks, each with a marker and at least 28 payload bytes.
+    assert!(archive_len(true) >= archive_len(false) + 3 * 32);
+    let _ = fs::remove_dir_all(temporary);
+}
+
+#[test]
+fn invalid_block_options_fail_without_output() {
+    let temporary = temporary();
+    let input = temporary.join("input.txt");
+    fs::write(&input, b"input").unwrap();
+    for (index, (options, message)) in [
+        (
+            vec!["--plain", "--unique-keys"],
+            "--unique-keys needs an encrypted archive",
+        ),
+        (
+            vec!["--plain", "--cipher", "aes-256-gcm"],
+            "--cipher needs an encrypted archive",
+        ),
+        (
+            vec!["--plain", "--block-size", "0"],
+            "invalid fixed block size",
+        ),
+        (vec!["--block-size", "0"], "invalid fixed block size"),
+        (
+            vec!["--block-size", "1024", "--cdc", "64,256,1024"],
+            "cannot be used with",
+        ),
+        (vec!["--cipher", "des"], "invalid value"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = temporary.join(format!("invalid-{index}.pith"));
+        let mut create = if options.contains(&"--plain") {
+            let mut create = command();
+            create
+                .arg("--output")
+                .arg(&output)
+                .arg("create")
+                .arg(&input);
+            create
+        } else {
+            create_command(&output, &input)
+        };
+        let result = create.args(&options).output().unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{options:?}");
+        assert!(stderr.contains(message), "{options:?}: {stderr}");
+        assert!(!output.exists(), "{options:?}");
+    }
+    let _ = fs::remove_dir_all(temporary);
+}

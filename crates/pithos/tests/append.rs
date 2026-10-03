@@ -258,3 +258,55 @@ fn append_cli_rejects_a_non_archive_target_without_panicking_or_mutating_archive
     assert_eq!(fs::read(&target).unwrap(), target_original);
     let _ = fs::remove_dir_all(temporary);
 }
+
+#[test]
+fn append_files_block_options_round_trip_and_conflicts_leave_the_archive() {
+    let temporary = temporary();
+    let archive = create_archive(&temporary);
+    let input = temporary.join("options.txt");
+    fs::write(&input, b"appended with block options").unwrap();
+
+    let mut conflict = sender_command();
+    add_recipient(&mut conflict, "sender");
+    let original = fs::read(&archive).unwrap();
+    let output = conflict
+        .args(["append", "files", "--file"])
+        .arg(&archive)
+        .args(["--block-size", "1024", "--cdc", "64,256,1024"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("cannot be used with"));
+    assert_eq!(fs::read(&archive).unwrap(), original);
+
+    let mut append = sender_command();
+    add_recipient(&mut append, "sender");
+    add_recipient(&mut append, "recipient1");
+    let output = append
+        .args(["append", "files", "--file"])
+        .arg(&archive)
+        .args([
+            "--block-size",
+            "8",
+            "--unique-keys",
+            "--cipher",
+            "aes-256-gcm",
+        ])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let read = command()
+        .arg("--secret-key")
+        .arg(workspace_file("keys/recipient1_private.pem"))
+        .args(["read", "data"])
+        .arg(&archive)
+        .arg("options.txt")
+        .output()
+        .unwrap();
+    assert!(read.status.success(), "{}", stderr(&read));
+    assert_eq!(read.stdout, b"appended with block options");
+    let _ = fs::remove_dir_all(temporary);
+}

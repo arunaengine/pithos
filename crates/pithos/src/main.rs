@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pithos_lib::adapters::crypt4gh;
 use pithos_lib::adapters::crypt4gh::Crypt4GHError;
 use pithos_lib::archive::{
-    AccessKeys, AppendDurability, AppendOptions, Archive, ArchiveWriter, CdcConfig, Chunking,
-    OpenOptions, ProcessingOptions, WriteOptions, WriterError,
+    AccessKeys, AppendDurability, AppendOptions, Archive, ArchiveWriter, BlockKeyMode, CdcConfig,
+    Chunking, OpenOptions, PayloadCipher, ProcessingOptions, WriteOptions, WriterError,
 };
 use pithos_lib::crypto::{PrivateKey, PublicKey, generate_private_key};
 use pithos_lib::error::PithosError;
@@ -53,6 +53,24 @@ impl From<CliAppendDurability> for AppendDurability {
         match value {
             CliAppendDurability::Flush => Self::Flush,
             CliAppendDurability::SyncAll => Self::SyncAll,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum CliCipher {
+    #[default]
+    #[value(name = "chacha20-poly1305")]
+    ChaCha20Poly1305,
+    #[value(name = "aes-256-gcm")]
+    Aes256Gcm,
+}
+
+impl From<CliCipher> for PayloadCipher {
+    fn from(value: CliCipher) -> Self {
+        match value {
+            CliCipher::ChaCha20Poly1305 => Self::ChaCha20Poly1305,
+            CliCipher::Aes256Gcm => Self::Aes256Gcm,
         }
     }
 }
@@ -110,9 +128,18 @@ enum PithosCommands {
         #[arg(long)]
         reader_public_keys: Option<Vec<PathBuf>>, // Iterate files and parse all keys
         */
-        /// Use content-defined chunking with these sizes instead of fixed 4 MiB blocks
+        /// Use content-defined chunking with these sizes instead of fixed blocks
         #[arg(long="cdc", value_parser=parse_cdc_input, value_name = "MIN,AVG,MAX")]
         cdc: Option<CdcConfig>,
+        /// Size of fixed blocks in bytes
+        #[arg(long, value_name = "BYTES", default_value_t = Chunking::DEFAULT_BLOCK_SIZE, conflicts_with = "cdc")]
+        block_size: usize,
+        /// Cipher for encrypted blocks; needs an encrypted archive for aes-256-gcm
+        #[arg(long, value_enum, default_value_t)]
+        cipher: CliCipher,
+        /// Encrypt every block with its own random key, without deduplication; needs encryption
+        #[arg(long)]
+        unique_keys: bool,
         /// Create a local, uncompressed, unencrypted base archive
         #[arg(long, conflicts_with_all = ["secret_key", "public_keys"])]
         plain: bool,
@@ -232,9 +259,18 @@ enum AppendCommands {
         /// Path to Pithos file
         #[arg(short, long, value_name = "PITHOS FILE")]
         file: PathBuf,
-        /// Use content-defined chunking with these sizes instead of fixed 4 MiB blocks
+        /// Use content-defined chunking with these sizes instead of fixed blocks
         #[arg(long = "cdc", value_parser = parse_cdc_input, value_name = "MIN,AVG,MAX")]
         cdc: Option<CdcConfig>,
+        /// Size of fixed blocks in bytes
+        #[arg(long, value_name = "BYTES", default_value_t = Chunking::DEFAULT_BLOCK_SIZE, conflicts_with = "cdc")]
+        block_size: usize,
+        /// Cipher for new encrypted blocks; aes-256-gcm needs a version 1.1 archive
+        #[arg(long, value_enum, default_value_t)]
+        cipher: CliCipher,
+        /// Encrypt every new block with its own random key, without deduplication; needs version 1.1
+        #[arg(long)]
+        unique_keys: bool,
         /// Durability after publishing the appended directory
         #[arg(long, value_enum, default_value_t)]
         durability: CliAppendDurability,
@@ -279,6 +315,33 @@ pub enum PithosCliError {
         #[source]
         source: std::io::Error,
     },
+}
+
+fn chunking(cdc: Option<CdcConfig>, block_size: usize) -> Chunking {
+    cdc.map_or(Chunking::Fixed(block_size), Chunking::ContentDefined)
+}
+
+/// Applies the key mode and cipher options; the library rejects them without encryption.
+fn block_processing(
+    processing: ProcessingOptions,
+    cipher: CliCipher,
+    unique_keys: bool,
+) -> Result<ProcessingOptions, PithosCliError> {
+    let key_mode = if unique_keys {
+        BlockKeyMode::Unique
+    } else {
+        BlockKeyMode::ContentDerived
+    };
+    let processing = processing.with_key_mode(key_mode).map_err(|error| {
+        PithosCliError::InvalidArgumentError(format!(
+            "--unique-keys needs an encrypted archive: {error}"
+        ))
+    })?;
+    processing.with_cipher(cipher.into()).map_err(|error| {
+        PithosCliError::InvalidArgumentError(format!(
+            "--cipher needs an encrypted archive: {error}"
+        ))
+    })
 }
 
 #[tracing::instrument(level = "trace", skip())]
@@ -401,7 +464,14 @@ fn run() -> Result<(), PithosCliError> {
                 }
             }
         },
-        PithosCommands::Create { cdc, plain, files } => {
+        PithosCommands::Create {
+            cdc,
+            block_size,
+            cipher,
+            unique_keys,
+            plain,
+            files,
+        } => {
             if plain && (cli.secret_key.is_some() || cli.public_keys.is_some()) {
                 return Err(PithosCliError::InvalidArgumentError(
                     "--plain conflicts with --secret-key and --public-keys".into(),
@@ -413,10 +483,10 @@ fn run() -> Result<(), PithosCliError> {
                 ));
             }
 
+            let chunking = chunking(cdc, block_size);
             let (options, processing) = if plain {
                 (
-                    WriteOptions::base()
-                        .with_chunking(cdc.map(Chunking::ContentDefined).unwrap_or_default()),
+                    WriteOptions::base().with_chunking(chunking),
                     ProcessingOptions::new(false, 0).expect("zero compression is valid"),
                 )
             } else {
@@ -432,12 +502,12 @@ fn run() -> Result<(), PithosCliError> {
                     .map(|path| load_public_key_from_pem(path))
                     .collect();
                 (
-                    WriteOptions::new(sender_key, reader_keys?)
-                        .with_chunking(cdc.map(Chunking::ContentDefined).unwrap_or_default()),
+                    WriteOptions::new(sender_key, reader_keys?).with_chunking(chunking),
                     ProcessingOptions::default(),
                 )
             };
             options.validate()?;
+            let processing = block_processing(processing, cipher, unique_keys)?;
             let manifest = build_input_manifest(&files)?;
 
             let output_path = match cli.output {
@@ -532,6 +602,9 @@ fn run() -> Result<(), PithosCliError> {
             AppendCommands::Files {
                 file,
                 cdc,
+                block_size,
+                cipher,
+                unique_keys,
                 durability,
                 files,
             } => {
@@ -542,13 +615,11 @@ fn run() -> Result<(), PithosCliError> {
                 }
                 let sender_key = required_private_key(&cli.secret_key)?;
                 let reader_keys = required_recipient_keys(&cli.public_keys)?;
-                append_files(
-                    &file,
-                    AppendOptions::new(sender_key, reader_keys)
-                        .with_chunking(cdc.map(Chunking::ContentDefined).unwrap_or_default())
-                        .with_durability(durability.into()),
-                    &files,
-                )?;
+                let options = AppendOptions::new(sender_key, reader_keys)
+                    .with_chunking(chunking(cdc, block_size))
+                    .with_durability(durability.into());
+                let processing = block_processing(options.processing(), cipher, unique_keys)?;
+                append_files(&file, options.with_processing(processing), &files)?;
             }
         },
         PithosCommands::Export { file, path, .. } => {
