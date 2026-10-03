@@ -4,13 +4,15 @@ use common::keys::private_key;
 use futures_core::Stream;
 use pithos_lib::archive::{
     AccessKeys, Archive, ArchiveFeature, ArchivePath, ArchiveWriter, AsyncArchive,
-    AsyncExternalBlockResolver, BlockingHook, Chunking, EntryKind, EntryMetadata,
-    ExternalBlockAccessPolicy, ExternalLocation, OpenLimits, OpenOptions, ProcessingOptions,
-    ReadLimits, WriteOptions,
+    AsyncExternalBlockResolver, BlockRequest, BlockingHook, Chunking, EntryKind, EntryMetadata,
+    ExternalBlockAccessPolicy, ExternalLocation, NoExternalBlocks, OpenLimits, OpenOptions,
+    ProcessingOptions, ReadLimits, WriteOptions,
 };
 use pithos_lib::error::PithosError;
 use pithos_lib::source::{AsyncArchiveSource, MemorySource, SourceError};
+use std::collections::HashSet;
 use std::future::Future;
+use std::ops::Range;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,7 +24,8 @@ enum Mode {
     Ready,
     /// Each read returns `Pending` once, so several reads overlap.
     YieldOnce,
-    /// Reads complete only while `Probe::completions` allows it.
+    /// A read completes once its offset is in `Probe::released`, and fails if it is also in
+    /// `Probe::failing`.
     Gated,
     /// Responses are one byte longer or shorter than requested.
     Resize(isize),
@@ -35,7 +38,8 @@ struct Probe {
     outstanding: AtomicUsize,
     max_outstanding: AtomicUsize,
     cancelled: AtomicUsize,
-    completions: AtomicUsize,
+    released: Mutex<HashSet<u64>>,
+    failing: Mutex<HashSet<u64>>,
     delivered: AtomicUsize,
     /// Reads issued while opening, which `max_ahead` ignores.
     baseline: AtomicUsize,
@@ -89,6 +93,7 @@ impl AsyncArchiveSource for TestSource {
             _ => offset + len,
         };
         Read {
+            offset,
             probe: Arc::clone(&self.probe),
             response: Some(self.bytes[offset as usize..end as usize].to_vec()),
             mode,
@@ -103,6 +108,7 @@ impl AsyncArchiveSource for TestSource {
 
 /// A read that records completion and cancellation.
 struct Read {
+    offset: u64,
     probe: Arc<Probe>,
     response: Option<Vec<u8>>,
     mode: Mode,
@@ -120,20 +126,20 @@ impl Future for Read {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
-            Mode::Gated => {
-                let allowed = this.probe.completions.fetch_update(
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                    |count| count.checked_sub(1),
-                );
-                if allowed.is_err() {
-                    return Poll::Pending;
-                }
+            Mode::Gated if !this.probe.released.lock().unwrap().contains(&this.offset) => {
+                return Poll::Pending;
             }
             _ => {}
         }
         this.probe.outstanding.fetch_sub(1, Ordering::SeqCst);
-        Poll::Ready(Ok(this.response.take().unwrap()))
+        let response = this.response.take().unwrap();
+        if this.probe.failing.lock().unwrap().contains(&this.offset) {
+            return Poll::Ready(Err(SourceError::Remote {
+                offset: this.offset,
+                message: "injected failure".into(),
+            }));
+        }
+        Poll::Ready(Ok(response))
     }
 }
 
@@ -235,6 +241,164 @@ fn blocks(count: u64, encrypted: bool) -> Vec<u8> {
     writer.finish().unwrap()
 }
 
+/// One planned block: its stored offset, framed length, decoded size and planned output.
+#[derive(Clone, Copy, Debug)]
+struct Planned {
+    offset: u64,
+    framed: u64,
+    output: u64,
+}
+
+fn planned<E, B>(archive: &AsyncArchive<TestSource, E, B>, range: Range<u64>) -> Vec<Planned>
+where
+    E: AsyncExternalBlockResolver,
+    B: BlockingHook,
+{
+    archive
+        .view()
+        .plan_range("data", range)
+        .unwrap()
+        .map(|block| {
+            let block = block.unwrap();
+            let BlockRequest::Local { offset, len } = block.request() else {
+                panic!("unexpected external block");
+            };
+            Planned {
+                offset,
+                framed: len,
+                output: block.output().len() as u64,
+            }
+        })
+        .collect()
+}
+
+fn release(probe: &Probe, offset: u64) {
+    probe.released.lock().unwrap().insert(offset);
+}
+
+/// Hook tasks run only once their call index is released, or all of them while `open` is set.
+#[derive(Default)]
+struct HookGate {
+    open: std::sync::atomic::AtomicBool,
+    started: AtomicUsize,
+    finished: AtomicUsize,
+    dropped: AtomicUsize,
+    released: Mutex<HashSet<usize>>,
+}
+
+#[derive(Clone, Default)]
+struct GatedHook(Arc<HookGate>);
+
+impl BlockingHook for GatedHook {
+    fn spawn_blocking<F, T>(&self, task: F) -> impl Future<Output = T> + Send
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        GatedTask {
+            index: self.0.started.fetch_add(1, Ordering::SeqCst),
+            gate: Arc::clone(&self.0),
+            task: Some(Box::new(task)),
+        }
+    }
+}
+
+struct GatedTask<F> {
+    index: usize,
+    gate: Arc<HookGate>,
+    task: Option<Box<F>>,
+}
+
+impl<F: FnOnce() -> T, T> Future for GatedTask<F> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
+        let this = self.get_mut();
+        let released = this.gate.open.load(Ordering::SeqCst)
+            || this.gate.released.lock().unwrap().contains(&this.index);
+        if !released {
+            return Poll::Pending;
+        }
+        let output = (this.task.take().unwrap())();
+        this.gate.finished.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(output)
+    }
+}
+
+impl<F> Drop for GatedTask<F> {
+    fn drop(&mut self) {
+        if self.task.is_some() {
+            self.gate.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Opens with a hook that runs the open steps and then holds every decode.
+fn open_gated(
+    bytes: &[u8],
+    limits: ReadLimits,
+) -> (
+    AsyncArchive<TestSource, NoExternalBlocks, GatedHook>,
+    Arc<Probe>,
+    GatedHook,
+) {
+    let (source, probe, mode) = TestSource::new(bytes);
+    let hook = GatedHook::default();
+    hook.0.open.store(true, Ordering::SeqCst);
+    let archive = block_on(AsyncArchive::open_with_hook(
+        source,
+        OpenOptions::default(),
+        None,
+        hook.clone(),
+    ))
+    .unwrap()
+    .with_read_limits(limits);
+    hook.0.open.store(false, Ordering::SeqCst);
+    *mode.lock().unwrap() = Mode::Gated;
+    (archive, probe, hook)
+}
+
+/// Blocks of 4096 bytes that are zero except for their index, so they compress well.
+fn compressible(count: u64) -> Vec<u8> {
+    (0..count)
+        .flat_map(|block| {
+            let mut bytes = vec![0; 4096];
+            bytes[..8].copy_from_slice(&block.to_be_bytes());
+            bytes
+        })
+        .collect()
+}
+
+fn compressed_blocks(count: u64, encrypted: bool) -> Vec<u8> {
+    let sender = private_key("sender");
+    let options = WriteOptions::new(sender.duplicate(), vec![sender.public_key()])
+        .with_chunking(Chunking::Fixed(4096));
+    let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+    let content = compressible(count);
+    writer
+        .add_file(
+            ArchivePath::new("data").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(encrypted, 3).unwrap(),
+            Some(content.len() as u64),
+            std::io::Cursor::new(content),
+        )
+        .unwrap();
+    writer.finish().unwrap()
+}
+
+/// The documented reservation of one request over full, encrypted and compressed blocks.
+fn reservation(blocks: &[Planned]) -> u64 {
+    let response = blocks.iter().map(|block| block.framed).sum::<u64>();
+    let output = blocks.iter().map(|block| block.output).sum::<u64>();
+    let working = blocks
+        .iter()
+        .map(|block| 2 * block.framed + block.output)
+        .max()
+        .unwrap();
+    response + output + working
+}
+
 fn sender() -> OpenOptions {
     OpenOptions::default().with_access_keys(AccessKeys::new().with_key(private_key("sender")))
 }
@@ -243,15 +407,23 @@ fn open(
     bytes: &[u8],
     limits: ReadLimits,
 ) -> (AsyncArchive<TestSource>, Arc<Probe>, Arc<Mutex<Mode>>) {
+    open_as(bytes, OpenOptions::default(), limits)
+}
+
+fn open_as(
+    bytes: &[u8],
+    options: OpenOptions,
+    limits: ReadLimits,
+) -> (AsyncArchive<TestSource>, Arc<Probe>, Arc<Mutex<Mode>>) {
     let (source, probe, mode) = TestSource::new(bytes);
-    let archive = block_on(AsyncArchive::open(source, OpenOptions::default(), None)).unwrap();
+    let archive = block_on(AsyncArchive::open(source, options, None)).unwrap();
     let opened = probe.reads.lock().unwrap().len();
     probe.baseline.store(opened, Ordering::SeqCst);
     probe.max_ahead.store(0, Ordering::SeqCst);
     (archive.with_read_limits(limits), probe, mode)
 }
 
-/// Single-block requests that reserve 20 + 20 + 16 bytes each.
+/// Single-block requests that reserve 20 + 16 + (20 + 16) bytes each.
 fn single_blocks(max_in_flight: usize, max_buffered_bytes: u64) -> ReadLimits {
     ReadLimits {
         max_in_flight,
@@ -327,7 +499,7 @@ fn reads_respect_the_in_flight_bound() {
 fn reads_respect_the_buffered_byte_bound() {
     let bytes = blocks(32, false);
     // One reservation, then less than one: each request waits for the previous chunk.
-    for max_buffered_bytes in [56, 1] {
+    for max_buffered_bytes in [72, 1] {
         let (archive, probe, mode) = open(&bytes, single_blocks(8, max_buffered_bytes));
         *mode.lock().unwrap() = Mode::YieldOnce;
         let (output, error) = drain(archive.read_range("data", 0..512).unwrap(), &probe);
@@ -339,12 +511,12 @@ fn reads_respect_the_buffered_byte_bound() {
             "{max_buffered_bytes}"
         );
     }
-    // Each undelivered block holds at least its 16 output bytes and a new request 56 bytes.
-    let (archive, probe, _) = open(&bytes, single_blocks(100, 560));
+    // Each undelivered block holds at least its 16 output bytes and a new request 72 bytes.
+    let (archive, probe, _) = open(&bytes, single_blocks(100, 720));
     let (output, _) = drain(archive.read_range("data", 0..512).unwrap(), &probe);
     assert_eq!(output, content(32));
     let ahead = probe.max_ahead.load(Ordering::SeqCst);
-    assert!((10..=(560 - 56) / 16 + 1).contains(&ahead), "{ahead}");
+    assert!((10..=(720 - 72) / 16 + 1).contains(&ahead), "{ahead}");
 }
 
 #[test]
@@ -355,7 +527,7 @@ fn dropping_a_stream_cancels_outstanding_requests() {
     let mut stream = archive.read_range("data", 0..256).unwrap();
     assert!(next(&mut stream).is_pending());
     assert_eq!(probe.outstanding.load(Ordering::SeqCst), 4);
-    probe.completions.store(1, Ordering::SeqCst);
+    release(&probe, planned(&archive, 0..16)[0].offset);
     let Poll::Ready(Some(Ok(first))) = next(&mut stream) else {
         panic!("the first block was released");
     };
@@ -634,4 +806,171 @@ fn external_blocks_are_read_through_the_async_resolver() {
     }
     let ExternalRead { result, .. } = external_read(b"BLCKjello", None, 0..5);
     assert!(matches!(result, Err(PithosError::BlockHashMismatch { .. })));
+}
+
+#[test]
+fn reads_completed_in_reverse_are_delivered_in_file_order() {
+    let bytes = blocks(8, false);
+    let (archive, probe, mode) = open(&bytes, single_blocks(4, 1 << 20));
+    *mode.lock().unwrap() = Mode::Gated;
+    let blocks = planned(&archive, 0..64);
+    let mut stream = archive.read_range("data", 0..64).unwrap();
+    assert!(next(&mut stream).is_pending());
+    for block in blocks[1..].iter().rev() {
+        release(&probe, block.offset);
+        assert!(next(&mut stream).is_pending());
+    }
+    assert_eq!(probe.outstanding.load(Ordering::SeqCst), 1);
+    release(&probe, blocks[0].offset);
+    for block in 0..4 {
+        let Poll::Ready(Some(Ok(chunk))) = next(&mut stream) else {
+            panic!("block {block} was released");
+        };
+        assert_eq!(chunk, content(block + 1)[block as usize * 16..]);
+    }
+    assert!(matches!(next(&mut stream), Poll::Ready(None)));
+}
+
+#[test]
+fn decodes_completed_in_reverse_are_delivered_in_file_order() {
+    let bytes = blocks(4, false);
+    let (archive, probe, hook) = open_gated(&bytes, single_blocks(4, 1 << 20));
+    for block in planned(&archive, 0..64) {
+        release(&probe, block.offset);
+    }
+    let mut stream = archive.read_range("data", 0..64).unwrap();
+    assert!(next(&mut stream).is_pending());
+    assert_eq!(hook.0.started.load(Ordering::SeqCst), 3 + 4);
+    for index in (4..7).rev() {
+        hook.0.released.lock().unwrap().insert(index);
+        assert!(next(&mut stream).is_pending());
+    }
+    assert_eq!(hook.0.finished.load(Ordering::SeqCst), 3 + 3);
+    hook.0.released.lock().unwrap().insert(3);
+    let (output, error) = drain(stream, &probe);
+    assert!(error.is_none());
+    assert_eq!(output, content(4));
+}
+
+#[test]
+fn a_later_failure_ends_the_stream_after_the_earlier_output() {
+    let bytes = blocks(8, false);
+    let (archive, probe, mode) = open(&bytes, single_blocks(4, 1 << 20));
+    *mode.lock().unwrap() = Mode::Gated;
+    let blocks = planned(&archive, 0..128);
+    probe.failing.lock().unwrap().insert(blocks[2].offset);
+    let mut stream = archive.read_range("data", 0..128).unwrap();
+    assert!(next(&mut stream).is_pending());
+    release(&probe, blocks[2].offset);
+    assert!(next(&mut stream).is_pending());
+    release(&probe, blocks[1].offset);
+    assert!(next(&mut stream).is_pending());
+    release(&probe, blocks[0].offset);
+    let (output, error) = drain(stream, &probe);
+    assert_eq!(output, content(2));
+    assert!(matches!(
+        error,
+        Some(PithosError::Source(SourceError::Remote { offset, .. })) if offset == blocks[2].offset
+    ));
+    // The pending sibling was cancelled and no request started after the failure.
+    assert_eq!(probe.cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.outstanding.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.reads.lock().unwrap().len(), 3 + 4);
+}
+
+#[test]
+fn dropping_a_stream_during_a_decode_drops_the_hook_task() {
+    let bytes = blocks(8, false);
+    let (archive, probe, hook) = open_gated(&bytes, single_blocks(4, 1 << 20));
+    let first = planned(&archive, 0..16)[0];
+    release(&probe, first.offset);
+    let mut stream = archive.read_range("data", 0..128).unwrap();
+    assert!(next(&mut stream).is_pending());
+    assert_eq!(hook.0.started.load(Ordering::SeqCst), 3 + 1);
+    assert_eq!(probe.outstanding.load(Ordering::SeqCst), 4);
+    drop(stream);
+    assert_eq!(hook.0.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(hook.0.finished.load(Ordering::SeqCst), 3);
+    assert_eq!(probe.cancelled.load(Ordering::SeqCst), 4);
+    assert_eq!(probe.outstanding.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn compressed_blocks_share_a_request_only_within_the_byte_bound() {
+    let bytes = compressed_blocks(32, true);
+    let limits = ReadLimits {
+        max_in_flight: 8,
+        max_buffered_bytes: 40_000,
+        max_request_bytes: 1 << 20,
+    };
+    let (archive, probe, _) = open_as(&bytes, sender(), limits);
+    let blocks = planned(&archive, 0..32 * 4096);
+    // Compression is kept: every block stores far fewer bytes than it decodes to.
+    assert!(blocks.iter().all(|block| block.framed * 10 < block.output));
+    let mut stream = archive.read_range("data", 0..32 * 4096).unwrap();
+    let mut output = Vec::new();
+    let mut peak = 0;
+    while let Poll::Ready(Some(chunk)) = next(&mut stream) {
+        peak = peak.max(stream.buffered_bytes());
+        output.extend_from_slice(&chunk.unwrap());
+    }
+    assert!(matches!(next(&mut stream), Poll::Ready(None)));
+    assert_eq!(output, compressible(32));
+    assert!(peak > 0 && peak <= limits.max_buffered_bytes, "{peak}");
+    let reads = probe.reads.lock().unwrap()[3..].to_vec();
+    assert!(reads.len() > 1 && reads.len() < blocks.len(), "{reads:?}");
+    let mut rest = &blocks[..];
+    for (offset, len) in reads {
+        let count = rest
+            .iter()
+            .scan(0, |total, block| {
+                *total += block.framed;
+                Some(*total)
+            })
+            .position(|total| total == len)
+            .unwrap()
+            + 1;
+        assert_eq!(rest[0].offset, offset);
+        assert!(reservation(&rest[..count]) <= limits.max_buffered_bytes);
+        rest = &rest[count..];
+    }
+    assert!(rest.is_empty());
+
+    // A bound below one block still reads, one block per request.
+    let limits = ReadLimits {
+        max_buffered_bytes: 100,
+        ..limits
+    };
+    let (archive, probe, _) = open_as(&bytes, sender(), limits);
+    let (output, error) = drain(archive.read_range("data", 0..32 * 4096).unwrap(), &probe);
+    assert!(error.is_none());
+    assert_eq!(output, compressible(32));
+    let reads = probe.reads.lock().unwrap()[3..].to_vec();
+    assert_eq!(reads.len(), blocks.len());
+    assert!(
+        reads
+            .iter()
+            .zip(&blocks)
+            .all(|(read, block)| read.1 == block.framed)
+    );
+}
+
+#[test]
+fn encrypted_compressed_blocks_reserve_the_decrypted_bytes() {
+    for encrypted in [true, false] {
+        let bytes = compressed_blocks(4, encrypted);
+        let (archive, probe, mode) = open_as(&bytes, sender(), single_blocks(1, 1 << 20));
+        *mode.lock().unwrap() = Mode::Gated;
+        let block = planned(&archive, 0..4096)[0];
+        assert!(block.framed * 10 < block.output);
+        let mut stream = archive.read_range("data", 0..4096).unwrap();
+        assert!(next(&mut stream).is_pending());
+        let decrypted = if encrypted { block.framed } else { 0 };
+        let expected = block.framed + block.output + (block.framed + decrypted + block.output);
+        assert_eq!(stream.buffered_bytes(), expected, "encrypted {encrypted}");
+        release(&probe, block.offset);
+        let (output, error) = drain(stream, &probe);
+        assert!(error.is_none());
+        assert_eq!(output, compressible(1));
+    }
 }
