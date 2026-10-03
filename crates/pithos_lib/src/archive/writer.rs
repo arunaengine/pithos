@@ -1420,9 +1420,14 @@ impl<W: Write> ArchiveWriter<W> {
             self.validate_required_access_records()?;
             self.seal_recipient_lists()?;
             self.validate_publishable()?;
-            let bytes = directory::encode_complete_directory(&self.directory)?;
             if let Some(snapshot) = &self.append_snapshot {
-                let span = Span::new(self.sink.offset, bytes.len() as u64)?;
+                // Count the directory length without keeping its bytes during validation.
+                let mut counter = CountingSink {
+                    sink: io::sink(),
+                    offset: 0,
+                };
+                directory::encode_directory(&self.directory, &mut counter)?;
+                let span = Span::new(self.sink.offset, counter.offset)?;
                 let child = validated_segment_from_directory(
                     self.version,
                     &self.directory,
@@ -1431,6 +1436,7 @@ impl<W: Write> ArchiveWriter<W> {
                 )?;
                 snapshot.validate_prospective_child(child)?;
             }
+            let bytes = directory::encode_complete_directory(&self.directory)?;
             self.sink
                 .write_all(&bytes)
                 .map_err(SerializationError::from)?;
