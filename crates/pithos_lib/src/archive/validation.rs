@@ -4,8 +4,8 @@ use crate::archive::types::{
     SegmentEntry, Span, ValidatedSegment,
 };
 use crate::error::PithosError;
-use crate::format::block::BlockLocation as FormatBlockLocation;
-use crate::format::directory::{Directory, STANDARD_RELATIONSHIPS};
+use crate::format::block::{BlockIndexEntry, BlockLocation as FormatBlockLocation};
+use crate::format::directory::{BlockSink, Directory, STANDARD_RELATIONSHIPS};
 use crate::format::file_entry::{BlockDataState, FileEntry, FileType};
 use crate::format::header::FormatVersion;
 use std::collections::{BTreeMap, HashSet};
@@ -38,6 +38,108 @@ pub(crate) fn validated_segment_from_directory(
     span: Span,
     parent: Option<Span>,
 ) -> Result<ValidatedSegment, PithosError> {
+    let descriptors = directory
+        .blocks
+        .iter()
+        .map(|(hash, entry)| block_descriptor(version, *hash, entry))
+        .collect::<Result<Vec<_>, _>>()?;
+    segment_from_parts(directory, descriptors, span, parent)
+}
+
+/// Converts the block descriptors of a directory while it is decoded, so the decoded form is
+/// the only copy.
+pub(crate) struct DescriptorList {
+    version: FormatVersion,
+    max_count: usize,
+    descriptors: Vec<(BlockHash, BlockDescriptor)>,
+}
+
+impl DescriptorList {
+    pub(crate) fn new(version: FormatVersion, directory_len: usize) -> Self {
+        Self {
+            version,
+            // A descriptor takes at least 37 bytes: the hash and five one-byte fields.
+            max_count: directory_len / 37,
+            descriptors: Vec::new(),
+        }
+    }
+
+    pub(crate) fn into_descriptors(self) -> Vec<(BlockHash, BlockDescriptor)> {
+        self.descriptors
+    }
+}
+
+impl BlockSink for DescriptorList {
+    fn reserve(&mut self, count: usize) -> Result<(), PithosError> {
+        let count = count.min(self.max_count);
+        self.descriptors
+            .try_reserve_exact(count)
+            .map_err(|_| PithosError::AllocationFailed {
+                field: "block descriptors",
+                size: count as u64,
+            })
+    }
+
+    fn insert(&mut self, hash: [u8; 32], entry: BlockIndexEntry) -> Result<(), PithosError> {
+        self.descriptors
+            .push(block_descriptor(self.version, hash, &entry)?);
+        Ok(())
+    }
+}
+
+fn block_descriptor(
+    version: FormatVersion,
+    hash: [u8; 32],
+    block_index_entry: &BlockIndexEntry,
+) -> Result<(BlockHash, BlockDescriptor), PithosError> {
+    let processing = Processing::from_byte(block_index_entry.flags.0, version)?;
+    if matches!(block_index_entry.location, FormatBlockLocation::Local)
+        && processing.to_byte() & 0x08 != 0
+        && block_index_entry.stored_size < 28
+    {
+        return Err(PithosError::InvalidBlockDescriptor(
+            "encrypted local block payload is shorter than 28 bytes",
+        ));
+    }
+    let stored_size_with_marker =
+        block_index_entry
+            .stored_size
+            .checked_add(4)
+            .ok_or(PithosError::InvalidDirectoryRange {
+                operation: "validate block range",
+            })?;
+    let location = match &block_index_entry.location {
+        FormatBlockLocation::Local => BlockLocation::Local(Span::new(
+            block_index_entry.offset,
+            stored_size_with_marker,
+        )?),
+        FormatBlockLocation::External { url } => {
+            BlockLocation::External(ExternalLocation::new(url))
+        }
+    };
+    Ok((
+        BlockHash(hash),
+        BlockDescriptor {
+            stored_size: block_index_entry.stored_size,
+            original_size: block_index_entry.original_size,
+            processing,
+            location,
+        },
+    ))
+}
+
+/// Builds a segment from a decoded directory and its already converted block descriptors.
+/// The descriptors are sorted by hash and must be unique.
+pub(crate) fn segment_from_parts(
+    directory: &Directory,
+    mut descriptors: Vec<(BlockHash, BlockDescriptor)>,
+    span: Span,
+    parent: Option<Span>,
+) -> Result<ValidatedSegment, PithosError> {
+    descriptors.sort_unstable_by_key(|(hash, _)| *hash);
+    if descriptors.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(PithosError::DuplicateBlockHash);
+    }
     let mut entries = Vec::new();
     let mut entry_ids = HashSet::new();
     for (id, path, file_entry) in directory.files.iter() {
@@ -55,41 +157,6 @@ pub(crate) fn validated_segment_from_directory(
         });
     }
     validate_relationships(directory)?;
-    let mut descriptors = Vec::new();
-    for (hash, block_index_entry) in &directory.blocks {
-        let processing = Processing::from_byte(block_index_entry.flags.0, version)?;
-        if matches!(block_index_entry.location, FormatBlockLocation::Local)
-            && processing.to_byte() & 0x08 != 0
-            && block_index_entry.stored_size < 28
-        {
-            return Err(PithosError::InvalidBlockDescriptor(
-                "encrypted local block payload is shorter than 28 bytes",
-            ));
-        }
-        let stored_size_with_marker = block_index_entry.stored_size.checked_add(4).ok_or(
-            PithosError::InvalidDirectoryRange {
-                operation: "validate block range",
-            },
-        )?;
-        let location = match &block_index_entry.location {
-            FormatBlockLocation::Local => BlockLocation::Local(Span::new(
-                block_index_entry.offset,
-                stored_size_with_marker,
-            )?),
-            FormatBlockLocation::External { url } => {
-                BlockLocation::External(ExternalLocation::new(url))
-            }
-        };
-        descriptors.push((
-            BlockHash(*hash),
-            BlockDescriptor {
-                stored_size: block_index_entry.stored_size,
-                original_size: block_index_entry.original_size,
-                processing,
-                location,
-            },
-        ));
-    }
     let mut relationships = Vec::new();
     let mut relation_names: BTreeMap<u64, String> = BTreeMap::new();
     for (id, name) in &directory.relations {

@@ -54,11 +54,13 @@ pub(crate) fn decode_validated_directory(
     bytes: &[u8],
     limits: &crate::format::limits::DeserializationLimits,
     remaining_block_references: &mut u64,
+    blocks: &mut impl crate::format::directory::BlockSink,
 ) -> Result<crate::format::directory::Directory, crate::error::PithosError> {
     crate::format::directory::decode_complete_directory_with_validation_and_budget(
         bytes,
         limits,
         remaining_block_references,
+        blocks,
         |directory| validate_directory_entries(&directory.files),
     )
 }

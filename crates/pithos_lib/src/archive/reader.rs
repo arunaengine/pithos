@@ -1,6 +1,6 @@
-use super::opener::{ArchiveOpener, OpenSettings};
+use super::opener::{ArchiveOpener, DecodedDirectory, OpenSettings};
 use super::planning::{BlockRequest, PlannedBlock, ReadPlan};
-use super::{AccessProvenance, AppendSnapshot, ArchiveView, FileId, ResolvedAccess, Span};
+use super::{AccessProvenance, AppendSnapshot, ArchiveView, FileId, ResolvedAccess};
 use crate::archive::index::ArchiveIndex;
 use crate::archive::types::{BlockLocation, ContentState, Entry, ExternalLocation, ReadRange};
 #[cfg(feature = "crypt4gh")]
@@ -38,9 +38,9 @@ pub(super) struct DecodedDirectoryCounts {
 }
 
 impl DecodedDirectoryCounts {
-    pub(super) fn record(&mut self, directory: &Directory) {
+    pub(super) fn record(&mut self, directory: &Directory, descriptors: usize) {
         self.entries += directory.files.len() as u64;
-        self.descriptors += directory.blocks.len() as u64;
+        self.descriptors += descriptors as u64;
         self.references += directory
             .files
             .iter()
@@ -787,11 +787,11 @@ pub(super) fn resolve_block_lists(
 /// key id, which new file ids must stay above.
 pub(super) fn validate_piece_keys(
     version: FormatVersion,
-    raw: &[(Directory, Span)],
+    raw: &[DecodedDirectory],
 ) -> Result<Option<u64>, PithosError> {
     let mut file_ids = HashSet::new();
     let mut piece_keys = HashSet::new();
-    for (directory, _) in raw {
+    for DecodedDirectory { directory, .. } in raw {
         for (id, _, file) in directory.files.iter() {
             file_ids.insert(id);
             if let BlockDataState::Pieces(pieces) = &file.block_data {

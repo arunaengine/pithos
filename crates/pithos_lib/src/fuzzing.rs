@@ -35,8 +35,14 @@ pub fn decode_header(data: &[u8]) -> FuzzOutcome {
 pub fn decode_directory(data: &[u8]) -> FuzzOutcome {
     let limits = DeserializationLimits::default();
     let mut remaining_block_references = limits.max_block_references;
-    match crate::archive::decode_validated_directory(data, &limits, &mut remaining_block_references)
-    {
+    let mut blocks: indexmap::IndexMap<[u8; 32], crate::format::block::BlockIndexEntry> =
+        indexmap::IndexMap::new();
+    match crate::archive::decode_validated_directory(
+        data,
+        &limits,
+        &mut remaining_block_references,
+        &mut blocks,
+    ) {
         Ok(_) => FuzzOutcome::Accepted,
         Err(error) => FuzzOutcome::Rejected(classify_archive_error(&error)),
     }

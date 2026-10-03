@@ -1,14 +1,14 @@
 use super::access::ResolvedAccess;
+use super::decode_validated_directory;
 use super::index::build_effective_index;
 use super::reader::{
     AccessKeys, DecodedDirectoryCounts, OpenLimits, OpenOptions, classify_content_availability,
     move_block_keys, remaining_deserialization_limits, resolve_block_lists, resolve_recipients,
     validate_directory_len, validate_piece_keys,
 };
-use super::types::{FileId, Span, ValidatedSegment};
-use super::validation::IndexLimits;
+use super::types::{BlockDescriptor, BlockHash, FileId, Span, ValidatedSegment};
+use super::validation::{DescriptorList, IndexLimits, segment_from_parts};
 use super::view::ArchiveView;
-use super::{decode_validated_directory, validated_segment_from_directory};
 use crate::error::PithosError;
 use crate::format::directory::Directory;
 use crate::format::header::{FileHeader, FormatVersion};
@@ -90,11 +90,19 @@ enum Phase {
     Failed,
 }
 
+/// One decoded directory. Its block descriptors were converted while it was decoded, so the
+/// directory itself holds none.
+pub(super) struct DecodedDirectory {
+    pub(super) directory: Directory,
+    pub(super) descriptors: Vec<(BlockHash, BlockDescriptor)>,
+    pub(super) span: Span,
+}
+
 /// Directories decoded so far, from the terminal one back toward the base.
 struct DecodedChain {
     version: FormatVersion,
     terminal: Span,
-    raw: Vec<(Directory, Span)>,
+    raw: Vec<DecodedDirectory>,
     remaining_block_references: u64,
     directory_hashes: Vec<[u8; 32]>,
 }
@@ -250,16 +258,23 @@ impl ArchiveOpener {
                 let decoded_chain = &mut chain.decoded_chain;
                 let hash = blake3::hash(&response);
                 decoded_chain.directory_hashes.push(*hash.as_bytes());
+                let mut descriptors = DescriptorList::new(decoded_chain.version, response.len());
                 let directory = decode_validated_directory(
                     &response,
                     &limits,
                     &mut decoded_chain.remaining_block_references,
+                    &mut descriptors,
                 )?;
                 drop(response);
+                let descriptors = descriptors.into_descriptors();
                 let next = directory.parent_directory_offset;
                 let span = chain.pending;
-                chain.decoded.record(&directory);
-                chain.decoded_chain.raw.push((directory, span));
+                chain.decoded.record(&directory, descriptors.len());
+                chain.decoded_chain.raw.push(DecodedDirectory {
+                    directory,
+                    descriptors,
+                    span,
+                });
                 chain.child_start = span.start();
                 match next {
                     Some((start, len)) => {
@@ -344,7 +359,7 @@ fn complete_open(
     let maximum_piece_key = validate_piece_keys(version, &raw)?;
 
     let mut first_grants = HashMap::new();
-    for (directory, _) in &raw {
+    for DecodedDirectory { directory, .. } in &raw {
         for (sender, section) in &directory.encryption {
             for (recipient, recipient_section) in &section.recipients {
                 let pair = (*sender, *recipient);
@@ -362,7 +377,7 @@ fn complete_open(
 
     let mut access = ResolvedAccess::new();
     let mut recovery_order = 0usize;
-    for (segment, (directory, _)) in raw.iter().enumerate() {
+    for (segment, DecodedDirectory { directory, .. }) in raw.iter().enumerate() {
         resolve_recipients(
             version,
             directory,
@@ -375,8 +390,12 @@ fn complete_open(
     }
 
     let mut segments: Vec<ValidatedSegment> = Vec::new();
-    for (segment_index, (directory, span)) in raw.into_iter().enumerate() {
-        let mut directory = directory;
+    for (segment_index, decoded) in raw.into_iter().enumerate() {
+        let DecodedDirectory {
+            mut directory,
+            descriptors,
+            span,
+        } = decoded;
         resolve_block_lists(
             &mut directory,
             &mut access,
@@ -386,9 +405,7 @@ fn complete_open(
         let parent = segment_index
             .checked_sub(1)
             .map(|index| segments[index].span);
-        segments.push(validated_segment_from_directory(
-            version, &directory, span, parent,
-        )?);
+        segments.push(segment_from_parts(&directory, descriptors, span, parent)?);
         move_block_keys(&mut directory, &mut access)?;
     }
     let index_limits = IndexLimits {

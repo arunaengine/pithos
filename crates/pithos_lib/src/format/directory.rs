@@ -368,10 +368,46 @@ pub(crate) fn decode_directory<R: Read>(
     decode_directory_with_budget(reader, limits, &mut remaining_block_references)
 }
 
+/// Receives the block descriptors of a directory while it is decoded.
+pub(crate) trait BlockSink {
+    /// Prepares for the declared number of descriptors before the first one is decoded.
+    fn reserve(&mut self, count: usize) -> Result<(), PithosError>;
+    fn insert(&mut self, hash: [u8; 32], entry: BlockIndexEntry) -> Result<(), PithosError>;
+}
+
+impl BlockSink for IndexMap<[u8; 32], BlockIndexEntry> {
+    fn reserve(&mut self, _count: usize) -> Result<(), PithosError> {
+        Ok(())
+    }
+
+    fn insert(&mut self, hash: [u8; 32], entry: BlockIndexEntry) -> Result<(), PithosError> {
+        if self.contains_key(&hash) {
+            return Err(PithosError::DuplicateBlockHash);
+        }
+        IndexMap::insert(self, hash, entry);
+        Ok(())
+    }
+}
+
 pub(crate) fn decode_directory_with_budget<R: Read>(
     reader: &mut R,
     limits: &DeserializationLimits,
     remaining_block_references: &mut u64,
+) -> Result<Directory, PithosError> {
+    let mut blocks = IndexMap::new();
+    let mut directory =
+        decode_directory_with_sink(reader, limits, remaining_block_references, &mut blocks)?;
+    directory.blocks = blocks;
+    Ok(directory)
+}
+
+/// Decodes a directory but hands its block descriptors to `blocks`, so the returned
+/// directory has none.
+fn decode_directory_with_sink<R: Read>(
+    reader: &mut R,
+    limits: &DeserializationLimits,
+    remaining_block_references: &mut u64,
+    blocks: &mut impl BlockSink,
 ) -> Result<Directory, PithosError> {
     let mut identifier = [0; 8];
     reader.read_exact(&mut identifier)?;
@@ -427,14 +463,11 @@ pub(crate) fn decode_directory_with_budget<R: Read>(
         limits.max_block_descriptors,
         "blocks",
     )?;
-    let mut blocks = IndexMap::new();
+    blocks.reserve(block_count)?;
     for _ in 0..block_count {
         let mut hash = [0; 32];
         reader.read_exact(&mut hash)?;
-        if blocks.contains_key(&hash) {
-            return Err(PithosError::DuplicateBlockHash);
-        }
-        blocks.insert(hash, decode_block_index_entry(reader, limits)?);
+        blocks.insert(hash, decode_block_index_entry(reader, limits)?)?;
     }
     let relation_count = bounded_len(
         reader
@@ -477,7 +510,7 @@ pub(crate) fn decode_directory_with_budget<R: Read>(
         identifier,
         parent_directory_offset,
         files,
-        blocks,
+        blocks: IndexMap::new(),
         relations,
         encryption,
         dir_len: reader.read_u64::<BigEndian>()?,
@@ -499,18 +532,24 @@ pub(crate) fn decode_complete_directory_with_validation(
     validate: impl Fn(&Directory) -> Result<(), PithosError>,
 ) -> Result<Directory, PithosError> {
     let mut remaining_block_references = limits.max_block_references;
-    decode_complete_directory_with_validation_and_budget(
+    let mut blocks = IndexMap::new();
+    let mut directory = decode_complete_directory_with_validation_and_budget(
         bytes,
         limits,
         &mut remaining_block_references,
+        &mut blocks,
         validate,
-    )
+    )?;
+    directory.blocks = blocks;
+    Ok(directory)
 }
 
+/// Decodes and checks a complete directory. Its block descriptors go to `blocks`.
 pub(crate) fn decode_complete_directory_with_validation_and_budget(
     bytes: &[u8],
     limits: &DeserializationLimits,
     remaining_block_references: &mut u64,
+    blocks: &mut impl BlockSink,
     validate: impl Fn(&Directory) -> Result<(), PithosError>,
 ) -> Result<Directory, PithosError> {
     if bytes.len() < MIN_DIRECTORY_LEN {
@@ -552,7 +591,8 @@ pub(crate) fn decode_complete_directory_with_validation_and_budget(
         });
     }
     let mut reader = Cursor::new(bytes);
-    let directory = decode_directory_with_budget(&mut reader, limits, remaining_block_references)?;
+    let directory =
+        decode_directory_with_sink(&mut reader, limits, remaining_block_references, blocks)?;
     validate(&directory)?;
     if reader.position() != bytes.len() as u64 {
         return Err(PithosError::DirectoryConsumptionMismatch {
