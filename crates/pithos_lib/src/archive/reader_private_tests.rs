@@ -1170,6 +1170,37 @@ fn missing_or_changed_local_block_markers_fail_when_the_block_is_read() {
 }
 
 #[test]
+fn an_expected_digest_mismatch_fails_before_any_metadata_is_decrypted() {
+    let (_temporary, path) = fixture();
+    rewrite_terminal_directory(&path, |directory| {
+        for section in directory.encryption.values_mut() {
+            for recipient in section.recipients.values_mut() {
+                let RecipientData::Encrypted(bytes) = &mut recipient.recipient_data else {
+                    panic!("fixture grants are encrypted");
+                };
+                *bytes.last_mut().unwrap() ^= 1;
+            }
+        }
+    });
+    let digest = open_without_keys(&path).unwrap().metadata_digest();
+    let open = |digest| {
+        Archive::open(
+            MemorySource::new(Arc::<[u8]>::from(std::fs::read(&path).unwrap())),
+            OpenOptions::default()
+                .with_access_keys(AccessKeys::new().with_key(private("recipient1")))
+                .with_expected_metadata_digest(digest),
+        )
+    };
+    assert!(matches!(open(digest), Err(PithosError::Crypt(_))));
+    let mut wrong = digest;
+    wrong[0] ^= 1;
+    assert!(matches!(
+        open(wrong),
+        Err(PithosError::MetadataDigestMismatch)
+    ));
+}
+
+#[test]
 fn encrypted_local_descriptor_stored_size_has_a_28_byte_minimum() {
     for stored_size in [0, 27] {
         let (_temporary, path) = fixture_with("encrypted descriptor size boundary", 0);
