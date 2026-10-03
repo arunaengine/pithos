@@ -58,46 +58,68 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// One composed file in a single piece that references one 4-byte block `references` times.
-/// Its block list is far larger than everything else in the directory.
-fn one_piece(references: u32) -> Vec<u8> {
+/// One composed file of `pieces` pieces with `blocks` 4-byte blocks each. The blocks are
+/// distinct, or one block repeated. Returns the archive, its content and its directory size.
+fn composed(pieces: u32, blocks: u32, distinct: bool) -> (Vec<u8>, Vec<u8>, usize) {
     let processing = ProcessingOptions::new(true, 0).unwrap();
-    let mut encoder = PieceEncoder::new(1, vec![public_key("recipient1")], processing).unwrap();
     let mut stored = Vec::new();
-    for _ in 0..references {
-        stored.extend(encoder.push(b"same").unwrap());
+    let mut content = Vec::new();
+    let mut sealed = Vec::new();
+    for key_id in 1..=pieces {
+        let mut encoder =
+            PieceEncoder::new(key_id.into(), vec![public_key("recipient1")], processing).unwrap();
+        for block in 0..blocks {
+            let plaintext = if distinct {
+                (key_id * blocks + block).to_be_bytes()
+            } else {
+                *b"same"
+            };
+            stored.extend(encoder.push(&plaintext).unwrap());
+            content.extend_from_slice(&plaintext);
+        }
+        sealed.push(encoder.finish().unwrap());
     }
-    let piece = encoder.finish().unwrap();
     let composition = compose(
         ArchivePath::new("object").unwrap(),
         EntryMetadata::new(0, 0, 0o644),
-        &[piece],
+        &sealed,
     )
     .unwrap();
     let mut archive = composition.header().to_vec();
     archive.extend_from_slice(&stored);
     archive.extend_from_slice(composition.directory());
-    archive
+    (archive, content, composition.directory().len())
 }
 
-/// Opening holds at most two list-sized buffers at once: the directory response and the
-/// decoded sealed list, then the sealed list and its plaintext, then the plaintext and the
-/// decoded list. Keeping the response, copying the decoded list and collecting the keys into a
-/// map through a sorted copy needed more than five.
-#[test]
-fn opening_one_large_piece_holds_no_extra_copies_of_its_block_list() {
-    let references = 100_000;
-    let source = MemorySource::new(one_piece(references));
+/// Opens `archive` and returns the peak bytes allocated while opening.
+fn open_peak(archive: Vec<u8>, content: &[u8]) -> usize {
+    let source = MemorySource::new(archive);
     let options = OpenOptions::default()
         .with_access_keys(AccessKeys::new().with_key(private_key("recipient1")));
     let baseline = CURRENT.load(Ordering::Relaxed);
     PEAK.store(baseline, Ordering::Relaxed);
     let archive = Archive::open(source, options).unwrap();
     let peak = PEAK.load(Ordering::Relaxed) - baseline;
-    let list = references as usize * 64;
-    assert_eq!(archive.entries().len(), 1);
+    let mut output = Vec::new();
+    archive.copy_to("object", &mut output).unwrap();
     assert!(
-        2 * peak < 5 * list,
-        "peak {peak} bytes for a {list}-byte list"
+        output == content,
+        "the opened archive returned other content"
     );
+    peak
+}
+
+/// Opening holds about two copies of the directory at most: the encoded directory with its
+/// decoded form, then the decoded form with the index and the recovered keys. Converting the
+/// directory, copying it into the index and copying the keys into a map needed 4.6 copies.
+#[test]
+fn opening_pieces_holds_about_two_copies_of_the_directory() {
+    for (pieces, blocks, distinct) in [(4, 25_000, true), (1, 100_000, false)] {
+        let (archive, content, directory) = composed(pieces, blocks, distinct);
+        let peak = open_peak(archive, &content);
+        assert!(
+            2 * peak <= 5 * directory,
+            "peak {peak} bytes for a {directory}-byte directory"
+        );
+    }
 }
