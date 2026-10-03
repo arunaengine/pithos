@@ -35,6 +35,15 @@ pub use types::{ArchivePath, ExternalLocation};
 pub(crate) use types::{FileId, Span};
 pub(crate) use validation::validated_segment_from_directory;
 
+/// The metadata digest: BLAKE3 over each directory's BLAKE3 hash, from base to terminal.
+pub(crate) fn metadata_digest(directory_hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for hash in directory_hashes {
+        hasher.update(hash);
+    }
+    *hasher.finalize().as_bytes()
+}
+
 pub(crate) fn decode_validated_directory(
     bytes: &[u8],
     limits: &crate::format::limits::DeserializationLimits,

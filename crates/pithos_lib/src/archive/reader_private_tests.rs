@@ -1697,3 +1697,19 @@ fn a_tampered_piece_fails_before_any_content_is_indexed() {
     });
     assert!(matches!(open_pieces(&path), Err(PithosError::Crypt(_))));
 }
+
+#[test]
+fn an_append_changes_the_metadata_digest() {
+    let (_temporary, path) = fixture();
+    let before = open_path(&path, AccessKeys::new()).metadata_digest();
+    append_empty_directory(&path, None);
+    let after = open_path(&path, AccessKeys::new()).metadata_digest();
+    assert_ne!(before, after);
+    assert!(matches!(
+        Archive::open(
+            MemorySource::new(Arc::<[u8]>::from(std::fs::read(&path).unwrap())),
+            OpenOptions::default().with_expected_metadata_digest(before),
+        ),
+        Err(PithosError::MetadataDigestMismatch)
+    ));
+}

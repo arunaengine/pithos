@@ -486,6 +486,17 @@ data/raw                (too late; parent `data` not yet declared)
 data                    (too late; a descendant already occurred)
 ```
 
+#### 4.3.4 Metadata Digest
+
+The metadata digest of an archive is the BLAKE3 hash of the concatenated 32-byte
+BLAKE3 hashes of each Directory's exact bytes, in selected-chain order from the
+base Directory to the terminal Directory. It is not stored in the archive and is
+the same for both versions. An application MAY keep the digest in storage it
+trusts and supply it when it opens the archive again. A reader given an expected
+digest MUST compare it after validating the Directory framing and before
+decrypting, merging, or otherwise using any metadata, and MUST reject the archive
+on a mismatch. Every append changes the digest.
+
 ### 4.4 File Representation
 
 #### 4.4.1 File Types
@@ -897,7 +908,9 @@ When archiving directory trees:
 ## 7. Security Considerations
 
 Directory CRC-32 detects accidental corruption of the serialized Directory bytes
-it covers; it is not authentication. Pithos 1.0 provides no archive-wide origin
+it covers; it is not authentication. An application that keeps the metadata
+digest (Section 4.3.4) in trusted storage gains metadata integrity for its own
+later reads; the digest does not authenticate archive origin to anyone else. Pithos 1.0 provides no archive-wide origin
 authentication or metadata integrity: an unauthenticated Directory can replace
 both a block hash and its referenced content. AEAD authenticates each encrypted
 value's ciphertext, but its empty AAD does not bind that value to its surrounding

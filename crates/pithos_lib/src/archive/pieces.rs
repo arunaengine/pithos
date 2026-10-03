@@ -364,6 +364,11 @@ impl Composition {
     pub fn archive_len(&self) -> u64 {
         self.archive_len
     }
+
+    /// The digest [`crate::archive::Archive::metadata_digest`] reports for this archive.
+    pub fn metadata_digest(&self) -> [u8; 32] {
+        crate::archive::metadata_digest(&[*blake3::hash(&self.directory).as_bytes()])
+    }
 }
 
 /// Joins pieces, in content order, into an archive with one data file at `path`.

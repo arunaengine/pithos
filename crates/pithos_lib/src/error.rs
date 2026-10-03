@@ -89,6 +89,8 @@ pub enum PithosError {
     PieceKeyIdConflict(u64),
     #[error("invalid piece record")]
     InvalidPieceRecord,
+    #[error("archive metadata does not match the expected digest")]
+    MetadataDigestMismatch,
     #[error("duplicate encoded recipient file id")]
     DuplicateRecipientFileId,
     #[error("reserved processing bits are set: {0:#04x}")]

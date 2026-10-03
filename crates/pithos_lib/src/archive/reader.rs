@@ -186,6 +186,7 @@ pub struct OpenOptions<E = NoExternalBlocks> {
     external: E,
     external_resolver_supplied: bool,
     external_access_policy: Option<Arc<dyn ExternalBlockAccessPolicy>>,
+    expected_metadata_digest: Option<[u8; 32]>,
 }
 
 impl Default for OpenOptions<NoExternalBlocks> {
@@ -196,6 +197,7 @@ impl Default for OpenOptions<NoExternalBlocks> {
             external: NoExternalBlocks,
             external_resolver_supplied: false,
             external_access_policy: None,
+            expected_metadata_digest: None,
         }
     }
 }
@@ -218,7 +220,15 @@ impl<E> OpenOptions<E> {
             external,
             external_resolver_supplied: true,
             external_access_policy: self.external_access_policy,
+            expected_metadata_digest: self.expected_metadata_digest,
         }
+    }
+
+    /// Requires the archive's metadata digest to equal `digest`, for example a value kept in
+    /// trusted storage. A mismatch fails before any metadata is decrypted or used.
+    pub fn with_expected_metadata_digest(mut self, digest: [u8; 32]) -> Self {
+        self.expected_metadata_digest = Some(digest);
+        self
     }
 
     pub fn with_external_access_policy(
@@ -269,6 +279,7 @@ pub struct Archive<S, E = NoExternalBlocks> {
     external_access_policy: Option<Arc<dyn ExternalBlockAccessPolicy>>,
     archive_len: u64,
     version: FormatVersion,
+    metadata_digest: [u8; 32],
     terminal_directory: Span,
     index: ArchiveIndex,
     segments: Vec<ValidatedSegment>,
@@ -305,6 +316,7 @@ where
         let mut visited = HashSet::new();
         let mut decoded = DecodedDirectoryCounts::default();
         let mut remaining_block_references = options.limits.max_accessible_block_references;
+        let mut directory_hashes = Vec::new();
         while let Some((start, len)) = next {
             validate_directory_len(len, options.limits)?;
             if raw.len() as u64 > options.limits.max_parent_directories {
@@ -336,6 +348,7 @@ where
                 });
             }
             let bytes = Zeroizing::new(read_source(&source, start, len, "directory")?);
+            directory_hashes.push(*blake3::hash(&bytes).as_bytes());
             let directory = decode_validated_directory(
                 &bytes,
                 &remaining_deserialization_limits(options.limits, &decoded),
@@ -347,6 +360,14 @@ where
             raw.push((directory, span));
         }
         raw.reverse();
+        directory_hashes.reverse();
+        let metadata_digest = crate::archive::metadata_digest(&directory_hashes);
+        if options
+            .expected_metadata_digest
+            .is_some_and(|expected| expected != metadata_digest)
+        {
+            return Err(PithosError::MetadataDigestMismatch);
+        }
         let maximum_piece_key = validate_piece_keys(version, &raw)?;
 
         let mut first_grants = HashMap::new();
@@ -420,6 +441,7 @@ where
             external_access_policy: options.external_access_policy,
             archive_len,
             version,
+            metadata_digest,
             terminal_directory: Span::new(terminal_start, terminal_len)?,
             index,
             segments,
@@ -429,6 +451,12 @@ where
             limits: options.limits,
             content_availability,
         })
+    }
+
+    /// BLAKE3 over the hashes of every directory, from the base to the terminal directory.
+    /// Keeping it in trusted storage lets a later open detect changed metadata.
+    pub fn metadata_digest(&self) -> [u8; 32] {
+        self.metadata_digest
     }
 
     pub fn entries(&self) -> impl ExactSizeIterator<Item = ArchiveEntry> + '_ {

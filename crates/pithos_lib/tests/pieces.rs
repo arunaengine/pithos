@@ -95,6 +95,41 @@ fn composed_pieces_read_back_as_one_file_with_ranges_across_pieces() {
 }
 
 #[test]
+fn the_composition_digest_guards_the_metadata_on_open() {
+    let parts = vec![encode(1, &content(1, 1500))];
+    let pieces = parts
+        .iter()
+        .map(|(_, piece)| piece.clone())
+        .collect::<Vec<_>>();
+    let digest = compose(
+        ArchivePath::new("object").unwrap(),
+        EntryMetadata::new(1, 2, 0o640),
+        &pieces,
+    )
+    .unwrap()
+    .metadata_digest();
+    let bytes = assemble(&parts);
+    let opened = Archive::open(
+        MemorySource::new(bytes.clone()),
+        OpenOptions::default()
+            .with_access_keys(recipient())
+            .with_expected_metadata_digest(digest),
+    )
+    .unwrap();
+    assert_eq!(opened.metadata_digest(), digest);
+
+    let mut wrong = digest;
+    wrong[0] ^= 1;
+    assert!(matches!(
+        Archive::open(
+            MemorySource::new(bytes),
+            OpenOptions::default().with_expected_metadata_digest(wrong),
+        ),
+        Err(PithosError::MetadataDigestMismatch)
+    ));
+}
+
+#[test]
 fn a_reader_without_a_granted_key_sees_unavailable_content() {
     let parts = vec![encode(1, &content(1, 1500))];
     let bytes = assemble(&parts);
