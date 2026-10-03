@@ -1006,9 +1006,10 @@ the number of blocks.
    flags, including its cipher. Unique-key blocks are never deduplicated.
 6. Store each file's block list decrypted, encrypted under a file key, or, in
    version 1.1, sealed in pieces under piece keys (Section 4.4.2).
-7. Write a directory, including its encryption sections when present. A
-   recipient needs a grant for the file key or for every piece key of each file
-   it may read (Section 4.5.3).
+7. Write a directory, including its encryption sections when present. For
+   encrypted block lists, a recipient needs a grant for the file key or for
+   every piece key of each file it may read (Section 4.5.3). A decrypted block
+   list needs no file-key grant.
 8. Validate complete structure
 
 A version 1.1 writer MAY also join independently written pieces without their
