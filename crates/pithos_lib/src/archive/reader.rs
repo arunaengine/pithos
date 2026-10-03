@@ -1,11 +1,10 @@
 use super::{
-    AccessProvenance, AppendSnapshot, FileId, ResolvedAccess, Span, build_effective_index,
-    decode_validated_directory, validated_segment_from_directory,
+    AccessProvenance, AppendSnapshot, ArchiveView, FileId, ResolvedAccess, Span,
+    build_effective_index, decode_validated_directory, validated_segment_from_directory,
 };
 use crate::archive::index::ArchiveIndex;
 use crate::archive::types::{
-    ArchivePath, BlockHash, BlockLocation, ContentState, Entry, ExternalLocation, ReadRange,
-    ValidatedSegment,
+    BlockHash, BlockLocation, ContentState, Entry, ExternalLocation, ReadRange, ValidatedSegment,
 };
 use crate::archive::validation::IndexLimits;
 use crate::block;
@@ -162,7 +161,7 @@ pub trait ExternalBlockAccessPolicy: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ContentAvailability {
+pub(super) enum ContentAvailability {
     Available,
     MissingAccess,
     Unsupported(ArchiveFeature),
@@ -284,18 +283,7 @@ pub struct Archive<S, E = NoExternalBlocks> {
     source: S,
     external: E,
     external_access_policy: Option<Arc<dyn ExternalBlockAccessPolicy>>,
-    archive_len: u64,
-    version: FormatVersion,
-    metadata_digest: [u8; 32],
-    terminal_directory: Span,
-    index: ArchiveIndex,
-    segments: Vec<ValidatedSegment>,
-    index_limits: IndexLimits,
-    access: ResolvedAccess,
-    #[cfg(feature = "crypt4gh")]
-    access_keys: AccessKeys,
-    limits: OpenLimits,
-    content_availability: BTreeMap<FileId, ContentAvailability>,
+    view: ArchiveView,
 }
 
 impl<S, E> Archive<S, E>
@@ -449,68 +437,51 @@ where
             source,
             external: options.external,
             external_access_policy: options.external_access_policy,
-            archive_len,
-            version,
-            metadata_digest,
-            terminal_directory: Span::new(terminal_start, terminal_len)?,
-            index,
-            segments,
-            index_limits,
-            access,
-            #[cfg(feature = "crypt4gh")]
-            access_keys: options.keys,
-            limits: options.limits,
-            content_availability,
+            view: ArchiveView {
+                archive_len,
+                version,
+                metadata_digest,
+                terminal_directory: Span::new(terminal_start, terminal_len)?,
+                index,
+                segments,
+                index_limits,
+                access,
+                #[cfg(feature = "crypt4gh")]
+                access_keys: options.keys,
+                limits: options.limits,
+                content_availability,
+            },
         })
     }
 
     /// BLAKE3 over the hashes of every directory, from the base to the terminal directory.
     /// Keeping it in trusted storage lets a later open detect changed metadata.
     pub fn metadata_digest(&self) -> [u8; 32] {
-        self.metadata_digest
+        self.view.metadata_digest()
     }
 
     pub fn entries(&self) -> impl ExactSizeIterator<Item = ArchiveEntry> + '_ {
-        self.index
-            .entries()
-            .map(|entry| archive_entry(&self.index, entry, &self.content_availability))
+        self.view.entries()
+    }
+
+    /// The validated metadata, for planning reads without this reader's source.
+    pub fn view(&self) -> &ArchiveView {
+        &self.view
     }
 
     /// Consumes the reader and transfers its validated state to append/grant planning.
     pub(crate) fn into_append_snapshot(self) -> AppendSnapshot {
-        let Self {
-            archive_len,
-            version,
-            terminal_directory,
-            index,
-            segments,
-            index_limits,
-            access,
-            ..
-        } = self;
-        AppendSnapshot::new(
-            archive_len,
-            version,
-            terminal_directory,
-            index,
-            segments,
-            index_limits,
-            access,
-        )
+        self.view.into_append_snapshot()
     }
 
     pub fn entry(&self, path: &str) -> Result<Option<ArchiveEntry>, PithosError> {
-        let path = ArchivePath::new(path)?;
-        Ok(self
-            .index
-            .entry_at_path(&path)
-            .map(|entry| archive_entry(&self.index, entry, &self.content_availability)))
+        self.view.entry(path)
     }
 
     pub fn copy_to<W: Write + ?Sized>(&self, path: &str, sink: &mut W) -> Result<(), PithosError> {
-        let (id, _) = self.content_id(path)?;
+        let (id, _) = self.view.content_id(path)?;
         self.require_content_available(id)?;
-        self.copy_plan(id, self.index.full_file_plan(id)?, sink)
+        self.copy_plan(id, self.view.index.full_file_plan(id)?, sink)
     }
 
     pub fn copy_range_to<W: Write + ?Sized>(
@@ -519,10 +490,10 @@ where
         range: Range<u64>,
         sink: &mut W,
     ) -> Result<(), PithosError> {
-        let (id, size) = self.content_id(path)?;
+        let (id, size) = self.view.content_id(path)?;
         let range = ReadRange::new(range, size)?;
         self.require_content_available(id)?;
-        self.copy_plan(id, self.index.range_plan(id, range)?, sink)
+        self.copy_plan(id, self.view.index.range_plan(id, range)?, sink)
     }
 
     #[cfg(feature = "crypt4gh")]
@@ -531,15 +502,19 @@ where
         path: &str,
         operation: impl FnOnce(FileId, &PrivateKey, &FileKey) -> Result<T, CallbackError>,
     ) -> Result<T, ContentOperationError<CallbackError>> {
-        let (id, _) = self.content_id(path).map_err(ContentOperationError::Core)?;
+        let (id, _) = self
+            .view
+            .content_id(path)
+            .map_err(ContentOperationError::Core)?;
         self.require_content_available(id)
             .map_err(ContentOperationError::Core)?;
         let fresh_key;
-        let (key, key_owner) = match self.access.key(id) {
+        let (key, key_owner) = match self.view.access.key(id) {
             Some(key) => (key, id),
             None => {
                 // A file sealed in pieces has no file key, so the export gets a fresh one.
                 let first_piece = self
+                    .view
                     .access
                     .grant_keys(id)
                     .and_then(|keys| keys.first().map(|(key_id, _)| *key_id))
@@ -550,11 +525,13 @@ where
             }
         };
         let provenance = self
+            .view
             .access
             .provenance(key_owner)
             .ok_or(PithosError::ContentUnavailable)
             .map_err(ContentOperationError::Core)?;
         let reader = self
+            .view
             .access_keys
             .0
             .get(provenance.access_key)
@@ -572,6 +549,7 @@ where
         self.require_content_available(id)
             .map_err(ContentOperationError::Core)?;
         let plan = self
+            .view
             .index
             .full_file_plan(id)
             .map_err(ContentOperationError::Core)?;
@@ -584,29 +562,8 @@ where
         Ok(())
     }
 
-    fn content_id(&self, path: &str) -> Result<(FileId, u64), PithosError> {
-        let path = ArchivePath::new(path)?;
-        let entry = self
-            .index
-            .entry_at_path(&path)
-            .ok_or_else(|| PithosError::FileNotFound(path.as_str().to_owned()))?;
-        let content = entry.entry.content().ok_or_else(|| {
-            PithosError::InvalidBlockDataState("only data/metadata entries have content".into())
-        })?;
-        Ok((entry.id, content.size))
-    }
-
     pub(crate) fn require_content_available(&self, id: FileId) -> Result<(), PithosError> {
-        match self.content_availability.get(&id).copied() {
-            Some(ContentAvailability::Available) => Ok(()),
-            Some(ContentAvailability::MissingAccess) => Err(PithosError::ContentUnavailable),
-            Some(ContentAvailability::Unsupported(feature)) => {
-                Err(PithosError::UnsupportedFeature(feature))
-            }
-            None => Err(PithosError::InvalidBlockDataState(
-                "only data/metadata entries have content".into(),
-            )),
-        }
+        self.view.require_content_available(id)
     }
 
     fn copy_plan<W: Write + ?Sized>(
@@ -627,17 +584,17 @@ where
         id: FileId,
         planned: &super::planning::PlannedBlock,
     ) -> Result<Zeroizing<Vec<u8>>, PithosError> {
-        if planned.descriptor.stored_size > self.limits.max_stored_block_bytes {
+        if planned.descriptor.stored_size > self.view.limits.max_stored_block_bytes {
             return Err(PithosError::LimitExceeded {
                 field: "stored block",
-                limit: self.limits.max_stored_block_bytes,
+                limit: self.view.limits.max_stored_block_bytes,
                 actual: planned.descriptor.stored_size,
             });
         }
-        if planned.descriptor.original_size > self.limits.max_decoded_block_bytes {
+        if planned.descriptor.original_size > self.view.limits.max_decoded_block_bytes {
             return Err(PithosError::LimitExceeded {
                 field: "decoded block",
-                limit: self.limits.max_decoded_block_bytes,
+                limit: self.view.limits.max_decoded_block_bytes,
                 actual: planned.descriptor.original_size,
             });
         }
@@ -674,7 +631,8 @@ where
                     )?,
                     location,
                     expected_len,
-                    self.limits
+                    self.view
+                        .limits
                         .max_stored_block_bytes
                         .checked_add(4)
                         .ok_or_else(|| {
@@ -699,6 +657,7 @@ where
             location: FormatBlockLocation::Local,
         };
         let key = self
+            .view
             .access
             .block_key(id, planned.hash)
             .ok_or(PithosError::ContentUnavailable)?;
@@ -708,8 +667,8 @@ where
             planned.hash.0,
             &meta,
             block::Limits {
-                max_stored_bytes: self.limits.max_stored_block_bytes,
-                max_decoded_bytes: self.limits.max_decoded_block_bytes,
+                max_stored_bytes: self.view.limits.max_stored_block_bytes,
+                max_decoded_bytes: self.view.limits.max_decoded_block_bytes,
             },
         )
     }
@@ -742,7 +701,7 @@ fn entry_kind(
     }
 }
 
-fn archive_entry(
+pub(super) fn archive_entry(
     index: &ArchiveIndex,
     entry: &super::index::IndexedEntry,
     content_availability: &BTreeMap<FileId, ContentAvailability>,

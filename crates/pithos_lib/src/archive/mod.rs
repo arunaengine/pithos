@@ -17,6 +17,7 @@ mod reader_private_tests;
 mod snapshot;
 mod types;
 mod validation;
+mod view;
 mod writer;
 
 pub(crate) use access::{AccessProvenance, ResolvedAccess};
@@ -36,6 +37,7 @@ pub(crate) use snapshot::AppendSnapshot;
 pub use types::{ArchivePath, ExternalLocation};
 pub(crate) use types::{FileId, Span};
 pub(crate) use validation::validated_segment_from_directory;
+pub use view::ArchiveView;
 
 /// The metadata digest: BLAKE3 over each directory's BLAKE3 hash, from base to terminal.
 pub(crate) fn metadata_digest(directory_hashes: &[[u8; 32]]) -> [u8; 32] {
