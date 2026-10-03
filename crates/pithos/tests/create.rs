@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -551,6 +553,22 @@ fn create_block_options_round_trip() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(read_back(&archive, "input.bin"), content, "{options:?}");
+        let aes = if options.contains(&"aes-256-gcm") {
+            0x20
+        } else {
+            0
+        };
+        let unique = if options.contains(&"--unique-keys") {
+            0x10
+        } else {
+            0
+        };
+        let expected = aes | unique;
+        let flags = common::block_flags(&fs::read(&archive).unwrap());
+        assert!(!flags.is_empty());
+        for flag in flags {
+            assert_eq!(flag & 0x30, expected, "{options:?}: flags {flag:#04x}");
+        }
     }
     let _ = fs::remove_dir_all(temporary);
 }

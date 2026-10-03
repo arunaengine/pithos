@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -297,6 +299,11 @@ fn append_files_block_options_round_trip_and_conflicts_leave_the_archive() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
+    let flags = common::block_flags(&fs::read(&archive).unwrap());
+    assert!(!flags.is_empty());
+    for flag in flags {
+        assert_eq!(flag & 0x30, 0x30, "flags {flag:#04x}");
+    }
 
     let read = command()
         .arg("--secret-key")
@@ -308,5 +315,73 @@ fn append_files_block_options_round_trip_and_conflicts_leave_the_archive() {
         .unwrap();
     assert!(read.status.success(), "{}", stderr(&read));
     assert_eq!(read.stdout, b"appended with block options");
+    let _ = fs::remove_dir_all(temporary);
+}
+
+#[test]
+fn append_files_rejects_invalid_block_options_without_mutation() {
+    let temporary = temporary();
+    let input = temporary.join("input.txt");
+    fs::write(&input, b"rejected payload").unwrap();
+    let base = temporary.join("base.txt");
+    fs::write(&base, b"version 1.0 base").unwrap();
+    let legacy = temporary.join("legacy.pith");
+    assert!(
+        command()
+            .arg("--output")
+            .arg(&legacy)
+            .args(["create", "--plain"])
+            .arg(&base)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // A base archive has no grants, so only its header version differs from 1.0.
+    let mut bytes = fs::read(&legacy).unwrap();
+    bytes[4..6].copy_from_slice(&[0x01, 0x00]);
+    fs::write(&legacy, &bytes).unwrap();
+    let current = create_archive(&temporary);
+
+    for (archive, options, message) in [
+        (&legacy, vec!["--unique-keys"], "require format version 1.1"),
+        (
+            &legacy,
+            vec!["--cipher", "aes-256-gcm"],
+            "require format version 1.1",
+        ),
+        (
+            &current,
+            vec!["--block-size", "0"],
+            "invalid fixed block size",
+        ),
+    ] {
+        let original = fs::read(archive).unwrap();
+        let mut append = sender_command();
+        add_recipient(&mut append, "recipient1");
+        let output = append
+            .args(["append", "files", "--file"])
+            .arg(archive)
+            .args(&options)
+            .arg(&input)
+            .output()
+            .unwrap();
+        let message_text = stderr(&output);
+        assert!(!output.status.success(), "{options:?}");
+        assert!(
+            message_text.contains(message),
+            "{options:?}: {message_text}"
+        );
+        assert_eq!(fs::read(archive).unwrap(), original, "{options:?}");
+    }
+
+    let mut append = sender_command();
+    add_recipient(&mut append, "recipient1");
+    let output = append
+        .args(["append", "files", "--file"])
+        .arg(&legacy)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
     let _ = fs::remove_dir_all(temporary);
 }
