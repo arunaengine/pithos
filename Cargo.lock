@@ -1438,6 +1438,7 @@ dependencies = [
  "shake",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "trybuild",
  "x25519-dalek",
