@@ -13,6 +13,7 @@ use crate::error::PithosError;
 use crate::format::directory::Directory;
 use crate::format::header::{FileHeader, FormatVersion};
 use std::collections::{HashMap, HashSet};
+use zeroize::Zeroizing;
 
 /// One exact byte range the opener needs next.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +60,7 @@ pub(super) struct OpenSettings {
 /// let mut opener = ArchiveOpener::new(4096, OpenOptions::default())?;
 /// while let Some(request) = opener.request() {
 ///     let bytes = read(request.offset(), request.len());
-///     opener.feed(request, &bytes)?;
+///     opener.feed(request, bytes)?;
 /// }
 /// let view = opener.finish()?;
 /// # let _ = view;
@@ -137,8 +138,10 @@ impl ArchiveOpener {
     /// Accepts the bytes for the outstanding request.
     ///
     /// A response to another request or of the wrong length is rejected and the request stays
-    /// outstanding. Any other error ends the open.
-    pub fn feed(&mut self, request: ReadRequest, response: &[u8]) -> Result<(), PithosError> {
+    /// outstanding. Any other error ends the open. The opener takes the response so it can
+    /// release a directory's bytes as soon as they are decoded.
+    pub fn feed(&mut self, request: ReadRequest, response: Vec<u8>) -> Result<(), PithosError> {
+        let response = Zeroizing::new(response);
         if self.pending != Some(request) {
             return Err(PithosError::UnexpectedReadResponse);
         }
@@ -179,7 +182,11 @@ impl ArchiveOpener {
         self.next_sequence += 1;
     }
 
-    fn advance(&mut self, phase: Phase, response: &[u8]) -> Result<Phase, PithosError> {
+    fn advance(
+        &mut self,
+        phase: Phase,
+        response: Zeroizing<Vec<u8>>,
+    ) -> Result<Phase, PithosError> {
         match phase {
             Phase::Header => {
                 let header = crate::format::header::decode_header(&mut &response[..])?;
@@ -231,13 +238,14 @@ impl ArchiveOpener {
             Phase::Directories(mut chain) => {
                 let limits = remaining_deserialization_limits(self.settings.limits, &chain.decoded);
                 let decoded_chain = &mut chain.decoded_chain;
-                let hash = blake3::hash(response);
+                let hash = blake3::hash(&response);
                 decoded_chain.directory_hashes.push(*hash.as_bytes());
                 let directory = decode_validated_directory(
-                    response,
+                    &response,
                     &limits,
                     &mut decoded_chain.remaining_block_references,
                 )?;
+                drop(response);
                 let next = directory.parent_directory_offset;
                 let span = chain.pending;
                 chain.decoded.record(&directory);

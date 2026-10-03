@@ -309,13 +309,8 @@ where
         let (settings, external, external_access_policy) = options.into_parts();
         let mut opener = ArchiveOpener::with_settings(archive_len, settings)?;
         while let Some(request) = opener.request() {
-            let response = Zeroizing::new(read_source(
-                &source,
-                request.offset(),
-                request.len(),
-                "directory",
-            )?);
-            opener.feed(request, &response)?;
+            let response = read_source(&source, request.offset(), request.len(), "directory")?;
+            opener.feed(request, response)?;
         }
         let view = opener.finish()?;
         Ok(Self {

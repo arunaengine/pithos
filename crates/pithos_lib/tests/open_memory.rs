@@ -80,10 +80,10 @@ fn one_piece(references: u32) -> Vec<u8> {
     archive
 }
 
-/// Opening holds the directory response plus at most two lists at once: the sealed list and its
-/// plaintext, then the plaintext and the decoded list. That is about three list sizes. Decoding
-/// into a separate list, copying it into an aggregate list and collecting the keys into a map
-/// through a sorted copy needed more than five.
+/// Opening holds at most two list-sized buffers at once: the directory response and the
+/// decoded sealed list, then the sealed list and its plaintext, then the plaintext and the
+/// decoded list. Keeping the response, copying the decoded list and collecting the keys into a
+/// map through a sorted copy needed more than five.
 #[test]
 fn opening_one_large_piece_holds_no_extra_copies_of_its_block_list() {
     let references = 100_000;
@@ -97,7 +97,7 @@ fn opening_one_large_piece_holds_no_extra_copies_of_its_block_list() {
     let list = references as usize * 64;
     assert_eq!(archive.entries().len(), 1);
     assert!(
-        2 * peak < 7 * list,
+        2 * peak < 5 * list,
         "peak {peak} bytes for a {list}-byte list"
     );
 }

@@ -24,7 +24,10 @@ fn drive(
         while let Some(request) = opener.request() {
             requests.push((request.offset(), request.len()));
             let start = request.offset() as usize;
-            opener.feed(request, &bytes[start..start + request.len() as usize])?;
+            opener.feed(
+                request,
+                bytes[start..start + request.len() as usize].to_vec(),
+            )?;
         }
         opener.finish()
     });
@@ -80,29 +83,29 @@ fn feed_rejects_wrong_lengths_unknown_and_repeated_responses() {
     let mut opener = ArchiveOpener::new(len, recipient()).unwrap();
     let header = opener.request().unwrap();
     assert!(matches!(
-        opener.feed(header, &bytes[..5]),
+        opener.feed(header, bytes[..5].to_vec()),
         Err(PithosError::ReadResponseLength {
             expected: 6,
             actual: 5
         })
     ));
     assert!(matches!(
-        opener.feed(header, &bytes[..7]),
+        opener.feed(header, bytes[..7].to_vec()),
         Err(PithosError::ReadResponseLength { .. })
     ));
     assert_eq!(opener.request(), Some(header));
-    opener.feed(header, &bytes[..6]).unwrap();
+    opener.feed(header, bytes[..6].to_vec()).unwrap();
     assert!(matches!(
-        opener.feed(header, &bytes[..6]),
+        opener.feed(header, bytes[..6].to_vec()),
         Err(PithosError::UnexpectedReadResponse)
     ));
 
     let mut other = ArchiveOpener::new(len + 1, OpenOptions::default()).unwrap();
     let other_header = other.request().unwrap();
-    other.feed(other_header, &bytes[..6]).unwrap();
+    other.feed(other_header, bytes[..6].to_vec()).unwrap();
     let foreign = other.request().unwrap();
     assert!(matches!(
-        opener.feed(foreign, &bytes[..12]),
+        opener.feed(foreign, bytes[..12].to_vec()),
         Err(PithosError::UnexpectedReadResponse)
     ));
     let footer = opener.request().unwrap();
@@ -113,13 +116,15 @@ fn feed_rejects_wrong_lengths_unknown_and_repeated_responses() {
         Err(PithosError::OpenIncomplete)
     ));
 
-    opener.feed(footer, &bytes[bytes.len() - 12..]).unwrap();
+    opener
+        .feed(footer, bytes[bytes.len() - 12..].to_vec())
+        .unwrap();
     let directory = opener.request().unwrap();
     let start = directory.offset() as usize;
-    opener.feed(directory, &bytes[start..]).unwrap();
+    opener.feed(directory, bytes[start..].to_vec()).unwrap();
     assert_eq!(opener.request(), None);
     assert!(matches!(
-        opener.feed(directory, &bytes[start..]),
+        opener.feed(directory, bytes[start..].to_vec()),
         Err(PithosError::UnexpectedReadResponse)
     ));
     assert_eq!(opener.finish().unwrap().entries().len(), 1);
