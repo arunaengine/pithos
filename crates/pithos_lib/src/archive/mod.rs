@@ -58,7 +58,7 @@ pub(crate) fn decode_validated_directory(
     )
 }
 pub use writer::{
-    ArchiveWriter, BlockKeyMode, CdcConfig, CreateError, EntryMetadata, EntryReference,
+    ArchiveWriter, BlockKeyMode, CdcConfig, Chunking, CreateError, EntryMetadata, EntryReference,
     FinishError, IncompleteWriter, PayloadCipher, ProcessingOptions, WriteOptions, WriterError,
     WrittenEntry,
 };

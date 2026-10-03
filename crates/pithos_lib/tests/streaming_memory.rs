@@ -1,6 +1,6 @@
 use peak_alloc::PeakAlloc;
 use pithos_lib::archive::{
-    ArchivePath, ArchiveWriter, CdcConfig, EntryMetadata, ProcessingOptions, WriteOptions,
+    ArchivePath, ArchiveWriter, CdcConfig, Chunking, EntryMetadata, ProcessingOptions, WriteOptions,
 };
 use pithos_lib::crypto::PrivateKey;
 use std::io::{Read, Write};
@@ -58,7 +58,8 @@ fn streamed_peak(logical_bytes: u64) -> (u64, u64) {
     PEAK_ALLOC.reset_peak_usage();
     let mut writer = ArchiveWriter::create(
         CountingSink::default(),
-        WriteOptions::new(sender, vec![recipient]).with_cdc(CdcConfig::DEFAULT),
+        WriteOptions::new(sender, vec![recipient])
+            .with_chunking(Chunking::ContentDefined(CdcConfig::DEFAULT)),
     )
     .unwrap();
     writer

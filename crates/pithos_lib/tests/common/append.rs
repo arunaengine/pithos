@@ -3,7 +3,7 @@ use super::{
     keys::{private_key, public_key},
 };
 use pithos_lib::archive::{
-    AccessKeys, AppendOptions, Archive, ArchivePath, ArchiveWriter, CdcConfig, EntryMetadata,
+    AccessKeys, AppendOptions, Archive, ArchivePath, ArchiveWriter, Chunking, EntryMetadata,
     ProcessingOptions, WriteOptions,
 };
 use pithos_lib::fs::{FsError, append_files, grant_readers};
@@ -95,13 +95,13 @@ pub fn append_fixture(temporary: &tempfile::TempDir) -> AppendFixture {
 
 #[allow(dead_code)]
 pub fn append(archive: &Path, sources: Vec<PathBuf>) -> Result<(), FsError> {
-    append_with_cdc(archive, CdcConfig::default(), sources)
+    append_with_chunking(archive, Chunking::default(), sources)
 }
 
 #[allow(dead_code)]
-pub fn append_with_cdc(
+pub fn append_with_chunking(
     archive: &Path,
-    cdc: CdcConfig,
+    chunking: Chunking,
     sources: Vec<PathBuf>,
 ) -> Result<(), FsError> {
     append_files(
@@ -110,7 +110,7 @@ pub fn append_with_cdc(
             private_key("sender"),
             vec![public_key("sender"), public_key("recipient1")],
         )
-        .with_cdc(cdc),
+        .with_chunking(chunking),
         &sources,
     )
     .map(|_| ())

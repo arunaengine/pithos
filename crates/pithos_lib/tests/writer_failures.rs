@@ -2,7 +2,7 @@ mod common;
 
 use common::writer::options;
 use pithos_lib::archive::{
-    AccessKeys, Archive, ArchivePath, ArchiveWriter, CdcConfig, EntryKind, EntryMetadata,
+    AccessKeys, Archive, ArchivePath, ArchiveWriter, CdcConfig, Chunking, EntryKind, EntryMetadata,
     OpenOptions, ProcessingOptions, WriteOptions, WriterError,
 };
 use pithos_lib::crypto::PrivateKey;
@@ -241,7 +241,9 @@ fn input_failure_between_emitted_blocks_poisons_the_writer() {
         .collect();
     let mut writer = ArchiveWriter::create(
         Vec::new(),
-        WriteOptions::new(sender, vec![recipient]).with_cdc(CdcConfig::new(64, 256, 1024).unwrap()),
+        WriteOptions::new(sender, vec![recipient]).with_chunking(Chunking::ContentDefined(
+            CdcConfig::new(64, 256, 1024).unwrap(),
+        )),
     )
     .unwrap();
     assert!(

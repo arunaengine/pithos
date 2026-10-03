@@ -3,7 +3,7 @@ use super::reader::{
     ExternalBlockResolver, OpenLimits, OpenOptions,
 };
 use crate::archive::{
-    ArchivePath, ArchiveWriter, BlockKeyMode, CdcConfig, EntryMetadata, PayloadCipher,
+    ArchivePath, ArchiveWriter, BlockKeyMode, CdcConfig, Chunking, EntryMetadata, PayloadCipher,
     ProcessingOptions, WriteOptions,
 };
 use crate::crypto::{self, FileKey, PrivateKey, PublicKey};
@@ -77,7 +77,7 @@ fn fixture_with_options(
     let path = temp.path().join("archive.pith");
     let options = WriteOptions::new(private("sender"), vec![public("recipient1")]);
     let options = match cdc {
-        Some(cdc) => options.with_cdc(cdc),
+        Some(cdc) => options.with_chunking(Chunking::ContentDefined(cdc)),
         None => options,
     };
     let mut writer = ArchiveWriter::create(File::create(&path).unwrap(), options).unwrap();
@@ -1728,8 +1728,9 @@ fn fixture_with_processing(
 ) -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("processing.pith");
-    let options = WriteOptions::new(private("sender"), vec![public("recipient1")])
-        .with_cdc(CdcConfig::new(64, 256, 1024).unwrap());
+    let options = WriteOptions::new(private("sender"), vec![public("recipient1")]).with_chunking(
+        Chunking::ContentDefined(CdcConfig::new(64, 256, 1024).unwrap()),
+    );
     let mut writer = ArchiveWriter::create(File::create(&path).unwrap(), options).unwrap();
     writer
         .add_file(

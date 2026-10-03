@@ -1,4 +1,4 @@
-use super::{CdcConfig, ProcessingOptions, WriteOptions};
+use super::{Chunking, ProcessingOptions, WriteOptions};
 use crate::crypto::{PrivateKey, PublicKey};
 use crate::error::PithosError;
 
@@ -16,7 +16,7 @@ pub struct AppendOptions {
     /// Private key used to open the existing archive and authorize the append.
     pub(crate) access_key: PrivateKey,
     pub(crate) recipients: Vec<PublicKey>,
-    pub(crate) cdc: CdcConfig,
+    pub(crate) chunking: Chunking,
     pub(crate) durability: AppendDurability,
     pub(crate) processing: ProcessingOptions,
 }
@@ -28,14 +28,15 @@ impl AppendOptions {
         Self {
             access_key,
             recipients,
-            cdc: CdcConfig::default(),
+            chunking: Chunking::default(),
             durability: AppendDurability::Flush,
             processing: ProcessingOptions::append_default(),
         }
     }
 
-    pub fn with_cdc(mut self, cdc: CdcConfig) -> Self {
-        self.cdc = cdc;
+    /// Selects how appended content is split into blocks. The default is [`Chunking::default`].
+    pub fn with_chunking(mut self, chunking: Chunking) -> Self {
+        self.chunking = chunking;
         self
     }
 

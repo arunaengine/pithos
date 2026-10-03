@@ -791,10 +791,11 @@ for each of its piece key IDs.
 
 ## 5. Content Processing
 
-### 5.1 Content-Defined Chunking
+### 5.1 Chunking
 
-Writers MAY use content-defined chunking. Chunking parameters are writer guidance,
-not a compatibility requirement; see Appendix A.
+Writers choose block boundaries. Fixed-size blocks and content-defined chunking
+are both valid. Chunking parameters are writer guidance, not a compatibility
+requirement; see Appendix A.
 
 ### 5.2 Block Hashing
 
@@ -973,7 +974,7 @@ Zstandard versions.
 
 1. Write file header
 2. Process files in correct directory order
-3. Chunk content using content-defined chunking
+3. Split content into blocks (fixed-size or content-defined)
 4. Deduplicate blocks by hash (unique-key blocks never repeat a hash)
 5. Write a directory, including its encryption sections when present
 6. Validate complete structure
@@ -1170,8 +1171,17 @@ Extensions MUST maintain backwards compatibility for reading.
 This appendix suggests writer choices only. It does not define archive
 conformance or reader behavior.
 
-Recommended content-defined chunking parameters are a 64 KB minimum, 128 KB
-average, 512 KB maximum, and 48-byte window.
+**Recommended block size:** fixed 4 MiB (4,194,304 byte) blocks. Every block
+of a file has this size except the last, which may be shorter. Block boundaries
+then depend only on byte offsets, not on how the input was read. This suits
+object storage and multipart uploads, where parts are written independently.
+Content-defined chunking (for example FastCDC) is optional. It can find more
+repeated blocks when content shifts, at the cost of variable block sizes.
+
+**Directory size:** each block adds one descriptor and one block-list entry, so
+the directory grows with the block count. A 5 TiB file at 4 MiB blocks has
+about 1.31 million blocks and roughly 150 MB of directory. Smaller blocks
+increase this size in proportion.
 
 **Recommended compression mapping:** a writer may map ProcessingFlags values
 `1` through `7` to Zstandard levels `1`, `4`, `8`, `11`, `15`, `18`, and `22`,

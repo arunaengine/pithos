@@ -1455,7 +1455,7 @@ fn inspect_ro_crate_zip_archive_manifest<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{CdcConfig, WriteOptions};
+    use crate::archive::{CdcConfig, Chunking, WriteOptions};
     use crate::crypto::PrivateKey;
     use std::cell::Cell;
     use std::io::{Cursor, SeekFrom};
@@ -1519,8 +1519,9 @@ mod tests {
         let sender = PrivateKey::generate();
         let mut writer = ArchiveWriter::create(
             Vec::new(),
-            WriteOptions::new(sender.duplicate(), vec![sender.public_key()])
-                .with_cdc(CdcConfig::new(64, 256, 1024).unwrap()),
+            WriteOptions::new(sender.duplicate(), vec![sender.public_key()]).with_chunking(
+                Chunking::ContentDefined(CdcConfig::new(64, 256, 1024).unwrap()),
+            ),
         )
         .unwrap();
         write_ro_crate_zip_archive(

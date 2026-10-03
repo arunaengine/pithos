@@ -5,7 +5,7 @@ use common::util::{open, private_key};
 use pithos_lib::adapters::ro_crate::{
     RO_CRATE_METADATA_FILE, RoCrateError, RoCrateSource, read_ro_crate_directory,
 };
-use pithos_lib::archive::{AccessKeys, CdcConfig, WriterError};
+use pithos_lib::archive::{AccessKeys, Chunking, WriterError};
 use pithos_lib::error::PithosError;
 use rocraters::ro_crate::graph_vector::GraphVector;
 use rocraters::ro_crate::read::CrateReadError;
@@ -32,7 +32,7 @@ fn loaded_directory_converts_from_retained_sources_after_path_replacement() {
     fs::write(source.join("replacement-only.bin"), b"replacement").unwrap();
 
     let output = temporary.path().join("retained-directory.pith");
-    write_loaded(&output, loaded, CdcConfig::default());
+    write_loaded(&output, loaded, Chunking::default());
     let archive = open(
         &output,
         AccessKeys::new().with_key(private_key("recipient1")),

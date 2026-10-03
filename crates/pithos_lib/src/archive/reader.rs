@@ -67,6 +67,9 @@ impl DecodedDirectoryCounts {
     }
 }
 
+/// The default limit for one decoded block, which also bounds fixed writer block sizes.
+pub(crate) const DEFAULT_MAX_DECODED_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Limits enforced before directory data is retained or expensive metadata work begins.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenLimits {
@@ -96,7 +99,7 @@ impl Default for OpenLimits {
             max_accessible_block_references: 1_000_000,
             max_opaque_metadata_bytes: 64 * 1024 * 1024,
             max_stored_block_bytes: 64 * 1024 * 1024,
-            max_decoded_block_bytes: 64 * 1024 * 1024,
+            max_decoded_block_bytes: DEFAULT_MAX_DECODED_BLOCK_BYTES,
         }
     }
 }

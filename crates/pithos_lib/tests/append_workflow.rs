@@ -1,10 +1,12 @@
 mod common;
 
-use common::append::{WITHHELD_ID, append, append_fixture, append_with_cdc, archive_with_entry};
+use common::append::{
+    WITHHELD_ID, append, append_fixture, append_with_chunking, archive_with_entry,
+};
 use common::util::{open, private_key, public_key};
 use pithos_lib::archive::{
-    AccessKeys, AppendOptions, ArchivePath, ArchiveWriter, BlockKeyMode, CdcConfig, EntryMetadata,
-    PayloadCipher, ProcessingOptions, WriteOptions,
+    AccessKeys, AppendOptions, ArchivePath, ArchiveWriter, BlockKeyMode, CdcConfig, Chunking,
+    EntryMetadata, PayloadCipher, ProcessingOptions, WriteOptions,
 };
 use pithos_lib::error::PithosError;
 use pithos_lib::fs::{FsError, append_files};
@@ -212,9 +214,9 @@ fn append_streams_multiblock_content_and_writes_one_child_directory_without_a_he
         &(0..8192u32).flat_map(u32::to_le_bytes).collect::<Vec<_>>(),
     );
 
-    append_with_cdc(
+    append_with_chunking(
         &fixture.archive,
-        CdcConfig::new(64, 256, 1024).unwrap(),
+        Chunking::ContentDefined(CdcConfig::new(64, 256, 1024).unwrap()),
         vec![source],
     )
     .unwrap();
@@ -248,4 +250,20 @@ fn append_streams_multiblock_content_and_writes_one_child_directory_without_a_he
         .copy_to("multiblock.bin", &mut contents)
         .unwrap();
     assert_eq!(contents.len(), 8192 * 4);
+}
+
+#[test]
+fn appends_reject_invalid_fixed_block_sizes_before_writing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let fixture = append_fixture(&temporary);
+    let original = std::fs::read(&fixture.archive).unwrap();
+    let source = fixture.append_source("appended.txt", b"appended payload");
+    assert!(matches!(
+        append_with_chunking(&fixture.archive, Chunking::Fixed(0), vec![source]),
+        Err(FsError::Core {
+            source: PithosError::InvalidBlockSize(0),
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(&fixture.archive).unwrap(), original);
 }

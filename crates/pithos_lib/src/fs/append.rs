@@ -179,8 +179,13 @@ fn append_files_impl(
             Arc::clone(&mutated),
         );
         sink.seek(SeekFrom::Start(original_len))?;
-        let mut writer =
-            ArchiveWriter::append(sink, wrapping_sender, recipients, options.cdc, snapshot)?;
+        let mut writer = ArchiveWriter::append(
+            sink,
+            wrapping_sender,
+            recipients,
+            options.chunking,
+            snapshot,
+        )?;
         plan.manifest
             .ingest_planned(&plan.ids, &mut writer, options.processing)
             .map_err(writer_error)?;
@@ -258,8 +263,13 @@ pub fn grant_readers(
             Arc::clone(&mutated),
         );
         sink.seek(SeekFrom::Start(original_len))?;
-        let mut writer =
-            ArchiveWriter::append(sink, wrapping_sender, recipients, options.cdc, snapshot)?;
+        let mut writer = ArchiveWriter::append(
+            sink,
+            wrapping_sender,
+            recipients,
+            options.chunking,
+            snapshot,
+        )?;
         writer.grant_file_keys(&ids.iter().copied().map(FileId).collect::<Vec<_>>())?;
         let mut sink = writer.finish().map_err(|error| error.into_parts().0)?;
         if options.durability == AppendDurability::SyncAll {

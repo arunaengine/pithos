@@ -176,6 +176,8 @@ pub enum PithosError {
         avg_size: usize,
         max_size: usize,
     },
+    #[error("invalid fixed block size {0}")]
+    InvalidBlockSize(usize),
     #[error("writer is poisoned")]
     WriterPoisoned,
     #[error("streamed content size overflow")]

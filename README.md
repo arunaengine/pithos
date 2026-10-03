@@ -37,7 +37,7 @@ For the complete command workflow, including extracting entries, see the [CLI gu
 ## What it provides
 
 - Encrypted archive entries with recipient-key access control and per-block integrity verification.
-- Content-defined chunking, optional compression, and indexed reads of complete entries or byte ranges.
+- Fixed 4 MiB blocks by default or optional content-defined chunking, optional compression, and indexed reads of complete entries or byte ranges.
 - Local filesystem operations that avoid symlink traversal and refuse to overwrite existing extracted files.
 - RO-Crate directory and ZIP conversion, plus Crypt4GH export for readable entries.
 

@@ -6,8 +6,8 @@ use pithos_lib::adapters::ro_crate::{
     LoadedRoCrate, read_ro_crate_directory, read_ro_crate_zip, write_ro_crate,
 };
 use pithos_lib::archive::{
-    AccessKeys, Archive, ArchivePath, ArchiveWriter, CdcConfig, EntryMetadata, OpenOptions,
-    ProcessingOptions, WriteOptions,
+    AccessKeys, Archive, ArchivePath, ArchiveWriter, CdcConfig, Chunking, EntryMetadata,
+    OpenOptions, ProcessingOptions, WriteOptions,
 };
 use pithos_lib::crypto::{PrivateKey, PublicKey};
 use pithos_lib::source::FileSource;
@@ -69,7 +69,9 @@ fn write_archive_fixture(path: &Path, sender: PrivateKey, recipient: PublicKey) 
     let payload = support::deterministic_bytes(1, LARGE_MEMBER_BYTES);
     let mut writer = ArchiveWriter::create(
         std::fs::File::create(path).unwrap(),
-        WriteOptions::new(sender, vec![recipient]).with_cdc(CdcConfig::new(64, 256, 1024).unwrap()),
+        WriteOptions::new(sender, vec![recipient]).with_chunking(Chunking::ContentDefined(
+            CdcConfig::new(64, 256, 1024).unwrap(),
+        )),
     )
     .unwrap();
     writer
@@ -107,7 +109,7 @@ fn convert_ro_crate(
 ) -> u64 {
     let mut writer = ArchiveWriter::create(
         support::CountingSink::default(),
-        WriteOptions::new(sender, vec![recipient]).with_cdc(cdc),
+        WriteOptions::new(sender, vec![recipient]).with_chunking(Chunking::ContentDefined(cdc)),
     )
     .unwrap();
     write_ro_crate(&mut writer, loaded, ProcessingOptions::default()).unwrap();

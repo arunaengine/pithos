@@ -447,7 +447,7 @@ mod tests {
             Vec::new(),
             PrivateKey::generate(),
             vec![recipient.public_key()],
-            crate::archive::CdcConfig::default(),
+            crate::archive::Chunking::default(),
             snapshot,
         )
         .unwrap()
@@ -524,7 +524,7 @@ mod tests {
             Vec::new(),
             sender,
             vec![recipient.public_key()],
-            crate::archive::CdcConfig::default(),
+            crate::archive::Chunking::default(),
             snapshot,
         )
         .unwrap();

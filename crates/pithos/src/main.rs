@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pithos_lib::adapters::crypt4gh;
 use pithos_lib::adapters::crypt4gh::Crypt4GHError;
 use pithos_lib::archive::{
-    AccessKeys, AppendDurability, AppendOptions, Archive, ArchiveWriter, CdcConfig, OpenOptions,
-    ProcessingOptions, WriteOptions, WriterError,
+    AccessKeys, AppendDurability, AppendOptions, Archive, ArchiveWriter, CdcConfig, Chunking,
+    OpenOptions, ProcessingOptions, WriteOptions, WriterError,
 };
 use pithos_lib::crypto::{PrivateKey, PublicKey, generate_private_key};
 use pithos_lib::error::PithosError;
@@ -110,7 +110,7 @@ enum PithosCommands {
         #[arg(long)]
         reader_public_keys: Option<Vec<PathBuf>>, // Iterate files and parse all keys
         */
-        /// Set values for content-defined chunking
+        /// Use content-defined chunking with these sizes instead of fixed 4 MiB blocks
         #[arg(long="cdc", value_parser=parse_cdc_input, value_name = "MIN,AVG,MAX")]
         cdc: Option<CdcConfig>,
         /// Create a local, uncompressed, unencrypted base archive
@@ -232,7 +232,7 @@ enum AppendCommands {
         /// Path to Pithos file
         #[arg(short, long, value_name = "PITHOS FILE")]
         file: PathBuf,
-        /// Set values for content-defined chunking
+        /// Use content-defined chunking with these sizes instead of fixed 4 MiB blocks
         #[arg(long = "cdc", value_parser = parse_cdc_input, value_name = "MIN,AVG,MAX")]
         cdc: Option<CdcConfig>,
         /// Durability after publishing the appended directory
@@ -415,7 +415,8 @@ fn run() -> Result<(), PithosCliError> {
 
             let (options, processing) = if plain {
                 (
-                    WriteOptions::base().with_cdc(cdc.unwrap_or_default()),
+                    WriteOptions::base()
+                        .with_chunking(cdc.map(Chunking::ContentDefined).unwrap_or_default()),
                     ProcessingOptions::new(false, 0).expect("zero compression is valid"),
                 )
             } else {
@@ -431,7 +432,8 @@ fn run() -> Result<(), PithosCliError> {
                     .map(|path| load_public_key_from_pem(path))
                     .collect();
                 (
-                    WriteOptions::new(sender_key, reader_keys?).with_cdc(cdc.unwrap_or_default()),
+                    WriteOptions::new(sender_key, reader_keys?)
+                        .with_chunking(cdc.map(Chunking::ContentDefined).unwrap_or_default()),
                     ProcessingOptions::default(),
                 )
             };
@@ -543,7 +545,7 @@ fn run() -> Result<(), PithosCliError> {
                 append_files(
                     &file,
                     AppendOptions::new(sender_key, reader_keys)
-                        .with_cdc(cdc.unwrap_or_default())
+                        .with_chunking(cdc.map(Chunking::ContentDefined).unwrap_or_default())
                         .with_durability(durability.into()),
                     &files,
                 )?;

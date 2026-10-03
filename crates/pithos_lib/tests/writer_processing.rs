@@ -1,8 +1,8 @@
 mod common;
 
 use pithos_lib::archive::{
-    AccessKeys, Archive, ArchivePath, ArchiveWriter, CdcConfig, EntryMetadata, OpenOptions,
-    ProcessingOptions, WriteOptions,
+    AccessKeys, Archive, ArchivePath, ArchiveWriter, CdcConfig, Chunking, EntryMetadata,
+    OpenOptions, ProcessingOptions, WriteOptions,
 };
 use pithos_lib::crypto::PrivateKey;
 use pithos_lib::source::MemorySource;
@@ -15,8 +15,9 @@ fn repeated_identical_chunks_round_trip_in_order() {
     let data = vec![0u8; 2 * 1024];
     let mut writer = ArchiveWriter::create(
         Vec::new(),
-        WriteOptions::new(sender, vec![reader.public_key()])
-            .with_cdc(CdcConfig::new(64, 256, 1024).unwrap()),
+        WriteOptions::new(sender, vec![reader.public_key()]).with_chunking(
+            Chunking::ContentDefined(CdcConfig::new(64, 256, 1024).unwrap()),
+        ),
     )
     .unwrap();
     writer

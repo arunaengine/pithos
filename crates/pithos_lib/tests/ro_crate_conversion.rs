@@ -3,7 +3,7 @@ mod common;
 use common::ro_crate::{metadata, write_loaded, write_raw_zip};
 use common::util::{open, private_key};
 use pithos_lib::adapters::ro_crate::{read_ro_crate_directory, read_ro_crate_zip};
-use pithos_lib::archive::{AccessKeys, ArchiveEntry, CdcConfig, EntryKind};
+use pithos_lib::archive::{AccessKeys, ArchiveEntry, Chunking, EntryKind};
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
@@ -61,12 +61,12 @@ fn typed_directory_and_zip_conversion_have_semantic_parity_and_extract() {
     write_loaded(
         &directory_output,
         read_ro_crate_directory(&source).unwrap(),
-        CdcConfig::default(),
+        Chunking::default(),
     );
     write_loaded(
         &zip_output,
         read_ro_crate_zip(&zip).unwrap(),
-        CdcConfig::default(),
+        Chunking::default(),
     );
 
     assert_eq!(

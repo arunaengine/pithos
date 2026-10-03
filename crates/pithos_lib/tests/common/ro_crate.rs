@@ -1,7 +1,7 @@
 use super::keys::{private_key, public_key};
 use pithos_lib::adapters::ro_crate::{LoadedRoCrate, RoCrateError, write_ro_crate};
 use pithos_lib::archive::{
-    ArchivePath, ArchiveWriter, CdcConfig, EntryMetadata, ProcessingOptions, WriteOptions,
+    ArchivePath, ArchiveWriter, Chunking, EntryMetadata, ProcessingOptions, WriteOptions,
 };
 use std::fs::{self, File};
 use std::path::Path;
@@ -84,10 +84,11 @@ pub fn write_raw_zip(path: &Path, entries: &[(&[u8], &[u8], u32)]) {
 }
 
 #[allow(dead_code)]
-pub fn write_loaded(output: &Path, loaded: LoadedRoCrate, cdc: CdcConfig) {
+pub fn write_loaded(output: &Path, loaded: LoadedRoCrate, chunking: Chunking) {
     let mut writer = ArchiveWriter::create(
         File::create(output).unwrap(),
-        WriteOptions::new(private_key("sender"), vec![public_key("recipient1")]).with_cdc(cdc),
+        WriteOptions::new(private_key("sender"), vec![public_key("recipient1")])
+            .with_chunking(chunking),
     )
     .unwrap();
     write_ro_crate(

@@ -7,7 +7,7 @@ use common::util::{open, private_key};
 use pithos_lib::adapters::ro_crate::{
     RO_CRATE_METADATA_FILE, RoCrateError, RoCrateSource, read_ro_crate_zip,
 };
-use pithos_lib::archive::{AccessKeys, CdcConfig, EntryKind, WriterError};
+use pithos_lib::archive::{AccessKeys, CdcConfig, Chunking, EntryKind, WriterError};
 use pithos_lib::error::PithosError;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -47,7 +47,7 @@ fn loaded_zip_converts_from_retained_open_archive_after_path_replacement() {
     );
 
     let output = temporary.path().join("retained-zip.pith");
-    write_loaded(&output, loaded, CdcConfig::default());
+    write_loaded(&output, loaded, Chunking::default());
     let archive = open(
         &output,
         AccessKeys::new().with_key(private_key("recipient1")),
@@ -208,7 +208,7 @@ fn typed_zip_conversion_streams_large_multiblock_member_and_round_trips() {
     write_loaded(
         &output,
         read_ro_crate_zip(&zip).unwrap(),
-        CdcConfig::new(64, 256, 1024).unwrap(),
+        Chunking::ContentDefined(CdcConfig::new(64, 256, 1024).unwrap()),
     );
     let archive = open(
         &output,
@@ -421,7 +421,7 @@ fn parser_preserves_a_synthetic_zip_fixture_graph_source_and_permissions() {
     assert!(!loaded.ro_crate().graph.is_empty());
 
     let output = temporary.path().join("fixture.pith");
-    write_loaded(&output, loaded, CdcConfig::default());
+    write_loaded(&output, loaded, Chunking::default());
     let archive = open(
         &output,
         AccessKeys::new().with_key(private_key("recipient1")),

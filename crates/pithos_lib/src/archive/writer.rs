@@ -4,6 +4,7 @@ use crate::archive::path_validation::{
     validate_directory_entry_hierarchy_complete, validate_directory_entry_hierarchy_with_snapshot,
     validate_new_candidate_with_snapshot,
 };
+use crate::archive::reader::DEFAULT_MAX_DECODED_BLOCK_BYTES;
 use crate::archive::types::Processing;
 use crate::archive::validation::validate_relationships;
 use crate::archive::{AppendSnapshot, ArchivePath, FileId, Span, validated_segment_from_directory};
@@ -75,6 +76,100 @@ impl CdcConfig {
 impl Default for CdcConfig {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+/// How streamed content is split into blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Chunking {
+    /// Blocks of exactly this many bytes. Only the last block of a file may be shorter.
+    /// The size must be between 1 byte and the default reader limit for one decoded block.
+    Fixed(usize),
+    /// FastCDC boundaries chosen from the content, so shifted content can still deduplicate.
+    ContentDefined(CdcConfig),
+}
+
+impl Chunking {
+    /// The default fixed block size of 4 MiB.
+    pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+
+    pub(crate) fn validate(self) -> Result<(), PithosError> {
+        match self {
+            Self::Fixed(size) => validate_block_size(size),
+            Self::ContentDefined(_) => Ok(()),
+        }
+    }
+}
+
+impl Default for Chunking {
+    fn default() -> Self {
+        Self::Fixed(Self::DEFAULT_BLOCK_SIZE)
+    }
+}
+
+pub(crate) fn validate_block_size(size: usize) -> Result<(), PithosError> {
+    if size == 0 || size as u64 > DEFAULT_MAX_DECODED_BLOCK_BYTES {
+        return Err(PithosError::InvalidBlockSize(size));
+    }
+    Ok(())
+}
+
+/// Splits streamed content into block plaintexts.
+enum Chunker<R: Read> {
+    Fixed {
+        content: R,
+        size: usize,
+        block: Zeroizing<Vec<u8>>,
+    },
+    ContentDefined {
+        stream: StreamCDC<R>,
+        block: Zeroizing<Vec<u8>>,
+    },
+}
+
+impl<R: Read> Chunker<R> {
+    fn new(content: R, chunking: Chunking) -> Self {
+        match chunking {
+            Chunking::Fixed(size) => Self::Fixed {
+                content,
+                size,
+                block: Zeroizing::new(Vec::new()),
+            },
+            Chunking::ContentDefined(cdc) => Self::ContentDefined {
+                stream: StreamCDC::with_level(
+                    content,
+                    cdc.min_size,
+                    cdc.avg_size,
+                    cdc.max_size,
+                    Normalization::Level1,
+                ),
+                block: Zeroizing::new(Vec::new()),
+            },
+        }
+    }
+
+    /// Returns the next block, or `None` at the end of the content.
+    fn next_block(&mut self) -> Result<Option<&[u8]>, PithosError> {
+        match self {
+            Self::Fixed {
+                content,
+                size,
+                block,
+            } => {
+                // Reserving the whole block once keeps plaintext from being copied on growth.
+                block.clear();
+                block.reserve_exact(*size);
+                content.by_ref().take(*size as u64).read_to_end(block)?;
+                Ok((!block.is_empty()).then_some(block.as_slice()))
+            }
+            Self::ContentDefined { stream, block } => match stream.next() {
+                Some(chunk) => {
+                    *block = Zeroizing::new(chunk?.data);
+                    Ok(Some(block.as_slice()))
+                }
+                None => Ok(None),
+            },
+        }
     }
 }
 
@@ -234,31 +329,33 @@ enum WriteMode {
 /// Creation options for a base or encrypted archive.
 pub struct WriteOptions {
     mode: WriteMode,
-    cdc: CdcConfig,
+    chunking: Chunking,
 }
 
 impl WriteOptions {
     pub fn new(sender: PrivateKey, recipients: Vec<PublicKey>) -> Self {
         Self {
             mode: WriteMode::Encrypted { sender, recipients },
-            cdc: CdcConfig::default(),
+            chunking: Chunking::default(),
         }
     }
 
     pub fn base() -> Self {
         Self {
             mode: WriteMode::Base,
-            cdc: CdcConfig::default(),
+            chunking: Chunking::default(),
         }
     }
 
-    pub fn with_cdc(mut self, cdc: CdcConfig) -> Self {
-        self.cdc = cdc;
+    /// Selects how content is split into blocks. The default is [`Chunking::default`].
+    pub fn with_chunking(mut self, chunking: Chunking) -> Self {
+        self.chunking = chunking;
         self
     }
 
     /// Check all creation metadata before taking ownership of an output sink.
     pub fn validate(&self) -> Result<(), PithosError> {
+        self.chunking.validate()?;
         if let WriteMode::Encrypted { recipients, .. } = &self.mode {
             if recipients.is_empty() {
                 return Err(PithosError::WriterRequiresRecipient);
@@ -595,7 +692,7 @@ impl<W: Write> Write for CountingSink<W> {
 pub struct ArchiveWriter<W: Write> {
     mode: ArchiveWriterMode,
     version: FormatVersion,
-    cdc: CdcConfig,
+    chunking: Chunking,
     sink: CountingSink<W>,
     directory: Directory,
     poisoned: bool,
@@ -632,7 +729,7 @@ impl<W: Write> ArchiveWriter<W> {
         if let Err(error) = options.validate() {
             return Err(CreateError { error, sink });
         }
-        let WriteOptions { mode, cdc } = options;
+        let WriteOptions { mode, chunking } = options;
         let (mode, encryption) = match mode {
             WriteMode::Base => (ArchiveWriterMode::Base, IndexMap::new()),
             WriteMode::Encrypted { sender, recipients } => {
@@ -659,7 +756,7 @@ impl<W: Write> ArchiveWriter<W> {
         Ok(Self {
             mode,
             version: FormatVersion::CURRENT,
-            cdc,
+            chunking,
             sink,
             directory,
             poisoned: false,
@@ -678,10 +775,12 @@ impl<W: Write> ArchiveWriter<W> {
         sink: W,
         sender: PrivateKey,
         recipients: Vec<PublicKey>,
-        cdc: CdcConfig,
+        chunking: Chunking,
         snapshot: AppendSnapshot,
     ) -> Result<Self, PithosError> {
-        WriteOptions::new(sender.duplicate(), recipients.clone()).validate()?;
+        WriteOptions::new(sender.duplicate(), recipients.clone())
+            .with_chunking(chunking)
+            .validate()?;
         let sender = sender.into_dalek_static_secret();
         let recipients = recipients
             .into_iter()
@@ -698,7 +797,7 @@ impl<W: Write> ArchiveWriter<W> {
         Ok(Self {
             mode: ArchiveWriterMode::Encrypted { sender },
             version: snapshot.version(),
-            cdc,
+            chunking,
             sink: CountingSink {
                 sink,
                 offset: snapshot.archive_len(),
@@ -916,22 +1015,17 @@ impl<W: Write> ArchiveWriter<W> {
         }
         processing.validate_for(self.version)?;
         let mut delta = self.stage_entry(file_type, path, metadata, 0, None)?;
-        let mut stream = StreamCDC::with_level(
-            content,
-            self.cdc.min_size,
-            self.cdc.avg_size,
-            self.cdc.max_size,
-            Normalization::Level1,
-        );
+        let mut chunker = Chunker::new(content, self.chunking);
         let mut size = 0u64;
         let mut block_references = HashMap::new();
-        for chunk in &mut stream {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => return self.poison(error.into()),
+        loop {
+            let chunk_data = match chunker.next_block() {
+                Ok(Some(chunk_data)) => chunk_data,
+                Ok(None) => break,
+                Err(error) => return self.poison(error),
             };
-            let chunk_data = Zeroizing::new(chunk.data);
-            size = match size.checked_add(chunk.length as u64) {
+            let chunk_len = chunk_data.len() as u64;
+            size = match size.checked_add(chunk_len) {
                 Some(size) => size,
                 None => return self.poison(PithosError::WriterSizeOverflow),
             };
@@ -941,7 +1035,7 @@ impl<W: Write> ArchiveWriter<W> {
             };
             let encoded = match self
                 .runtime
-                .encode_block(&chunk_data, processing.flags(), nonce)
+                .encode_block(chunk_data, processing.flags(), nonce)
             {
                 Ok(encoded) => encoded,
                 Err(error) => return self.poison(error),
@@ -960,11 +1054,11 @@ impl<W: Write> ArchiveWriter<W> {
                 return self.poison(error);
             }
             if let Some(existing) = self.directory.blocks.get(&hash) {
-                if existing.original_size != chunk.length as u64 {
+                if existing.original_size != chunk_len {
                     return self.poison(PithosError::BlockIndexConflict {
                         hash,
                         existing_original_size: existing.original_size,
-                        new_original_size: chunk.length as u64,
+                        new_original_size: chunk_len,
                     });
                 }
                 continue;
@@ -974,21 +1068,21 @@ impl<W: Write> ArchiveWriter<W> {
                 .as_ref()
                 .and_then(|snapshot| snapshot.descriptor(crate::archive::types::BlockHash(hash)))
             {
-                if existing.original_size != chunk.length as u64 {
+                if existing.original_size != chunk_len {
                     return self.poison(PithosError::BlockIndexConflict {
                         hash,
                         existing_original_size: existing.original_size,
-                        new_original_size: chunk.length as u64,
+                        new_original_size: chunk_len,
                     });
                 }
                 continue;
             }
             if let Some(existing) = delta.descriptors.get(&hash) {
-                if existing.original_size != chunk.length as u64 {
+                if existing.original_size != chunk_len {
                     return self.poison(PithosError::BlockIndexConflict {
                         hash,
                         existing_original_size: existing.original_size,
-                        new_original_size: chunk.length as u64,
+                        new_original_size: chunk_len,
                     });
                 }
                 continue;
@@ -999,7 +1093,7 @@ impl<W: Write> ArchiveWriter<W> {
                     Ok(size) => size,
                     Err(_) => return self.poison(PithosError::WriterSizeOverflow),
                 },
-                original_size: chunk.length as u64,
+                original_size: chunk_len,
                 flags: encoded.flags,
                 location: BlockLocation::Local,
             };
@@ -1637,7 +1731,9 @@ mod tests {
     fn content_writer(failure: Option<(RuntimeOperation, usize)>) -> ArchiveWriter<Vec<u8>> {
         ArchiveWriter::with_test_runtime(
             Vec::new(),
-            deterministic_options().with_cdc(CdcConfig::new(64, 256, 1024).unwrap()),
+            deterministic_options().with_chunking(Chunking::ContentDefined(
+                CdcConfig::new(64, 256, 1024).unwrap(),
+            )),
             Box::new(TestRuntime::new(failure)),
             0,
         )
@@ -1990,7 +2086,7 @@ mod tests {
             Vec::new(),
             PrivateKey::generate(),
             vec![sender.public_key()],
-            CdcConfig::default(),
+            Chunking::default(),
             snapshot,
         )
         .unwrap();
@@ -2233,7 +2329,7 @@ mod tests {
             Vec::new(),
             sender,
             vec![recipient.public_key()],
-            CdcConfig::default(),
+            Chunking::default(),
             snapshot,
         )
         .unwrap();
@@ -2317,7 +2413,7 @@ mod tests {
             Vec::new(),
             PrivateKey::generate(),
             vec![recipient],
-            CdcConfig::default(),
+            Chunking::default(),
             snapshot,
         )
         .unwrap();
@@ -2369,5 +2465,72 @@ mod tests {
             writer.prepare_planned_ids(&[u64::MAX, 0]),
             Err(WriterError::Pithos(PithosError::FileIdExhausted))
         ));
+    }
+
+    /// Yields one byte per read call.
+    struct ByteReader<'a>(&'a [u8]);
+
+    impl Read for ByteReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match (self.0.split_first(), buffer.first_mut()) {
+                (Some((first, rest)), Some(target)) => {
+                    *target = *first;
+                    self.0 = rest;
+                    Ok(1)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_blocks_ignore_read_sizes_and_end_with_one_short_block() {
+        fn blocks(content: impl Read) -> Vec<([u8; 32], u64)> {
+            let options = options().with_chunking(Chunking::Fixed(1000));
+            let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+            writer
+                .add_file(
+                    ArchivePath::new("data").unwrap(),
+                    EntryMetadata::new(0, 0, 0o644),
+                    ProcessingOptions::new(true, 0).unwrap(),
+                    None,
+                    content,
+                )
+                .unwrap();
+            let blocks = writer.directory.blocks.iter();
+            blocks
+                .map(|(hash, block)| (*hash, block.original_size))
+                .collect()
+        }
+        let content = (0..2500u32)
+            .map(|index| (index * 7) as u8)
+            .collect::<Vec<_>>();
+        for content in [&content[..], &content[..2000]] {
+            let expected = content
+                .chunks(1000)
+                .map(|chunk| (*blake3::hash(chunk).as_bytes(), chunk.len() as u64))
+                .collect::<Vec<_>>();
+            assert_eq!(blocks(Cursor::new(content)), expected);
+            assert_eq!(blocks(ByteReader(content)), expected);
+        }
+    }
+
+    #[test]
+    fn fixed_block_sizes_are_validated_before_header_output() {
+        assert_eq!(
+            WriteOptions::base().chunking,
+            Chunking::Fixed(4 * 1024 * 1024)
+        );
+        let largest = 64 * 1024 * 1024;
+        for size in [0, largest + 1] {
+            let options = options().with_chunking(Chunking::Fixed(size));
+            let error = ArchiveWriter::create(Vec::new(), options).err().unwrap();
+            assert!(
+                matches!(error.error(), PithosError::InvalidBlockSize(actual) if *actual == size)
+            );
+            assert!(error.into_incomplete().is_empty());
+        }
+        let options = options().with_chunking(Chunking::Fixed(largest));
+        assert!(ArchiveWriter::create(Vec::new(), options).is_ok());
     }
 }
