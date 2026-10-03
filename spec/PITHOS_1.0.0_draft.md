@@ -767,7 +767,8 @@ count followed by that many ULEB128 `file_id` and `file_key[32]` pairs. A
 repeated file ID is valid only when it has the same file key; readers MUST
 reject a conflicting duplicate file ID and file key. In version 1.1 the
 `file_id` field may also hold a piece key ID; its `file_key` is then that
-piece's key.
+piece's key. Access to a file sealed in pieces therefore needs one record
+for each of its piece key IDs.
 
 ## 5. Content Processing
 

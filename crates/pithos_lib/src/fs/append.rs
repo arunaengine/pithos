@@ -356,7 +356,7 @@ fn validate_grant_ids(snapshot: &AppendSnapshot, ids: &[u64]) -> Result<(), Pith
         if !unique.insert(*id) {
             return Err(PithosError::DuplicateRecipientFileId);
         }
-        snapshot.with_file_key(FileId(*id), |_| ())?;
+        snapshot.with_grant_keys(FileId(*id), |_| ())?;
     }
     Ok(())
 }

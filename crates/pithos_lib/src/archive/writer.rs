@@ -797,19 +797,22 @@ impl<W: Write> ArchiveWriter<W> {
             .append_snapshot
             .as_ref()
             .ok_or(PithosError::GrantRequiresAppendSnapshot)?;
+        let mut requested_ids = HashSet::with_capacity(ids.len());
         let mut granted_ids = HashSet::with_capacity(ids.len());
         for id in ids {
-            if !granted_ids.insert(id.0) {
+            if !requested_ids.insert(id.0) {
                 return Err(PithosError::DuplicateRecipientFileId);
             }
-            snapshot.with_file_key(*id, |_| ())?;
+            snapshot.with_grant_keys(*id, |keys| {
+                granted_ids.extend(keys.iter().map(|(key_id, _)| key_id.0));
+            })?;
         }
         for section in self.directory.encryption.values_mut() {
             for recipient in section.recipients.values_mut() {
                 let RecipientData::Decrypted(records) = &mut recipient.recipient_data else {
                     return Err(PithosError::WriterUnsealedRecipientList);
                 };
-                reserve(records, ids.len(), "recipient access records")?;
+                reserve(records, granted_ids.len(), "recipient access records")?;
             }
         }
         let mut recipients = self
@@ -819,13 +822,16 @@ impl<W: Write> ArchiveWriter<W> {
             .flat_map(|section| section.recipients.values_mut())
             .collect::<Vec<_>>();
         for id in ids {
-            snapshot.with_file_key(*id, |key| {
-                let record_key = Zeroizing::new(*key.expose_for_protocol());
-                for recipient in &mut recipients {
-                    let RecipientData::Decrypted(records) = &mut recipient.recipient_data else {
-                        unreachable!("recipient lists were validated before grant publication");
-                    };
-                    records.push((id.0, *record_key));
+            snapshot.with_grant_keys(*id, |keys| {
+                for (key_id, key) in keys {
+                    let record_key = Zeroizing::new(*key.expose_for_protocol());
+                    for recipient in &mut recipients {
+                        let RecipientData::Decrypted(records) = &mut recipient.recipient_data
+                        else {
+                            unreachable!("recipient lists were validated before grant publication");
+                        };
+                        records.push((key_id.0, *record_key));
+                    }
                 }
             })?;
         }

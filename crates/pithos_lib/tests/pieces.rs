@@ -2,8 +2,8 @@ mod common;
 
 use common::util::{private_key, public_key};
 use pithos_lib::archive::{
-    AccessKeys, Archive, ArchivePath, EntryKind, EntryMetadata, OpenOptions, Piece, PieceEncoder,
-    ProcessingOptions, compose,
+    AccessKeys, AppendOptions, Archive, ArchivePath, EntryKind, EntryMetadata, OpenOptions, Piece,
+    PieceEncoder, ProcessingOptions, compose,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
@@ -211,4 +211,28 @@ fn piece_records_round_trip_and_reject_damage() {
             Err(PithosError::InvalidPieceRecord)
         ));
     }
+}
+
+#[test]
+fn a_reader_grant_for_a_composed_file_carries_every_piece_key() {
+    let first = content(4, 1200);
+    let second = content(5, 800);
+    let parts = vec![encode(2, &first), encode(3, &second)];
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("composed.pith");
+    std::fs::write(&path, assemble(&parts)).unwrap();
+
+    pithos_lib::fs::grant_readers(
+        &path,
+        AppendOptions::new(private_key("recipient1"), vec![public_key("recipient2")]),
+        &[0],
+    )
+    .unwrap();
+    let archive = open(
+        std::fs::read(&path).unwrap(),
+        AccessKeys::new().with_key(private_key("recipient2")),
+    );
+    let mut output = Vec::new();
+    archive.copy_to("object", &mut output).unwrap();
+    assert_eq!(output, [first, second].concat());
 }

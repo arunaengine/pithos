@@ -242,28 +242,29 @@ impl AppendSnapshot {
         Ok(())
     }
 
-    /// Borrows an opaque, zeroizing recovered file key only for content entries.
-    pub(crate) fn with_file_key<T>(
+    /// Borrows the keys a reader grant for content entry `id` must carry.
+    pub(crate) fn with_grant_keys<T>(
         &self,
         id: FileId,
-        operation: impl FnOnce(&FileKey) -> T,
+        operation: impl FnOnce(&[(FileId, &FileKey)]) -> T,
     ) -> Result<T, PithosError> {
+        self.ensure_content_entry(id)?;
+        self.access
+            .grant_keys(id)
+            .map(|keys| operation(&keys))
+            .ok_or(PithosError::SnapshotContentUnavailable(id.0))
+    }
+
+    fn ensure_content_entry(&self, id: FileId) -> Result<(), PithosError> {
         let entry = self
             .entries
             .get(&id)
             .ok_or(PithosError::SnapshotFileIdNotFound(id.0))?;
         match entry.kind {
-            SnapshotEntryKind::Directory => {
-                return Err(PithosError::SnapshotDirectoryHasNoContent(id.0));
-            }
-            SnapshotEntryKind::Symlink => {
-                return Err(PithosError::SnapshotSymlinkHasNoContent(id.0));
-            }
-            SnapshotEntryKind::File | SnapshotEntryKind::Metadata => {}
+            SnapshotEntryKind::Directory => Err(PithosError::SnapshotDirectoryHasNoContent(id.0)),
+            SnapshotEntryKind::Symlink => Err(PithosError::SnapshotSymlinkHasNoContent(id.0)),
+            SnapshotEntryKind::File | SnapshotEntryKind::Metadata => Ok(()),
         }
-        self.access
-            .with_file_key(id, operation)
-            .ok_or(PithosError::SnapshotContentUnavailable(id.0))
     }
 }
 
@@ -364,7 +365,7 @@ mod tests {
 
         let (bytes, _sender, recipient) = archive_with_entries();
         let snapshot = consume(open(bytes, AccessKeys::new().with_key(recipient)));
-        assert!(snapshot.with_file_key(FileId(0), |_| ()).is_ok());
+        assert!(snapshot.with_grant_keys(FileId(0), |_| ()).is_ok());
     }
 
     #[test]
@@ -397,11 +398,11 @@ mod tests {
         ));
         assert!(snapshot.ensure_id_available(FileId(3)).is_ok());
         assert!(matches!(
-            snapshot.with_file_key(FileId(1), |_| ()),
+            snapshot.with_grant_keys(FileId(1), |_| ()),
             Err(PithosError::SnapshotDirectoryHasNoContent(1))
         ));
         assert!(matches!(
-            snapshot.with_file_key(FileId(2), |_| ()),
+            snapshot.with_grant_keys(FileId(2), |_| ()),
             Err(PithosError::SnapshotSymlinkHasNoContent(2))
         ));
     }
@@ -484,11 +485,11 @@ mod tests {
         let (bytes, sender, recipient) = archive_with_entries();
         let sender_key = open(bytes.clone(), AccessKeys::new().with_key(sender))
             .into_append_snapshot()
-            .with_file_key(FileId(0), |key| *key.expose_for_protocol())
+            .with_grant_keys(FileId(0), |keys| *keys[0].1.expose_for_protocol())
             .unwrap();
         let recipient_key = open(bytes, AccessKeys::new().with_key(recipient))
             .into_append_snapshot()
-            .with_file_key(FileId(0), |key| *key.expose_for_protocol())
+            .with_grant_keys(FileId(0), |keys| *keys[0].1.expose_for_protocol())
             .unwrap();
         assert_eq!(sender_key, recipient_key);
     }
@@ -501,15 +502,15 @@ mod tests {
             open(bytes, AccessKeys::new().with_key(private("recipient2"))).into_append_snapshot();
 
         assert!(matches!(
-            unavailable.with_file_key(FileId(99), |_| ()),
+            unavailable.with_grant_keys(FileId(99), |_| ()),
             Err(PithosError::SnapshotFileIdNotFound(99))
         ));
         assert!(matches!(
-            unavailable.with_file_key(FileId(0), |_| ()),
+            unavailable.with_grant_keys(FileId(0), |_| ()),
             Err(PithosError::SnapshotContentUnavailable(0))
         ));
         assert!(matches!(
-            wrong.with_file_key(FileId(0), |_| ()),
+            wrong.with_grant_keys(FileId(0), |_| ()),
             Err(PithosError::SnapshotContentUnavailable(0))
         ));
     }

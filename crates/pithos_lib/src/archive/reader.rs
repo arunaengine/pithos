@@ -984,6 +984,10 @@ fn resolve_block_lists(
                     entries.extend_from_slice(&piece_entries);
                 }
                 crate::format::file_entry::validate_unique_block_references(&entries)?;
+                access.insert_pieces(
+                    file_id,
+                    pieces.iter().map(|piece| FileId(piece.key_id)).collect(),
+                );
                 record_block_keys(access, file_id, &entries);
                 file.block_data = BlockDataState::Decrypted(entries);
             }

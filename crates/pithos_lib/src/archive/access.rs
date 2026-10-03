@@ -8,6 +8,8 @@ pub(crate) struct ResolvedAccess {
     keys: BTreeMap<FileId, FileKey>,
     block_keys: BTreeMap<FileId, BTreeMap<crate::archive::types::BlockHash, BlockKey>>,
     provenance: BTreeMap<FileId, AccessProvenance>,
+    /// Piece key ids of each file whose block list was sealed in pieces.
+    pieces: BTreeMap<FileId, Vec<FileId>>,
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -25,6 +27,7 @@ impl ResolvedAccess {
             keys: BTreeMap::new(),
             block_keys: BTreeMap::new(),
             provenance: BTreeMap::new(),
+            pieces: BTreeMap::new(),
         }
     }
 
@@ -60,12 +63,19 @@ impl ResolvedAccess {
         self.provenance.get(&id).copied()
     }
 
-    pub(crate) fn with_file_key<T>(
-        &self,
-        id: FileId,
-        operation: impl FnOnce(&FileKey) -> T,
-    ) -> Option<T> {
-        self.keys.get(&id).map(operation)
+    pub(crate) fn insert_pieces(&mut self, id: FileId, key_ids: Vec<FileId>) {
+        self.pieces.insert(id, key_ids);
+    }
+
+    /// The keys a reader grant for `id` must carry: its file key, or every piece key.
+    pub(crate) fn grant_keys(&self, id: FileId) -> Option<Vec<(FileId, &FileKey)>> {
+        match self.pieces.get(&id) {
+            Some(key_ids) => key_ids
+                .iter()
+                .map(|key_id| self.keys.get(key_id).map(|key| (*key_id, key)))
+                .collect(),
+            None => self.keys.get(&id).map(|key| vec![(id, key)]),
+        }
     }
 
     pub(crate) fn insert_block_keys<'a>(
