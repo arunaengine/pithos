@@ -2,16 +2,28 @@
 //!
 //! A [`PieceEncoder`] encodes the blocks of one part and seals its block list under a fresh
 //! piece key granted to the recipients. The resulting [`Piece`] holds no secret, so it can be
-//! stored and later joined into a version 1.1 archive with one data file.
+//! stored and later joined by [`compose`] into a version 1.1 archive with one data file.
 
-use crate::archive::writer::ProcessingOptions;
+use crate::archive::path_validation::validate_entry;
+use crate::archive::types::ArchivePath;
+use crate::archive::writer::{EntryMetadata, ProcessingOptions};
 use crate::block;
 use crate::crypto::{self, FileKey, PublicKey};
 use crate::error::PithosError;
-use crate::format::block::ProcessingFlags;
-use crate::format::encryption::encode_decrypted_recipient_list;
-use crate::format::file_entry::{BlockDataEntry, encode_decrypted_block_list};
-use crate::format::header::FormatVersion;
+use crate::format::block::{BlockIndexEntry, BlockLocation, ProcessingFlags};
+use crate::format::directory::{
+    Directory, DirectoryEntries, encode_directory, update_directory_crc, update_directory_len,
+};
+use crate::format::encryption::{
+    EncryptionSection, RecipientData, RecipientSection, encode_decrypted_recipient_list,
+};
+use crate::format::file_entry::{
+    BlockDataEntry, BlockDataState, BlockListPiece, FileEntry, FileType,
+    encode_decrypted_block_list,
+};
+use crate::format::header::{FileHeader, FormatVersion, encode_header};
+use crate::format::limits::DeserializationError;
+use indexmap::IndexMap;
 use integer_encoding::{VarIntReader, VarIntWriter};
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
@@ -321,4 +333,146 @@ fn checked_add(left: u64, right: u64) -> Result<u64, PithosError> {
         .ok_or(PithosError::InvalidDirectoryRange {
             operation: "add piece sizes",
         })
+}
+
+/// A composed version 1.1 archive. Write [`Composition::header`], then the stored bytes of
+/// every piece in order (at [`Composition::piece_offsets`]), then the directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Composition {
+    piece_offsets: Vec<u64>,
+    directory: Vec<u8>,
+    archive_len: u64,
+}
+
+impl Composition {
+    pub fn header(&self) -> [u8; FileHeader::ENCODED_LEN] {
+        let mut header = [0; FileHeader::ENCODED_LEN];
+        encode_header(&FormatVersion::V1_1.header(), &mut header.as_mut_slice())
+            .expect("the header fits its fixed length");
+        header
+    }
+
+    /// Archive offset at which each piece's stored bytes start.
+    pub fn piece_offsets(&self) -> &[u64] {
+        &self.piece_offsets
+    }
+
+    pub fn directory(&self) -> &[u8] {
+        &self.directory
+    }
+
+    pub fn archive_len(&self) -> u64 {
+        self.archive_len
+    }
+}
+
+/// Joins pieces, in content order, into an archive with one data file at `path`.
+/// It opens no key, so it works without access to the content. Key ids must increase,
+/// and `path` must be at the archive root because the archive declares no directories.
+pub fn compose(
+    path: ArchivePath,
+    metadata: EntryMetadata,
+    pieces: &[Piece],
+) -> Result<Composition, PithosError> {
+    if path.as_str().contains('/') {
+        return Err(PithosError::InvalidArchivePath {
+            path: path.as_str().to_owned(),
+            reason: "a composed file must be at the archive root".into(),
+        });
+    }
+    if let Some(reference) = metadata.references.first() {
+        return Err(PithosError::MissingReferenceTarget(
+            reference.target_file_id,
+        ));
+    }
+    let mut piece_offsets = Vec::with_capacity(pieces.len());
+    let mut offset = FileHeader::ENCODED_LEN as u64;
+    let mut file_size = 0u64;
+    let mut blocks: IndexMap<[u8; 32], BlockIndexEntry> = IndexMap::new();
+    let mut encryption = IndexMap::new();
+    let mut previous_key = 0u64;
+    for piece in pieces {
+        if piece.key_id <= previous_key {
+            return Err(DeserializationError::UnorderedPieceKeys.into());
+        }
+        previous_key = piece.key_id;
+        piece_offsets.push(offset);
+        for block in &piece.blocks {
+            let entry = BlockIndexEntry {
+                offset: checked_add(offset, block.offset)?,
+                stored_size: block.stored_size,
+                original_size: block.original_size,
+                flags: block.flags,
+                location: BlockLocation::Local,
+            };
+            // Equal hashes have equal convergent keys, so the first stored copy serves all.
+            match blocks.get(&block.hash) {
+                Some(existing) if existing.original_size != entry.original_size => {
+                    return Err(PithosError::BlockIndexConflict {
+                        hash: block.hash,
+                        existing_original_size: existing.original_size,
+                        new_original_size: entry.original_size,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    blocks.insert(block.hash, entry);
+                }
+            }
+        }
+        let recipients = piece
+            .grants
+            .iter()
+            .map(|(recipient, wrapped)| {
+                let data = RecipientData::Encrypted(wrapped.clone());
+                (
+                    *recipient,
+                    RecipientSection {
+                        recipient_data: data,
+                    },
+                )
+            })
+            .collect();
+        if encryption
+            .insert(piece.sender, EncryptionSection { recipients })
+            .is_some()
+        {
+            return Err(PithosError::DuplicateSenderKey);
+        }
+        offset = checked_add(offset, piece.stored_len)?;
+        file_size = checked_add(file_size, piece.original_size)?;
+    }
+
+    let entry = FileEntry {
+        file_type: FileType::Data,
+        block_data: BlockDataState::Pieces(
+            pieces
+                .iter()
+                .map(|piece| BlockListPiece {
+                    key_id: piece.key_id,
+                    sealed: piece.sealed_list.clone(),
+                })
+                .collect(),
+        ),
+        created: metadata.created,
+        modified: metadata.modified,
+        file_size,
+        permissions: metadata.permissions,
+        references: Vec::new(),
+        symlink_target: None,
+    };
+    validate_entry(path.as_str(), &entry)?;
+    let mut files = DirectoryEntries::new();
+    files.insert(0, path.as_str(), entry)?;
+    let mut directory = Directory::new(None, files, encryption);
+    directory.blocks = blocks;
+    update_directory_len(&mut directory)?;
+    update_directory_crc(&mut directory)?;
+    let mut bytes = Vec::new();
+    encode_directory(&directory, &mut bytes)?;
+    Ok(Composition {
+        piece_offsets,
+        archive_len: checked_add(offset, bytes.len() as u64)?,
+        directory: bytes,
+    })
 }

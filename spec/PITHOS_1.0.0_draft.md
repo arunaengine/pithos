@@ -1056,6 +1056,14 @@ average, 512 KB maximum, and 48-byte window.
 respectively. A writer may sample 4096 bytes and require a 0.85 compression
 ratio before compressing. These suggestions are non-normative.
 
+**Joining independently written parts:** a version 1.1 writer may encode each
+part of a file on its own, seal that part's block list as one piece under a fresh
+piece key, and grant the piece key with a fresh sender key per piece. A later
+step can then join the parts into one archive without any key: it copies the
+stored blocks, keeps every sealed piece and grant unchanged, and writes one
+Directory. Because block keys are convergent, a block that repeats in two parts
+needs only one effective descriptor.
+
 ## Appendix B. Conformance Examples and Vectors
 
 This appendix is informative. The cited sections remain authoritative. Complete
