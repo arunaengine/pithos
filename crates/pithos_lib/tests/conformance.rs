@@ -5,8 +5,8 @@ mod common;
 use common::util::{private_key, public_key};
 use pithos_lib::archive::{
     AccessKeys, AppendOptions, Archive, ArchivePath, ArchiveWriter, BlockKeyMode, Chunking,
-    EntryKind, EntryMetadata, OpenOptions, PayloadCipher, Piece, PieceEncoder, ProcessingOptions,
-    WriteOptions, compose,
+    EntryKind, EntryMetadata, OpenLimits, OpenOptions, PayloadCipher, Piece, PieceEncoder,
+    ProcessingOptions, WriteOptions, compose,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::fs::{append_files, grant_readers};
@@ -395,4 +395,191 @@ fn assert_no_access(bytes: &[u8], reader: &str, path: &str) {
         Ok(archive) => assert!(!available(&archive, path)),
         Err(error) => assert!(matches!(error, PithosError::Crypt(_)), "{error:?}"),
     }
+}
+
+fn recipient() -> Vec<pithos_lib::crypto::PublicKey> {
+    vec![public_key("recipient1")]
+}
+
+#[test]
+fn composed_content_hash_matches_the_full_read_at_piece_boundaries() {
+    let file = content(10, 9000);
+    let cases: [&[usize]; 6] = [
+        &[2048, 4096, 1024],
+        &[3072, 10],
+        &[1024, 0, 1024],
+        &[2048, 0],
+        &[999],
+        &[],
+    ];
+    for sizes in cases {
+        let mut offset = 0;
+        let mut parts = Vec::new();
+        for (index, size) in sizes.iter().enumerate() {
+            let encoder = PieceEncoder::new(index as u64 + 1, recipient(), encrypted(0))
+                .unwrap()
+                .with_block_size(1000)
+                .unwrap();
+            let encoder = encoder.with_content_offset(offset as u64).unwrap();
+            parts.push(encode_piece(encoder, &file[offset..offset + size]));
+            offset += size;
+        }
+        let (bytes, hash) = assemble(&parts);
+        let output = read(&open(bytes, keys(&["recipient1"])), "object");
+        assert_eq!(output, file[..offset]);
+        assert_eq!(hash, Some(*blake3::hash(&output).as_bytes()), "{sizes:?}");
+    }
+
+    // A part that ends inside a BLAKE3 chunk leaves no valid offset for the next part.
+    let first = &file[..1500];
+    let second = &file[1500..2500];
+    let encoder = || PieceEncoder::new(2, recipient(), encrypted(0)).unwrap();
+    assert!(matches!(
+        encoder().with_content_offset(1500),
+        Err(PithosError::InvalidContentOffset(1500))
+    ));
+    for recorded in [1024, 2048] {
+        let later = encoder().with_content_offset(recorded).unwrap();
+        let parts = [
+            piece(1, &["recipient1"], encrypted(0), first),
+            encode_piece(later, second),
+        ];
+        let (bytes, hash) = assemble(&parts);
+        assert_eq!(hash, None);
+        assert_eq!(
+            read(&open(bytes, keys(&["recipient1"])), "object"),
+            file[..2500]
+        );
+    }
+}
+
+#[test]
+fn oversized_blocks_are_rejected_by_open_limits() {
+    let file = content(11, 1000);
+    let (composed, _) = assemble(&[piece(1, &["recipient1"], encrypted(0), &file)]);
+    let written = write_archive(&[("object", encrypted(0), &file)]);
+    // One block: 1000 plaintext bytes, stored as a nonce, the ciphertext and a tag.
+    let stored = 12 + 1000 + 16;
+    for bytes in [composed, written] {
+        let attempt = |limits: OpenLimits| {
+            let mut output = Vec::new();
+            let result = Archive::open(
+                MemorySource::new(bytes.clone()),
+                OpenOptions::default()
+                    .with_limits(limits)
+                    .with_access_keys(keys(&["recipient1"])),
+            )
+            .and_then(|archive| archive.copy_to("object", &mut output));
+            (result, output)
+        };
+        let limited = |stored_bytes: u64, decoded_bytes: u64| OpenLimits {
+            max_stored_block_bytes: stored_bytes,
+            max_decoded_block_bytes: decoded_bytes,
+            ..OpenLimits::default()
+        };
+        for limits in [limited(stored - 1, 1000), limited(stored, 999)] {
+            let (result, output) = attempt(limits);
+            assert!(matches!(result, Err(PithosError::LimitExceeded { .. })));
+            assert!(output.is_empty());
+        }
+        let (result, output) = attempt(limited(stored, 1000));
+        result.unwrap();
+        assert_eq!(output, file);
+    }
+}
+
+#[test]
+fn a_piece_without_a_grant_leaves_the_whole_file_unavailable() {
+    let first = content(12, 2500);
+    let second = content(13, 1500);
+    let parts = [
+        piece(1, &["recipient1", "recipient2"], encrypted(3), &first),
+        piece(2, &["recipient1"], aes(encrypted(0)), &second),
+    ];
+    let (bytes, _) = assemble(&parts);
+    let archive = open(bytes.clone(), keys(&["recipient2"]));
+    assert!(!available(&archive, "object"));
+    let mut output = Vec::new();
+    assert!(archive.copy_to("object", &mut output).is_err());
+    assert!(
+        archive
+            .copy_range_to("object", 0..100, &mut output)
+            .is_err()
+    );
+    assert!(output.is_empty());
+
+    let archive = open(bytes, keys(&["recipient2", "recipient1"]));
+    assert_eq!(read(&archive, "object"), [first, second].concat());
+}
+
+#[test]
+fn metadata_digest_covers_every_directory_of_the_chain() {
+    let temporary = tempfile::tempdir().unwrap();
+    let base = write_archive(&[("data", encrypted(2), &content(14, 3000))]);
+    let base_start = terminal_directory_start(&base);
+    let base_hash = *blake3::hash(&base[base_start..]).as_bytes();
+    let first = *blake3::hash(&base_hash).as_bytes();
+    assert_eq!(
+        open(base.clone(), AccessKeys::new()).metadata_digest(),
+        first
+    );
+
+    // The digest covers only directories, so it is the same under both versions.
+    let mut legacy = plain_archive("data", b"plain");
+    let plain_digest = open(legacy.clone(), AccessKeys::new()).metadata_digest();
+    set_version(&mut legacy, 0);
+    assert_eq!(
+        open(legacy, AccessKeys::new()).metadata_digest(),
+        plain_digest
+    );
+
+    let path = write_temporary(temporary.path(), "archive.pith", &base);
+    let source = write_temporary(temporary.path(), "appended", b"appended payload");
+    append_files(
+        &path,
+        AppendOptions::new(private_key("sender"), vec![public_key("recipient1")]),
+        &[source],
+    )
+    .unwrap();
+    let appended = std::fs::read(&path).unwrap();
+    let terminal = *blake3::hash(&appended[terminal_directory_start(&appended)..]).as_bytes();
+    let second = *blake3::hash(&[base_hash, terminal].concat()).as_bytes();
+    assert_ne!(second, first);
+
+    let with_digest = |digest: [u8; 32], keys: AccessKeys| {
+        Archive::open(
+            MemorySource::new(appended.clone()),
+            OpenOptions::default()
+                .with_access_keys(keys)
+                .with_expected_metadata_digest(digest),
+        )
+    };
+    let archive = with_digest(second, keys(&["recipient1"])).unwrap();
+    assert_eq!(archive.metadata_digest(), second);
+    assert_eq!(read(&archive, "appended"), b"appended payload");
+    for keys in [AccessKeys::new(), keys(&["recipient1"])] {
+        assert!(matches!(
+            with_digest(first, keys),
+            Err(PithosError::MetadataDigestMismatch)
+        ));
+    }
+
+    // Changing one metadata byte, with a fresh CRC, changes the digest.
+    let mut changed = appended.clone();
+    let start = terminal_directory_start(&changed);
+    let name = start
+        + changed[start..]
+            .windows(8)
+            .position(|window| window == b"appended")
+            .unwrap();
+    changed[name] = b'A';
+    refresh_crc(&mut changed);
+    assert!(Archive::open(MemorySource::new(changed.clone()), OpenOptions::default()).is_ok());
+    assert!(matches!(
+        Archive::open(
+            MemorySource::new(changed),
+            OpenOptions::default().with_expected_metadata_digest(second),
+        ),
+        Err(PithosError::MetadataDigestMismatch)
+    ));
 }
