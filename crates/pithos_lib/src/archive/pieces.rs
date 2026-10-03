@@ -158,7 +158,9 @@ impl PieceEncoder {
     }
 
     /// Sets the block size used by [`PieceEncoder::write`]. The default is 4 MiB.
+    /// Fails once content was added, because buffered bytes assume the old size.
     pub fn with_block_size(mut self, size: usize) -> Result<Self, PithosError> {
+        self.ensure_no_content()?;
         validate_block_size(size)?;
         self.block_size = size;
         Ok(self)
@@ -176,9 +178,10 @@ impl PieceEncoder {
                 content = rest;
                 continue;
             }
-            // Reserving the whole block once keeps plaintext from being copied on growth.
-            self.pending.reserve_exact(self.block_size);
-            let take = (self.block_size - self.pending.len()).min(content.len());
+            let missing = self.block_size - self.pending.len();
+            // Reserving the rest of the block once keeps plaintext from being copied on growth.
+            self.pending.reserve_exact(missing);
+            let take = missing.min(content.len());
             self.pending.extend_from_slice(&content[..take]);
             content = &content[take..];
             if self.pending.len() == self.block_size {
@@ -775,6 +778,12 @@ mod tests {
         assert!(matches!(
             encoder().with_block_size(0),
             Err(PithosError::InvalidBlockSize(0))
+        ));
+        let mut started = encoder();
+        started.write(b"pending").unwrap();
+        assert!(matches!(
+            started.with_block_size(4),
+            Err(PithosError::PieceContentStarted)
         ));
     }
 }
