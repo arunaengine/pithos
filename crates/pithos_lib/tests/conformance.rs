@@ -108,6 +108,11 @@ fn terminal_directory_start(bytes: &[u8]) -> usize {
     bytes.len() - u64::from_be_bytes(footer[..8].try_into().unwrap()) as usize
 }
 
+/// Bytes of a single-segment archive between the 6-byte header and its directory.
+fn block_region(bytes: &[u8]) -> usize {
+    terminal_directory_start(bytes) - 6
+}
+
 fn read_uleb(bytes: &[u8], position: &mut usize) -> u64 {
     let mut value = 0;
     for shift in (0..64).step_by(7) {
@@ -287,7 +292,7 @@ fn one_archive_and_one_file_mix_both_ciphers() {
         ("aes", aes(encrypted(0)), &aes_file),
     ]);
     // The AES-256-GCM file reuses the ChaCha20-Poly1305 descriptor of the shared block, so
-    // the archive is one stored block smaller than with distinct content.
+    // the archive stores one block fewer than with distinct content.
     let distinct = write_archive(&[
         ("chacha", encrypted(0), &chacha_file),
         (
@@ -296,7 +301,9 @@ fn one_archive_and_one_file_mix_both_ciphers() {
             &[content(4, BLOCK), content(3, BLOCK)].concat(),
         ),
     ]);
-    assert!(distinct.len() >= bytes.len() + STORED_BLOCK);
+    assert_eq!(block_region(&bytes), 3 * STORED_BLOCK);
+    assert_eq!(layout(&bytes).flags, [0x08, 0x08, 0x28]);
+    assert_eq!(block_region(&distinct), 4 * STORED_BLOCK);
 
     let archive = open(bytes.clone(), keys(&["recipient1"]));
     assert_eq!(read(&archive, "chacha"), chacha_file);
@@ -322,7 +329,11 @@ fn one_archive_and_one_file_mix_both_ciphers() {
     )
     .unwrap();
     let grown = std::fs::read(&path).unwrap();
-    assert!(grown.len() < bytes.len() + STORED_BLOCK + (4 + 12 + 300 + 16));
+    assert_eq!(
+        terminal_directory_start(&grown) - bytes.len(),
+        4 + 12 + 300 + 16
+    );
+    assert_eq!(layout(&grown).flags, [0x28]);
     let archive = open(grown, keys(&["recipient1"]));
     assert_eq!(read(&archive, "chacha"), chacha_file);
     assert_eq!(read(&archive, "aes"), aes_file);
@@ -345,9 +356,12 @@ fn unique_keys_with_aes_store_every_block_and_read_back() {
     let processing = unique(aes(encrypted(0)));
     let one = write_archive(&[("first", processing, &file)]);
     let two = write_archive(&[("first", processing, &file), ("second", processing, &file)]);
-    // No repeat is deduplicated, within a file or across files.
-    assert!(one.len() >= convergent.len() + 2 * STORED_BLOCK);
-    assert!(two.len() >= one.len() + 4 * STORED_BLOCK + short_block);
+    // The convergent file stores its repeated block once. Unique keys store every block,
+    // within a file and across files, including the short last blocks.
+    assert_eq!(block_region(&convergent), 2 * STORED_BLOCK + short_block);
+    assert_eq!(block_region(&one), 4 * STORED_BLOCK + short_block);
+    assert_eq!(block_region(&two), 2 * (4 * STORED_BLOCK + short_block));
+    assert_eq!(layout(&two).flags, [0x38; 10]);
 
     // Compressible blocks keep compression level 3 next to the unique-key and AES bits.
     let text = |seed: u8, len: usize| {
