@@ -314,11 +314,6 @@ where
             opener.feed(request, &response)?;
         }
         let view = opener.finish()?;
-        for span in view.index.local_block_spans() {
-            let mut marker = [0; 4];
-            source.read_exact_at(span.start(), &mut marker)?;
-            crate::format::block::decode_block_marker(&mut marker.as_slice())?;
-        }
         Ok(Self {
             source,
             external,

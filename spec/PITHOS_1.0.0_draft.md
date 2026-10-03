@@ -331,6 +331,11 @@ search payload bytes for `BLCK`. Recovery tools MAY treat `BLCK` as an
 untrusted candidate only: the marker alone provides no length, flags, or
 identity.
 
+Opening an archive validates its metadata and reads no block bytes. A reader
+MUST check a local block's `BLCK` marker when it reads that block, before it
+uses the payload, and MUST reject the block if the marker is wrong. A reader
+SHOULD fetch the marker and the payload in one read of `4 + stored_size` bytes.
+
 #### 4.2.6 External Block Resolution
 
 External resolution is an optional capability and MUST remain disabled until a
@@ -965,10 +970,14 @@ Zstandard versions.
 ### 6.1 Reading Operations
 
 1. Read and validate file header
-2. Locate and validate the terminal Directory using the direct lookup in Section 4.3.1
+2. Locate and validate the terminal Directory using the direct lookup in Section 4.3.1, then each parent Directory of the selected chain
 3. Validate directory ordering
 4. Build the effective block-descriptor mapping
-5. Extract files by reading referenced blocks
+5. Extract files by reading referenced blocks, checking each local block's marker as it is read (Section 4.2.5)
+
+Steps 1 to 4 open the archive. They validate metadata only and read no block
+bytes, so the number of reads at open depends on the length of the chain, not on
+the number of blocks.
 
 ### 6.2 Writing Operations
 

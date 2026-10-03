@@ -26,7 +26,6 @@ pub(crate) struct ArchiveIndex {
     descriptors: IndexMap<BlockHash, BlockDescriptor>,
     relationships: BTreeMap<RelationId, Arc<str>>,
     segment_spans: Vec<Span>,
-    local_spans: Vec<Span>,
     maximum_id: Option<FileId>,
 }
 
@@ -66,10 +65,6 @@ impl ArchiveIndex {
 
     pub(crate) fn relationship(&self, id: RelationId) -> Option<&str> {
         self.relationships.get(&id).map(Arc::as_ref)
-    }
-
-    pub(crate) fn local_block_spans(&self) -> impl Iterator<Item = Span> + '_ {
-        self.local_spans.iter().copied()
     }
 
     #[cfg(test)]
@@ -207,7 +202,6 @@ pub(crate) fn build_effective_index(
         descriptors,
         relationships,
         segment_spans,
-        local_spans,
         maximum_id,
     })
 }

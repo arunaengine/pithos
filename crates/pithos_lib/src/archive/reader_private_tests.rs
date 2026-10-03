@@ -1120,7 +1120,7 @@ fn decrypted_encrypted_block_list_accepts_a_non_minimal_count() {
 }
 
 #[test]
-fn archive_open_validates_local_markers_without_reading_payloads_or_access_keys() {
+fn archive_open_reads_no_block_bytes() {
     let (_temporary, path) = fixture_with("marker validation payload", 0);
     let (offset, stored_size) = first_block(&path);
     let bytes = Arc::<[u8]>::from(std::fs::read(&path).unwrap());
@@ -1130,27 +1130,21 @@ fn archive_open_validates_local_markers_without_reading_payloads_or_access_keys(
             bytes,
             reads: Arc::clone(&reads),
         },
-        OpenOptions::default(),
+        OpenOptions::default().with_access_keys(AccessKeys::new().with_key(private("recipient1"))),
     )
     .unwrap();
-    let reads = reads.lock().unwrap();
+    let block_end = offset + 4 + stored_size;
     assert!(
-        reads.contains(&(offset, 4)),
-        "local marker was not read at open"
-    );
-    let payload_start = offset + 4;
-    let payload_end = payload_start + stored_size;
-    assert!(
-        reads.iter().all(|(start, len)| {
+        reads.lock().unwrap().iter().all(|(start, len)| {
             let end = start.saturating_add(*len as u64);
-            end <= payload_start || *start >= payload_end
+            end <= offset || *start >= block_end
         }),
-        "archive open read local payload bytes"
+        "archive open read block bytes"
     );
 }
 
 #[test]
-fn archive_open_rejects_missing_or_changed_local_block_markers_without_access_keys() {
+fn missing_or_changed_local_block_markers_fail_when_the_block_is_read() {
     for missing in [false, true] {
         let (_temporary, path) = fixture_with("invalid marker payload", 0);
         if missing {
@@ -1166,11 +1160,12 @@ fn archive_open_rejects_missing_or_changed_local_block_markers_without_access_ke
             std::fs::write(&path, bytes).unwrap();
         }
 
-        let error = match open_without_keys(&path) {
-            Ok(_) => panic!("archive with an invalid local block marker opened"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("block marker"));
+        open_without_keys(&path).unwrap();
+        let archive = open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+        let mut sink = RecordingSink(Vec::new());
+        let error = archive.copy_to("data", &mut sink).unwrap_err();
+        assert!(error.to_string().contains("block marker"), "{error}");
+        assert!(sink.0.is_empty());
     }
 }
 
