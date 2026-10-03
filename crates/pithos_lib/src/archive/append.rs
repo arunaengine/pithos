@@ -44,6 +44,13 @@ impl AppendOptions {
         self
     }
 
+    /// Processing for appended content. Options that need format version 1.1 are rejected
+    /// before any byte is written when the archive is version 1.0.
+    pub fn with_processing(mut self, processing: ProcessingOptions) -> Self {
+        self.processing = processing;
+        self
+    }
+
     pub(crate) fn validate_recipients(&self) -> Result<(), PithosError> {
         WriteOptions::new(self.access_key.duplicate(), self.recipients.clone()).validate()
     }

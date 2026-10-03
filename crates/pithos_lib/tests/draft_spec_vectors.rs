@@ -666,7 +666,7 @@ fn processing_known_answers_match_appendix_b() {
     stored.extend_from_slice(&ciphertext);
     assert_eq!(
         stored,
-        appendix_recipient_wrap("PV-RECIPIENT-WRAP-01"),
+        appendix_text_block("PV-RECIPIENT-WRAP-01"),
         "recipient-wrap bytes must match Appendix B"
     );
 
@@ -695,9 +695,32 @@ fn processing_known_answers_match_appendix_b() {
     );
     assert_eq!(
         stored,
-        appendix_recipient_wrap("PV-RECIPIENT-WRAP-11"),
+        appendix_text_block("PV-RECIPIENT-WRAP-11"),
         "version 1.1 recipient-wrap bytes must match Appendix B"
     );
+}
+
+#[test]
+fn unique_key_block_known_answer_matches_appendix_b() {
+    let key: [u8; 32] = std::array::from_fn(|index| index as u8);
+    let nonce: [u8; 12] = std::array::from_fn(|index| 0xa0 + index as u8);
+    let subkey = blake3::derive_key("pithos 1.1 block identity", &key);
+    let identity = blake3::keyed_hash(&subkey, b"hello");
+    for value in [blake3::Hash::from(subkey).to_hex(), identity.to_hex()] {
+        assert!(
+            SPEC.contains(value.as_str()),
+            "{value} missing from Appendix B"
+        );
+    }
+    assert_ne!(identity, blake3::hash(b"hello"));
+    let mut stored = nonce.to_vec();
+    stored.extend_from_slice(
+        &ChaCha20Poly1305::new_from_slice(&key)
+            .unwrap()
+            .encrypt(&Nonce::from(nonce), b"hello".as_ref())
+            .unwrap(),
+    );
+    assert_eq!(stored, appendix_text_block("PV-UNIQUE-KEY-HELLO"));
 }
 
 fn appendix_zstd_bytes(id: &str) -> Vec<u8> {
@@ -715,7 +738,7 @@ fn appendix_zstd_bytes(id: &str) -> Vec<u8> {
         .collect()
 }
 
-fn appendix_recipient_wrap(id: &str) -> Vec<u8> {
+fn appendix_text_block(id: &str) -> Vec<u8> {
     let start = SPEC.find(&format!("`{id}`")).unwrap();
     let block = SPEC[start..].split("```text\n").nth(1).unwrap();
     block

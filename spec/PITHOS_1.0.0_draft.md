@@ -69,6 +69,9 @@ Version 1.1 differs from version 1.0 only in these points:
 3. A file's block list may be sealed in independent pieces, each with its own
    key (BlockDataState tag `02`, Section 4.4.2). Piece key IDs share the file ID
    space (Section 4.3.2).
+4. An encrypted block may use a unique random key instead of its convergent key
+   (ProcessingFlags bit 4, Section 4.2.3). Its block hash is then a keyed BLAKE3
+   identity (Section 5.2), and the block is never deduplicated (Section 5.3).
 
 Readers MUST support both versions. Writers MUST create new archives as version
 1.1. An append MUST follow the version of the archive it extends, so appending
@@ -214,7 +217,7 @@ The directory block sequence is a vector. Each item is encoded as follows:
 | `offset` | ULEB128 `u64`: local block offset, or zero for `External` |
 | `stored_size` | ULEB128 `u64` |
 | `original_size` | ULEB128 `u64` |
-| `flags` | One ProcessingFlags byte: bits 0-2 compression level, bit 3 encryption enabled, bits 4-7 zero |
+| `flags` | One ProcessingFlags byte as defined in Section 4.2.3 |
 | `location` | One tag byte: `00` local, or `01` followed by an external location identifier string |
 
 Readers MUST reject duplicate block hashes in one directory and MUST use the
@@ -222,7 +225,8 @@ Readers MUST reject duplicate block hashes in one directory and MUST use the
 
 #### 4.2.3 Processing Flags
 
-ProcessingFlags records the compression level and whether a block is encrypted.
+ProcessingFlags records the compression level, whether a block is encrypted and,
+in version 1.1, how an encrypted block is keyed.
 
 ```rust
 /// Processing flags packed into one byte
@@ -242,7 +246,10 @@ bitflags::bitflags! {
         // Bit 3: Encryption enabled
         const ENCRYPTION_ENABLED = 0b0000_1000;
 
-        // Bits 4-7: Reserved for future use (MUST be zero)
+        // Bit 4: Unique random block key (version 1.1, requires bit 3)
+        const UNIQUE_KEY = 0b0001_0000;
+
+        // Bits 5-7: Reserved for future use (MUST be zero)
     }
 }
 ```
@@ -253,10 +260,15 @@ bitflags::bitflags! {
 | --- | --- |
 | 0-2 | Compression: `0` means the stored payload is not compressed; `1` through `7` each mean the stored payload is one standard Zstandard frame |
 | 3 | Encryption enabled: `0` is disabled; `1` is enabled |
-| 4-7 | Reserved; all bits MUST be zero |
+| 4 | Unique key (version 1.1): `0` means the block key is convergent; `1` means it is a unique random key (Section 5.3) |
+| 5-7 | Reserved; all bits MUST be zero |
 
 ProcessingFlags is stored as exactly one byte. Readers MUST reject a value with
-any reserved bit set.
+any reserved bit set. Bit 4 is valid only in a version 1.1 archive and only
+when bit 3 is set. Readers MUST reject a descriptor that sets bit 4 in a version
+1.0 archive or without bit 3. The same rules apply wherever a writer records
+these flags. For example, an encrypted unique-key block with no compression has
+the flags byte `18`.
 
 #### 4.2.4 Block Location
 
@@ -779,10 +791,24 @@ not a compatibility requirement; see Appendix A.
 
 ### 5.2 Block Hashing
 
-The block hash is the full 32-byte default unkeyed BLAKE3 digest of the exact
-plaintext chunk before compression or encryption. It is a block's only
-identity. The Directory `blocks` vector is keyed by block hash, and each file's
-block list is an ordered sequence of `(block_hash, block_key)` pairs. That order
+The block hash is a block's only identity. It is 32 bytes and covers the exact
+plaintext chunk before compression or encryption. Its form depends on
+ProcessingFlags bit 4 of the block's effective descriptor:
+
+- **Convergent key (bit 4 is `0`):** the full default unkeyed BLAKE3 digest of
+  the plaintext.
+- **Unique key (bit 4 is `1`):** a keyed BLAKE3 identity. The 32-byte identity
+  subkey is BLAKE3 `derive_key` with the context string
+  `pithos 1.1 block identity` (25 ASCII bytes) and the block key as key
+  material. The block hash is BLAKE3 `keyed_hash` of the plaintext under the
+  identity subkey. Equal plaintext under different random keys has different
+  block hashes.
+
+A keyed block hash identifies one stored block. It is not a content hash of the
+block or of its file and cannot be compared with a plain BLAKE3 digest.
+
+The Directory `blocks` vector is keyed by block hash, and each file's block list
+is an ordered sequence of `(block_hash, block_key)` pairs. That order
 reconstructs the file. For a file sealed in pieces, the sequence is the
 concatenation of its piece lists, and every rule in this section applies to that
 whole sequence.
@@ -802,8 +828,9 @@ empty file has `file_size` zero and an empty block list.
 Readers MUST retrieve each stored block, authenticate and decrypt it when
 encrypted, decompress it when compressed using the recorded original size as
 the output bound, require the resulting plaintext length to equal the recorded
-original size, compute the complete plaintext digest, and compare it with the
-block hash before releasing any output derived from that block.
+original size, compute the block hash of the complete plaintext in the form
+selected above, and compare it with the stored block hash before releasing any
+output derived from that block.
 
 Readers MAY use bounded memory or temporary spill-backed storage while
 performing this verification, but MUST NOT release output derived from a block
@@ -829,10 +856,19 @@ produces a 16-byte authentication tag. Every encrypted value is stored as
 `nonce || ciphertext || tag`; the nonce is part of the stored byte vector. The
 additional authenticated data (AAD) is empty.
 
-The block key is the first 32 output bytes of `SHAKE256(plaintext)`, where
-`plaintext` is the exact block plaintext before compression or encryption. No
-label or length prefix is included. A block payload with encryption enabled is
-encrypted with its block key.
+By default the block key is convergent: the first 32 output bytes of
+`SHAKE256(plaintext)`, where `plaintext` is the exact block plaintext before
+compression or encryption. No label or length prefix is included. A block
+payload with encryption enabled is encrypted with its block key.
+
+In version 1.1, a block whose ProcessingFlags bit 4 is set has a unique key
+instead: 32 bytes generated uniformly at random with a cryptographically secure
+random number generator. A writer MUST generate a fresh unique key for every
+block it encodes in this mode, including a block whose plaintext it has stored
+before, and MUST NOT use that key for any other block. Unique-key blocks are
+therefore never deduplicated: each occurrence is stored with its own key and
+block hash (Section 5.2). The block list carries the unique key like any other
+block key.
 
 A file key is 32 random bytes. It encrypts the decrypted block list for a file.
 In version 1.1, a piece key is 32 random bytes and encrypts the decrypted block
@@ -896,7 +932,7 @@ Zstandard versions.
 1. Write file header
 2. Process files in correct directory order
 3. Chunk content using content-defined chunking
-4. Deduplicate blocks by hash
+4. Deduplicate blocks by hash (unique-key blocks never repeat a hash)
 5. Write a directory, including its encryption sections when present
 6. Validate complete structure
 
@@ -941,6 +977,15 @@ key for each archive or piece keeps that scope small. Appends to version 1.0
 archives keep the version 1.0 construction. The plaintext-derived Directory block hash exposes
 block equality, and equal plaintext also derives the same convergent block key.
 
+Unique-key blocks (Section 5.3) hide one thing: whether two stored blocks have
+equal plaintext, from anyone who does not hold the block key. Their block hashes
+are keyed with random keys, so equal plaintext gives unrelated hashes in the
+same or in different archives. Unique keys do not hide stored and original block
+sizes, the number of blocks, the ProcessingFlags, or file sizes. A reader that
+holds a block key can test a guessed plaintext against that block's hash. A whole-file content hash
+kept outside the archive is separate from the keyed block identity and still
+reveals equal files.
+
 Pieces are joined in the order the Directory stores them. Their strictly
 increasing key IDs and the `file_size` check detect some reordering and missing
 pieces, but without authenticated metadata a modified Directory can still drop or
@@ -972,14 +1017,15 @@ negotiation record.
 | --- | --- |
 | Block compression | ProcessingFlags compression bits are `1` through `7` |
 | Block encryption | ProcessingFlags encryption bit is `1` |
+| Unique block keys | ProcessingFlags bit 4 is `1` (version 1.1) |
 | Encrypted block lists | BlockDataState tag is `00` (`Encrypted`) or, in version 1.1, `02` (`Pieces`) |
 | Encrypted recipient lists | RecipientData tag is `00` (`Encrypted`) |
 | External storage | BlockLocation tag is `01` (`External`) |
 
-Compression, block encryption, encrypted block lists, encrypted recipient
-lists, and external storage are optional capabilities. An implementation that
-supports an optional capability MUST process it according to its definition in
-this specification.
+Compression, block encryption, unique block keys, encrypted block lists,
+encrypted recipient lists, and external storage are optional capabilities. An
+implementation that supports an optional capability MUST process it according
+to its definition in this specification.
 
 ### 8.2 Unavailable Content
 
@@ -998,6 +1044,7 @@ uncompressed or unencrypted bytes.
 | Plain local: local, compression `0`, encryption `0` | Listed | Readable by a base reader |
 | Compressed local: local, compression `1` through `7`, encryption `0` | Listed | Readable only with block-compression capability; otherwise unavailable |
 | Encrypted local: local, compression `0`, encryption `1` | Listed | Readable only with block-encryption capability and any encrypted-list capability needed to obtain its block key; otherwise unavailable |
+| Unique-key local: local, encryption `1`, bit 4 `1` | Listed | Readable only with block-encryption and unique-block-key capability and any encrypted-list capability needed to obtain its block key; otherwise unavailable |
 | External: BlockLocation `External` | Listed | Readable only with external-storage capability and every capability required by its flags and data states; otherwise unavailable |
 | Combined: compression and encryption, at either location | Listed | Readable only when every indicated capability is supported; otherwise unavailable |
 
@@ -1038,7 +1085,7 @@ Non-POSIX platforms MAY retain them as metadata without an ACL mapping.
 
 The format reserves space for future extensions:
 - FileType values 4-255
-- ProcessingFlags bits 4-7
+- ProcessingFlags bits 5-7
 - Custom relationship types starting at 1000
 - BlockDataState tags `03` through `ff`
 
@@ -1087,8 +1134,9 @@ part of a file on its own, seal that part's block list as one piece under a fres
 piece key, and grant the piece key with a fresh sender key per piece. A later
 step can then join the parts into one archive without any key: it copies the
 stored blocks, keeps every sealed piece and grant unchanged, and writes one
-Directory. Because block keys are convergent, a block that repeats in two parts
-needs only one effective descriptor.
+Directory. Because convergent block keys are equal for equal plaintext, a block
+that repeats in two parts needs only one effective descriptor. Unique-key blocks
+never repeat.
 
 ## Appendix B. Conformance Examples and Vectors
 
@@ -1356,6 +1404,23 @@ stored `nonce || ciphertext || tag` is:
 0030: 43 a0 94 bb cc 91 e1 c5 a6 53 62 9a d4 a1
 ```
 
+`PV-UNIQUE-KEY-HELLO` is a version 1.1 known-answer test for one unique-key block
+(Sections 5.2 and 5.3). The plaintext is ASCII `hello` and the flags byte is `18`
+(no compression, encryption, unique key). The test inputs are block key bytes
+`00` through `1f` and nonce bytes `a0` through `ab`; writers use random values.
+The identity subkey is
+`7523b18f1fdbfe99d23177669ef03ce0ca6925cfe372b8a26cc99804db196d6b`, and the
+block hash is
+`ca2bb927d0c0ac7196480fdf9c5101615bd8bc349663ffd9c3fef37228675a62`, not the
+plain BLAKE3 digest of `hello`. The stored ChaCha20-Poly1305
+`nonce || ciphertext || tag` is:
+
+```text
+0000: a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab 64 ce 14 33
+0010: 22 bc 47 c9 e5 cc ec e2 dd 29 f5 e4 22 c2 e7 bc
+0020: d2
+```
+
 ### B.4 Acceptance and Rejection Mutations
 
 Each `AV-*` or `RV-*` vector is a mutation of the named canonical vector.
@@ -1391,5 +1456,5 @@ archive.
 | Directory framing, CRC, and chain | 4.3, 4.3.1, 4.3.2 | CV-BASE-EMPTY-146, CV-APPEND-EMPTY-28, RV-PARENT, RV-UNDERFLOW, RV-TRAILING, RV-CRC, RV-CROSS-SIZE | Valid archive or reject archive as stated |
 | Entries and paths | 4.3.3, 4.4.1, 4.4.3 | CV-LOCAL-HELLO-279, RV-DUPLICATES, RV-PATH, RV-SYMLINK, RV-FILETYPE, RV-PERMISSIONS | Valid archive or reject archive as stated |
 | Block locations and extents | 4.2.2, 4.2.5, 4.2.6, 8.2 | CV-LOCAL-HELLO-279, RV-EXTENT, RV-SHORT-ENCRYPTED, RV-EXTERNAL | Valid archive, reject archive, content read fails before output, or content unavailable as stated |
-| Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01, PV-RECIPIENT-WRAP-11 | Decode/decrypt to stated output |
+| Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01, PV-RECIPIENT-WRAP-11, PV-UNIQUE-KEY-HELLO | Decode/decrypt to stated output |
 | Version 1.1 pieces and grants | 1.3, 4.4.2, 5.3 | CV-PIECES-HELLO-766, PV-RECIPIENT-WRAP-11 | Valid archive; content readable only with the granted key |

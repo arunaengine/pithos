@@ -156,6 +156,10 @@ fn append_files_impl(
         Arc::clone(&bytes),
     )
     .map_err(|source| append_error("open append snapshot", archive, source))?;
+    spec.options
+        .processing
+        .validate_for(snapshot.version())
+        .map_err(|source| append_error("validate append processing", archive, source))?;
     let plan = AppendPlan::build(
         &spec,
         &snapshot,

@@ -7,6 +7,7 @@ use crate::error::PithosError;
 use crate::format::block::BlockLocation as FormatBlockLocation;
 use crate::format::directory::{Directory, STANDARD_RELATIONSHIPS};
 use crate::format::file_entry::{BlockDataState, FileEntry, FileType};
+use crate::format::header::FormatVersion;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ impl Default for IndexLimits {
 }
 
 pub(crate) fn validated_segment_from_directory(
+    version: FormatVersion,
     directory: &Directory,
     span: Span,
     parent: Option<Span>,
@@ -55,7 +57,7 @@ pub(crate) fn validated_segment_from_directory(
     validate_relationships(directory)?;
     let mut descriptors = Vec::new();
     for (hash, block_index_entry) in &directory.blocks {
-        let processing = Processing::from_byte(block_index_entry.flags.0)?;
+        let processing = Processing::from_byte(block_index_entry.flags.0, version)?;
         if matches!(block_index_entry.location, FormatBlockLocation::Local)
             && processing.to_byte() & 0x08 != 0
             && block_index_entry.stored_size < 28

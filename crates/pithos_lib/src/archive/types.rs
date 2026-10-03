@@ -1,4 +1,6 @@
 use crate::error::PithosError;
+use crate::format::block::ProcessingFlags;
+use crate::format::header::FormatVersion;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};
 use std::ops::Range;
@@ -167,21 +169,35 @@ impl Compression {
 pub(crate) struct Processing {
     compression: Compression,
     encrypted: bool,
+    unique_key: bool,
 }
 
 impl Processing {
-    pub(crate) fn from_byte(value: u8) -> Result<Self, PithosError> {
-        if value & 0xf0 != 0 {
+    /// Validates one flags byte against the rules of the archive's format version.
+    pub(crate) fn from_byte(value: u8, version: FormatVersion) -> Result<Self, PithosError> {
+        if value & ProcessingFlags::RESERVED_MASK != 0 {
             return Err(PithosError::ReservedProcessingBits(value));
+        }
+        let encrypted = value & 0x08 != 0;
+        if value & ProcessingFlags::VERSION_1_1_MASK != 0 {
+            if version == FormatVersion::V1_0 {
+                return Err(PithosError::UnsupportedProcessingFlags(value));
+            }
+            if !encrypted {
+                return Err(PithosError::ProcessingRequiresEncryption(value));
+            }
         }
         Ok(Self {
             compression: Compression::new(value & 0x07)?,
-            encrypted: value & 0x08 != 0,
+            encrypted,
+            unique_key: value & ProcessingFlags::UNIQUE_KEY_MASK != 0,
         })
     }
 
     pub(crate) fn to_byte(self) -> u8 {
-        self.compression.level() | (u8::from(self.encrypted) << 3)
+        self.compression.level()
+            | (u8::from(self.encrypted) << 3)
+            | (u8::from(self.unique_key) << 4)
     }
 }
 

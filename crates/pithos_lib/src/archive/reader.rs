@@ -417,7 +417,9 @@ where
             let parent = segment_index
                 .checked_sub(1)
                 .map(|index| segments[index].span);
-            segments.push(validated_segment_from_directory(&directory, span, parent)?);
+            segments.push(validated_segment_from_directory(
+                version, &directory, span, parent,
+            )?);
         }
         let index_limits = IndexLimits {
             max_entries: options.limits.max_entries,

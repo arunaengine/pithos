@@ -5,7 +5,7 @@
 //! stored and later joined by [`compose`] into a version 1.1 archive with one data file.
 
 use crate::archive::path_validation::validate_entry;
-use crate::archive::types::ArchivePath;
+use crate::archive::types::{ArchivePath, Processing};
 use crate::archive::writer::{EntryMetadata, ProcessingOptions};
 use crate::block;
 use crate::crypto::{self, FileKey, PublicKey};
@@ -85,6 +85,7 @@ impl PieceEncoder {
         if recipients.is_empty() {
             return Err(PithosError::WriterRequiresRecipient);
         }
+        processing.validate_for(FormatVersion::V1_1)?;
         let recipients = recipients
             .into_iter()
             .map(|recipient| recipient.into_dalek_public_key().to_bytes())
@@ -109,7 +110,8 @@ impl PieceEncoder {
     }
 
     /// Encodes one non-empty block and returns `BLCK || payload` to append to the piece.
-    /// A block that repeats an earlier block of this piece returns no bytes.
+    /// With content-derived keys, a block that repeats an earlier block of this piece returns
+    /// no bytes. With unique keys, every block is stored.
     pub fn push(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, PithosError> {
         if plaintext.is_empty() {
             return Err(PithosError::InvalidBlockDescriptor(
@@ -252,7 +254,9 @@ impl Piece {
                 original_size: read_uleb(&mut reader)?,
                 flags: ProcessingFlags::from_byte(read_vec(&mut reader, 1)?[0]),
             };
-            if block.offset != offset || block.flags.has_reserved_bits() {
+            if block.offset != offset
+                || Processing::from_byte(block.flags.0, FormatVersion::V1_1).is_err()
+            {
                 return Err(PithosError::InvalidPieceRecord);
             }
             offset = checked_add(offset, checked_add(BLOCK_MARKER_LEN, block.stored_size)?)?;
@@ -411,6 +415,7 @@ pub fn compose(
                 location: BlockLocation::Local,
             };
             // Equal hashes have equal convergent keys, so the first stored copy serves all.
+            // Unique-key hashes are keyed with random keys and do not repeat.
             match blocks.get(&block.hash) {
                 Some(existing) if existing.original_size != entry.original_size => {
                     return Err(PithosError::BlockIndexConflict {
@@ -480,4 +485,31 @@ pub fn compose(
         archive_len: checked_add(offset, bytes.len() as u64)?,
         directory: bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::BlockKeyMode;
+
+    #[test]
+    fn piece_records_carry_unique_key_flags_and_reject_invalid_ones() {
+        let recipient = crate::crypto::PrivateKey::generate().public_key();
+        let processing = ProcessingOptions::new(true, 0)
+            .unwrap()
+            .with_key_mode(BlockKeyMode::Unique)
+            .unwrap();
+        let mut encoder = PieceEncoder::new(1, vec![recipient], processing).unwrap();
+        encoder.push(b"unique block").unwrap();
+        let mut piece = encoder.finish().unwrap();
+        assert_eq!(piece.blocks[0].flags.0, 0x18);
+        assert_eq!(Piece::from_bytes(&piece.to_bytes()).unwrap(), piece);
+        for flags in [0x10, 0x40] {
+            piece.blocks[0].flags = ProcessingFlags(flags);
+            assert!(matches!(
+                Piece::from_bytes(&piece.to_bytes()),
+                Err(PithosError::InvalidPieceRecord)
+            ));
+        }
+    }
 }

@@ -4,6 +4,7 @@ use crate::archive::path_validation::{
     validate_directory_entry_hierarchy_complete, validate_directory_entry_hierarchy_with_snapshot,
     validate_new_candidate_with_snapshot,
 };
+use crate::archive::types::Processing;
 use crate::archive::validation::validate_relationships;
 use crate::archive::{AppendSnapshot, ArchivePath, FileId, Span, validated_segment_from_directory};
 use crate::archive::{validate_new_candidate, validate_symlink_target};
@@ -77,11 +78,23 @@ impl Default for CdcConfig {
     }
 }
 
+/// How the key of each encrypted block is chosen.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BlockKeyMode {
+    /// The key is derived from the block plaintext, so equal blocks are stored once.
+    #[default]
+    ContentDerived,
+    /// Every stored block gets a fresh random key and a keyed block hash (version 1.1).
+    /// Equal blocks are stored again, and their equality stays hidden.
+    Unique,
+}
+
 /// Per-block processing requested for a content entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessingOptions {
     encrypted: bool,
     compression_level: u8,
+    key_mode: BlockKeyMode,
 }
 
 impl ProcessingOptions {
@@ -89,6 +102,7 @@ impl ProcessingOptions {
         Self {
             encrypted: true,
             compression_level: 2,
+            key_mode: BlockKeyMode::ContentDerived,
         }
     }
 
@@ -99,7 +113,16 @@ impl ProcessingOptions {
         Ok(Self {
             encrypted,
             compression_level,
+            key_mode: BlockKeyMode::ContentDerived,
         })
+    }
+
+    /// Selects the key mode. [`BlockKeyMode::Unique`] requires encryption, and writing it
+    /// requires a version 1.1 archive.
+    pub fn with_key_mode(self, key_mode: BlockKeyMode) -> Result<Self, PithosError> {
+        let options = Self { key_mode, ..self };
+        options.validate_for(FormatVersion::V1_1)?;
+        Ok(options)
     }
 
     pub fn encrypted(self) -> bool {
@@ -108,9 +131,19 @@ impl ProcessingOptions {
     pub fn compression_level(self) -> u8 {
         self.compression_level
     }
+    pub fn key_mode(self) -> BlockKeyMode {
+        self.key_mode
+    }
 
     pub(crate) fn flags(self) -> ProcessingFlags {
-        ProcessingFlags::new(self.encrypted, Some(self.compression_level))
+        let mut flags = ProcessingFlags::new(self.encrypted, Some(self.compression_level));
+        flags.set_unique_key(self.key_mode == BlockKeyMode::Unique);
+        flags
+    }
+
+    /// Checks that an archive of `version` may store blocks with these options.
+    pub(crate) fn validate_for(self, version: FormatVersion) -> Result<(), PithosError> {
+        Processing::from_byte(self.flags().0, version).map(|_| ())
     }
 }
 
@@ -119,6 +152,7 @@ impl Default for ProcessingOptions {
         Self {
             encrypted: true,
             compression_level: 3,
+            key_mode: BlockKeyMode::ContentDerived,
         }
     }
 }
@@ -852,6 +886,7 @@ impl<W: Write> ArchiveWriter<W> {
         if self.mode.is_base() && (processing.encrypted() || processing.compression_level() != 0) {
             return Err(PithosError::BaseWriterRequiresPlainProcessing.into());
         }
+        processing.validate_for(self.version)?;
         let mut delta = self.stage_entry(file_type, path, metadata, 0, None)?;
         let mut stream = StreamCDC::with_level(
             content,
@@ -1267,6 +1302,7 @@ impl<W: Write> ArchiveWriter<W> {
             if let Some(snapshot) = &self.append_snapshot {
                 let span = Span::new(self.sink.offset, self.directory.dir_len)?;
                 let child = validated_segment_from_directory(
+                    self.version,
                     &self.directory,
                     span,
                     Some(snapshot.terminal_directory()),
@@ -1641,6 +1677,46 @@ mod tests {
                 "{other:?} rules opened a {version:?} grant"
             );
         }
+    }
+
+    #[test]
+    fn version_1_0_writers_reject_unique_keys_before_writing_blocks() {
+        let mut writer = ArchiveWriter::create(Vec::new(), options()).unwrap();
+        writer.version = FormatVersion::V1_0;
+        let unique = ProcessingOptions::default()
+            .with_key_mode(BlockKeyMode::Unique)
+            .unwrap();
+        assert!(matches!(
+            writer.add_file(
+                ArchivePath::new("data").unwrap(),
+                EntryMetadata::new(0, 0, 0o644),
+                unique,
+                None,
+                Cursor::new(b"content"),
+            ),
+            Err(WriterError::Pithos(
+                PithosError::UnsupportedProcessingFlags(_)
+            ))
+        ));
+        assert!(!writer.poisoned);
+        assert_eq!(writer.sink.offset, header::FileHeader::ENCODED_LEN as u64);
+        assert_eq!(writer.metadata_snapshot().descriptors, 0);
+    }
+
+    #[test]
+    fn unique_key_options_require_encryption() {
+        assert!(matches!(
+            ProcessingOptions::new(false, 0)
+                .unwrap()
+                .with_key_mode(BlockKeyMode::Unique),
+            Err(PithosError::ProcessingRequiresEncryption(0x10))
+        ));
+        let unique = ProcessingOptions::new(true, 5)
+            .unwrap()
+            .with_key_mode(BlockKeyMode::Unique)
+            .unwrap();
+        assert_eq!(unique.key_mode(), BlockKeyMode::Unique);
+        assert_eq!(unique.flags().0, 0x1d);
     }
 
     #[test]

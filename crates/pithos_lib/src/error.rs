@@ -95,6 +95,10 @@ pub enum PithosError {
     DuplicateRecipientFileId,
     #[error("reserved processing bits are set: {0:#04x}")]
     ReservedProcessingBits(u8),
+    #[error("processing flags {0:#04x} require format version 1.1")]
+    UnsupportedProcessingFlags(u8),
+    #[error("processing flags {0:#04x} require encryption")]
+    ProcessingRequiresEncryption(u8),
     #[error("conflicting relationship definition for id {0}")]
     ConflictingRelationshipDefinition(u64),
     #[error("invalid relationship definition for id {id}: {reason}")]

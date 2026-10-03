@@ -31,13 +31,30 @@ impl fmt::Debug for EncodedBlock {
     }
 }
 
+/// Encodes one block. A unique-key block gets a fresh random key on every call.
 pub fn encode(
     plaintext: &[u8],
     requested_flags: ProcessingFlags,
     nonce: [u8; 12],
 ) -> Result<EncodedBlock, PithosError> {
-    let hash = crypto::block_hash(plaintext);
-    let key = crypto::derive_block_key(plaintext);
+    let key = if requested_flags.is_unique_key() {
+        crypto::random_block_key()
+    } else {
+        crypto::derive_block_key(plaintext)
+    };
+    encode_with_key(plaintext, requested_flags, key, nonce)
+}
+
+fn encode_with_key(
+    plaintext: &[u8],
+    requested_flags: ProcessingFlags,
+    key: BlockKey,
+    nonce: [u8; 12],
+) -> Result<EncodedBlock, PithosError> {
+    if requested_flags.is_unique_key() && !requested_flags.is_encrypted() {
+        return Err(PithosError::ProcessingRequiresEncryption(requested_flags.0));
+    }
+    let hash = block_hash(requested_flags, &key, plaintext);
     let mut flags = requested_flags;
     let compression_level = zstd_level(flags);
     let mut stored = Zeroizing::new(
@@ -101,7 +118,7 @@ pub(crate) fn verify(
             actual: plaintext.len() as u64,
         });
     }
-    let actual_hash = crypto::block_hash(&plaintext);
+    let actual_hash = block_hash(meta.flags, key, &plaintext);
     if actual_hash != expected_hash {
         return Err(PithosError::BlockHashMismatch {
             expected: expected_hash,
@@ -109,6 +126,15 @@ pub(crate) fn verify(
         });
     }
     Ok(plaintext)
+}
+
+/// The block hash: plain BLAKE3, or the keyed identity of a unique-key block.
+fn block_hash(flags: ProcessingFlags, key: &BlockKey, plaintext: &[u8]) -> [u8; 32] {
+    if flags.is_unique_key() {
+        crypto::keyed_block_hash(key, plaintext)
+    } else {
+        crypto::block_hash(plaintext)
+    }
 }
 
 pub(crate) fn zstd_level(flags: ProcessingFlags) -> i32 {
@@ -188,6 +214,95 @@ mod tests {
             .unwrap(),
             plain
         );
+    }
+
+    fn limits() -> Limits {
+        Limits {
+            max_stored_bytes: 1024,
+            max_decoded_bytes: 1024,
+        }
+    }
+
+    fn unique_flags(compression_level: u8) -> ProcessingFlags {
+        let mut flags = ProcessingFlags::new(true, Some(compression_level));
+        flags.set_unique_key(true);
+        flags
+    }
+
+    #[test]
+    fn unique_key_vector_matches_the_specification() {
+        let key = BlockKey::from_bytes(std::array::from_fn(|index| index as u8));
+        let nonce = std::array::from_fn(|index| 0xa0 + index as u8);
+        let encoded = encode_with_key(b"hello", unique_flags(0), key, nonce).unwrap();
+        assert_eq!(encoded.flags.0, 0x18);
+        // PV-UNIQUE-KEY-HELLO in Appendix B.
+        assert_eq!(
+            blake3::Hash::from(encoded.hash).to_hex().as_str(),
+            "ca2bb927d0c0ac7196480fdf9c5101615bd8bc349663ffd9c3fef37228675a62"
+        );
+        assert_eq!(
+            &encoded.stored[12..],
+            [
+                0x64, 0xce, 0x14, 0x33, 0x22, 0xbc, 0x47, 0xc9, 0xe5, 0xcc, 0xec, 0xe2, 0xdd, 0x29,
+                0xf5, 0xe4, 0x22, 0xc2, 0xe7, 0xbc, 0xd2
+            ]
+        );
+        let meta = descriptor(&encoded, 5);
+        let plain = verify(
+            encoded.stored.clone(),
+            &encoded.key,
+            encoded.hash,
+            &meta,
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(&*plain, b"hello");
+
+        // Without bit 4 the reader expects the plain BLAKE3 digest instead.
+        let mut convergent = meta.clone();
+        convergent.flags.set_unique_key(false);
+        assert!(matches!(
+            verify(
+                encoded.stored,
+                &encoded.key,
+                encoded.hash,
+                &convergent,
+                limits()
+            ),
+            Err(PithosError::BlockHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn every_unique_key_encoding_has_a_fresh_key_and_identity() {
+        let plain = b"the same plaintext block";
+        let first = encode(plain, unique_flags(3), [1; 12]).unwrap();
+        let second = encode(plain, unique_flags(3), [1; 12]).unwrap();
+        assert_ne!(
+            first.key.expose_for_protocol(),
+            second.key.expose_for_protocol()
+        );
+        assert_ne!(first.hash, second.hash);
+        assert_ne!(first.hash, crypto::block_hash(plain));
+        let meta = descriptor(&second, plain.len());
+        assert!(matches!(
+            verify(
+                second.stored.clone(),
+                &first.key,
+                second.hash,
+                &meta,
+                limits()
+            ),
+            Err(PithosError::Crypt(_))
+        ));
+        assert!(matches!(
+            verify(second.stored, &second.key, first.hash, &meta, limits()),
+            Err(PithosError::BlockHashMismatch { .. })
+        ));
+        assert!(matches!(
+            encode(plain, ProcessingFlags(0x10), [0; 12]),
+            Err(PithosError::ProcessingRequiresEncryption(0x10))
+        ));
     }
 
     #[test]

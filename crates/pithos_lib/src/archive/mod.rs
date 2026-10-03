@@ -58,8 +58,8 @@ pub(crate) fn decode_validated_directory(
     )
 }
 pub use writer::{
-    ArchiveWriter, CdcConfig, CreateError, EntryMetadata, EntryReference, FinishError,
-    IncompleteWriter, ProcessingOptions, WriteOptions, WriterError, WrittenEntry,
+    ArchiveWriter, BlockKeyMode, CdcConfig, CreateError, EntryMetadata, EntryReference,
+    FinishError, IncompleteWriter, ProcessingOptions, WriteOptions, WriterError, WrittenEntry,
 };
 
 #[cfg(test)]
@@ -68,6 +68,8 @@ mod tests {
     use super::index::build_effective_index;
     use super::types::*;
     use super::validation::IndexLimits;
+    use crate::error::PithosError;
+    use crate::format::header::FormatVersion;
     use proptest::prelude::*;
     use std::sync::Arc;
 
@@ -84,7 +86,7 @@ mod tests {
         BlockDescriptor {
             stored_size: size,
             original_size: size,
-            processing: Processing::from_byte(0).unwrap(),
+            processing: Processing::from_byte(0, FormatVersion::V1_1).unwrap(),
             location: BlockLocation::External(ExternalLocation::new("opaque")),
         }
     }
@@ -93,7 +95,7 @@ mod tests {
         BlockDescriptor {
             stored_size: span.len().saturating_sub(4),
             original_size: 1,
-            processing: Processing::from_byte(0).unwrap(),
+            processing: Processing::from_byte(0, FormatVersion::V1_1).unwrap(),
             location: BlockLocation::Local(span),
         }
     }
@@ -115,6 +117,34 @@ mod tests {
             relationships: Vec::new(),
             recipient_pairs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn processing_flags_follow_the_version_and_encryption_rules() {
+        for version in [FormatVersion::V1_0, FormatVersion::V1_1] {
+            assert_eq!(
+                Processing::from_byte(0x0b, version).unwrap().to_byte(),
+                0x0b
+            );
+            assert!(matches!(
+                Processing::from_byte(0x40, version),
+                Err(PithosError::ReservedProcessingBits(0x40))
+            ));
+        }
+        assert_eq!(
+            Processing::from_byte(0x1b, FormatVersion::V1_1)
+                .unwrap()
+                .to_byte(),
+            0x1b
+        );
+        assert!(matches!(
+            Processing::from_byte(0x1b, FormatVersion::V1_0),
+            Err(PithosError::UnsupportedProcessingFlags(0x1b))
+        ));
+        assert!(matches!(
+            Processing::from_byte(0x13, FormatVersion::V1_1),
+            Err(PithosError::ProcessingRequiresEncryption(0x13))
+        ));
     }
 
     #[test]

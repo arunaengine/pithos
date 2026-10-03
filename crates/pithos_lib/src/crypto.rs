@@ -6,7 +6,7 @@
 
 use crate::format::header::FormatVersion;
 use chacha20poly1305::{
-    ChaCha20Poly1305, KeyInit, Nonce,
+    ChaCha20Poly1305, Key, KeyInit, Nonce,
     aead::{Aead, Generate, Payload},
 };
 use digest::{ExtendableOutput, Update, XofReader};
@@ -311,6 +311,20 @@ pub(crate) fn derive_block_key(plaintext: &[u8]) -> BlockKey {
 
 pub(crate) fn block_hash(plaintext: &[u8]) -> [u8; 32] {
     *blake3::hash(plaintext).as_bytes()
+}
+
+/// BLAKE3 key derivation context of the identity subkey of a unique block key.
+const BLOCK_IDENTITY_CONTEXT: &str = "pithos 1.1 block identity";
+
+/// A fresh random key for one unique-key block.
+pub(crate) fn random_block_key() -> BlockKey {
+    BlockKey(Key::generate().into())
+}
+
+/// The keyed block hash of a unique-key block, keyed with a subkey of its block key.
+pub(crate) fn keyed_block_hash(key: &BlockKey, plaintext: &[u8]) -> [u8; 32] {
+    let subkey = Zeroizing::new(blake3::derive_key(BLOCK_IDENTITY_CONTEXT, &key.0));
+    *blake3::keyed_hash(&subkey, plaintext).as_bytes()
 }
 
 pub(crate) fn seal_block_with_nonce(

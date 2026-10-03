@@ -21,7 +21,11 @@ pub struct ProcessingFlags(pub u8);
 impl ProcessingFlags {
     const COMPRESSION_MASK: u8 = 0b0000_0111;
     const ENCRYPTION_MASK: u8 = 0b0000_1000;
-    pub const RESERVED_MASK: u8 = 0b1111_0000;
+    /// Version 1.1: the block key is random and the block hash is a keyed identity.
+    pub const UNIQUE_KEY_MASK: u8 = 0b0001_0000;
+    /// Bits that are valid only in version 1.1 archives and only with encryption.
+    pub const VERSION_1_1_MASK: u8 = Self::UNIQUE_KEY_MASK;
+    pub const RESERVED_MASK: u8 = 0b1110_0000;
 
     pub fn new(encrypted: bool, compression_level: Option<u8>) -> Self {
         let mut flags = ProcessingFlags(0b0);
@@ -57,6 +61,18 @@ impl ProcessingFlags {
 
     pub fn is_encrypted(&self) -> bool {
         (self.0 & Self::ENCRYPTION_MASK) != 0
+    }
+
+    pub fn set_unique_key(&mut self, unique: bool) {
+        if unique {
+            self.0 |= Self::UNIQUE_KEY_MASK;
+        } else {
+            self.0 &= !Self::UNIQUE_KEY_MASK;
+        }
+    }
+
+    pub fn is_unique_key(&self) -> bool {
+        (self.0 & Self::UNIQUE_KEY_MASK) != 0
     }
 
     pub fn set_compression_level(&mut self, mut compression_level: u8) {
