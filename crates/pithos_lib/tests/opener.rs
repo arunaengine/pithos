@@ -314,3 +314,62 @@ fn a_view_decodes_blocks_from_bytes_the_caller_fetched() {
     let error = view.decode_block(&block, &stored).unwrap_err();
     assert!(error.to_string().contains("block marker"), "{error}");
 }
+
+#[test]
+fn a_view_checks_its_own_block_limits_for_blocks_planned_by_another_view() {
+    let bytes = many_blocks(4);
+    let keys = || AccessKeys::new().with_key(private_key("sender"));
+    let open = |limits: OpenLimits| {
+        drive(
+            &bytes,
+            OpenOptions::default()
+                .with_access_keys(keys())
+                .with_limits(limits),
+        )
+        .0
+        .unwrap()
+    };
+    let permissive = open(OpenLimits::default());
+    let block = permissive
+        .plan_range("data", 0..1)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let BlockRequest::Local { offset, len } = block.request() else {
+        panic!("unexpected external block");
+    };
+    let stored = &bytes[offset as usize..(offset + len) as usize];
+    assert_eq!(permissive.decode_block(&block, stored).unwrap().len(), 16);
+
+    for (limits, field) in [
+        (
+            OpenLimits {
+                max_stored_block_bytes: 15,
+                ..OpenLimits::default()
+            },
+            "stored block",
+        ),
+        (
+            OpenLimits {
+                max_decoded_block_bytes: 15,
+                ..OpenLimits::default()
+            },
+            "decoded block",
+        ),
+    ] {
+        let restrictive = open(limits);
+        // A short response proves that the limits are checked before the stored bytes.
+        for response in [stored, &stored[1..]] {
+            let error = restrictive.decode_block(&block, response).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    PithosError::LimitExceeded { field: name, limit: 15, actual: 16 }
+                        if name == field
+                ),
+                "{error:?}"
+            );
+        }
+    }
+}

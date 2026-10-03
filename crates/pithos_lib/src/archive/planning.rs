@@ -133,20 +133,7 @@ impl<'a> ReadPlan<'a> {
         if end <= self.range.start() {
             return Ok(None);
         }
-        if descriptor.stored_size > self.limits.max_stored_bytes {
-            return Err(PithosError::LimitExceeded {
-                field: "stored block",
-                limit: self.limits.max_stored_bytes,
-                actual: descriptor.stored_size,
-            });
-        }
-        if descriptor.original_size > self.limits.max_decoded_bytes {
-            return Err(PithosError::LimitExceeded {
-                field: "decoded block",
-                limit: self.limits.max_decoded_bytes,
-                actual: descriptor.original_size,
-            });
-        }
+        check_block_limits(descriptor, self.limits)?;
         let convert = |value: u64| {
             usize::try_from(value).map_err(|_| PithosError::InvalidDirectoryRange {
                 operation: "convert range index",
@@ -161,6 +148,28 @@ impl<'a> ReadPlan<'a> {
             output: output_start..output_end,
         }))
     }
+}
+
+/// Checks a block against the stored and decoded size limits.
+pub(crate) fn check_block_limits(
+    descriptor: &BlockDescriptor,
+    limits: block::Limits,
+) -> Result<(), PithosError> {
+    if descriptor.stored_size > limits.max_stored_bytes {
+        return Err(PithosError::LimitExceeded {
+            field: "stored block",
+            limit: limits.max_stored_bytes,
+            actual: descriptor.stored_size,
+        });
+    }
+    if descriptor.original_size > limits.max_decoded_bytes {
+        return Err(PithosError::LimitExceeded {
+            field: "decoded block",
+            limit: limits.max_decoded_bytes,
+            actual: descriptor.original_size,
+        });
+    }
+    Ok(())
 }
 
 impl Iterator for ReadPlan<'_> {

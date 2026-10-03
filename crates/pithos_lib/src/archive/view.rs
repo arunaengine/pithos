@@ -1,6 +1,6 @@
 use super::access::ResolvedAccess;
 use super::index::ArchiveIndex;
-use super::planning::{PlannedBlock, ReadPlan};
+use super::planning::{PlannedBlock, ReadPlan, check_block_limits};
 #[cfg(feature = "crypt4gh")]
 use super::reader::AccessKeys;
 use super::reader::{ArchiveEntry, ContentAvailability, OpenLimits, archive_entry};
@@ -77,14 +77,15 @@ impl ArchiveView {
 
     /// Decodes one planned block from its stored bytes, `BLCK` followed by the payload.
     ///
-    /// Checks the marker, the sizes, decryption, decompression and the block identity, and
-    /// returns the whole verified block. This is CPU work without I/O, so callers may run it
-    /// on a blocking pool.
+    /// Checks this view's block limits before anything is copied, then the marker, the sizes,
+    /// decryption, decompression and the block identity, and returns the whole verified block.
+    /// This is CPU work without I/O, so callers may run it on a blocking pool.
     pub fn decode_block(
         &self,
         block: &PlannedBlock,
         stored: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, PithosError> {
+        check_block_limits(&block.descriptor, self.block_limits())?;
         let expected = block.framed_len();
         if stored.len() as u64 != expected {
             return Err(PithosError::BlockSizeMismatch {
