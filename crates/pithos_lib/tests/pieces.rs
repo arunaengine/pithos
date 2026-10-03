@@ -306,12 +306,14 @@ fn a_composed_file_exports_to_crypt4gh_with_a_fresh_data_key() {
 }
 
 /// One 5 TiB file at 4 MiB blocks has 1,310,720 blocks. Tiny blocks give the same directory
-/// shape, and the default open limits must admit it.
+/// shape, and the default open limits must admit it. A single piece holds the whole list, as
+/// when one upload part covers the object. Offsets are smaller than real ones, so the real
+/// directory is about 8 bytes per block larger.
 #[test]
 #[ignore = "slow in debug builds (about 5 minutes, 8 seconds with --release); run with --ignored"]
 fn a_composition_with_the_block_count_of_5_tib_opens_with_default_limits() {
     const BLOCKS: u32 = 1_310_720;
-    const PIECES: u32 = 10;
+    const PIECES: u32 = 1;
     let per_piece = BLOCKS / PIECES;
     let parts = (0..PIECES)
         .map(|piece| {

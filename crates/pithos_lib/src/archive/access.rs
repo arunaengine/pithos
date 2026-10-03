@@ -84,13 +84,12 @@ impl ResolvedAccess {
         id: FileId,
         entries: impl IntoIterator<Item = (crate::archive::types::BlockHash, &'a [u8; 32])>,
     ) {
-        self.block_keys.insert(
-            id,
-            entries
-                .into_iter()
-                .map(|(hash, key)| (hash, BlockKey::from_protocol(key)))
-                .collect(),
-        );
+        // Inserting one by one avoids the sorted copy that collecting into a map would make.
+        let mut keys = BTreeMap::new();
+        for (hash, key) in entries {
+            keys.insert(hash, BlockKey::from_protocol(key));
+        }
+        self.block_keys.insert(id, keys);
     }
 
     pub(crate) fn block_key(

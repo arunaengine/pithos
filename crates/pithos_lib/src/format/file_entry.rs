@@ -83,17 +83,19 @@ impl BlockDataState {
     }
 }
 
+/// Rejects a hash listed with two different keys. Sorting indices keeps the extra memory at
+/// one index per entry instead of a copy of the list.
 pub(crate) fn validate_unique_block_references(
     entries: &[BlockDataEntry],
 ) -> Result<(), PithosError> {
-    let mut keys = HashMap::with_capacity(entries.len());
-    for (hash, key) in entries {
-        if keys
-            .insert(*hash, *key)
-            .is_some_and(|existing| existing != *key)
-        {
-            return Err(PithosError::DuplicateBlockReference);
-        }
+    let mut order = (0..entries.len()).collect::<Vec<_>>();
+    order.sort_unstable_by(|left, right| entries[*left].0.cmp(&entries[*right].0));
+    let conflict = order.windows(2).any(|pair| {
+        let (left, right) = (&entries[pair[0]], &entries[pair[1]]);
+        left.0 == right.0 && left.1 != right.1
+    });
+    if conflict {
+        return Err(PithosError::DuplicateBlockReference);
     }
     Ok(())
 }
@@ -367,6 +369,34 @@ fn decode_decrypted_block_list_reader_with_budget<R: Read>(
         entries.push((hash, key));
     }
     Ok(entries)
+}
+
+/// Appends one decrypted block list to `entries`. The caller checks the combined list for
+/// conflicting keys.
+pub(crate) fn append_decrypted_block_list(
+    bytes: &[u8],
+    limits: &DeserializationLimits,
+    remaining_block_references: &mut u64,
+    entries: &mut Vec<BlockDataEntry>,
+) -> Result<(), DeserializationError> {
+    let mut reader = std::io::Cursor::new(bytes);
+    let count = bounded_len(
+        reader.read_varint::<u64>()?,
+        limits.max_block_references.min(*remaining_block_references),
+        "block references",
+    )?;
+    *remaining_block_references -= count as u64;
+    reserve(entries, count, "block references")?;
+    for _ in 0..count {
+        let mut entry = ([0; 32], [0; 32]);
+        reader.read_exact(&mut entry.0)?;
+        reader.read_exact(&mut entry.1)?;
+        entries.push(entry);
+    }
+    if reader.position() != bytes.len() as u64 {
+        return Err(DeserializationError::InvalidLength);
+    }
+    Ok(())
 }
 
 pub(crate) fn decode_decrypted_block_list_with_budget(

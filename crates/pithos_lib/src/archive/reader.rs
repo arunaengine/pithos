@@ -715,7 +715,7 @@ pub(super) fn resolve_block_lists(
 ) -> Result<(), PithosError> {
     directory.files.try_for_each_mut(|id, file| {
         let file_id = FileId(id);
-        match &file.block_data {
+        match &mut file.block_data {
             BlockDataState::Decrypted(entries) => {
                 record_block_keys(access, file_id, entries);
             }
@@ -726,6 +726,10 @@ pub(super) fn resolve_block_lists(
                 {
                     return Ok(());
                 }
+                let key_ids = pieces.iter().map(|piece| FileId(piece.key_id)).collect();
+                let pieces = std::mem::take(pieces);
+                // Each sealed piece is dropped after decryption and each plaintext after
+                // decoding, so only the final list and one piece buffer are held.
                 let mut entries = Zeroizing::new(Vec::new());
                 for piece in pieces {
                     let key = access
@@ -734,25 +738,16 @@ pub(super) fn resolve_block_lists(
                     let mut decoded_limits = deserialization_limits(limits);
                     decoded_limits.max_block_references = *remaining_block_references;
                     let plaintext = crypto::open_file_block_list(key, &piece.sealed)?;
-                    let piece_entries =
-                        crate::format::file_entry::decode_decrypted_block_list_with_budget(
-                            &plaintext,
-                            &decoded_limits,
-                            remaining_block_references,
-                        )?;
-                    entries.try_reserve(piece_entries.len()).map_err(|_| {
-                        PithosError::AllocationFailed {
-                            field: "block list pieces",
-                            size: piece_entries.len() as u64,
-                        }
-                    })?;
-                    entries.extend_from_slice(&piece_entries);
+                    drop(piece);
+                    crate::format::file_entry::append_decrypted_block_list(
+                        &plaintext,
+                        &decoded_limits,
+                        remaining_block_references,
+                        &mut entries,
+                    )?;
                 }
                 crate::format::file_entry::validate_unique_block_references(&entries)?;
-                access.insert_pieces(
-                    file_id,
-                    pieces.iter().map(|piece| FileId(piece.key_id)).collect(),
-                );
+                access.insert_pieces(file_id, key_ids);
                 record_block_keys(access, file_id, &entries);
                 file.block_data = BlockDataState::Decrypted(entries);
             }
