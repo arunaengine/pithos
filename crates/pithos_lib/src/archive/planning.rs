@@ -292,6 +292,9 @@ pub struct BlockBatches<'a> {
     pending: Option<Result<PlannedBlock, PithosError>>,
 }
 
+/// Most planned blocks in one batch. Repeated blocks add no bytes, so this bounds their count.
+pub const MAX_BATCH_BLOCKS: usize = 1024;
+
 impl Iterator for BlockBatches<'_> {
     type Item = Result<BlockBatch, PithosError>;
 
@@ -307,7 +310,10 @@ impl Iterator for BlockBatches<'_> {
         };
         let (mut last, mut end, mut total) = (offset, offset + len, len);
         let mut blocks = vec![first];
-        for next in self.plan.by_ref() {
+        while blocks.len() < MAX_BATCH_BLOCKS {
+            let Some(next) = self.plan.next() else {
+                break;
+            };
             match next.as_ref().map(PlannedBlock::local_span) {
                 Ok(Some((offset, len))) if offset == last && offset + len == end => {
                     blocks.extend(next.ok());

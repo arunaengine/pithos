@@ -4,7 +4,8 @@ use common::append::append_fixture;
 use common::util::{fixture, private_key};
 use pithos_lib::archive::{
     AccessKeys, Archive, ArchiveOpener, ArchivePath, ArchiveView, ArchiveWriter, BlockRequest,
-    Chunking, EntryMetadata, OpenLimits, OpenOptions, ProcessingOptions, WriteOptions,
+    Chunking, EntryMetadata, MAX_BATCH_BLOCKS, OpenLimits, OpenOptions, ProcessingOptions,
+    WriteOptions,
 };
 use pithos_lib::error::PithosError;
 use pithos_lib::source::{ArchiveSource, MemorySource, SourceError};
@@ -433,6 +434,51 @@ fn repeated_adjacent_blocks_are_fetched_once() {
     let mut decoded = Vec::new();
     for (block, stored) in batches[0].split(response).unwrap() {
         decoded.extend_from_slice(&view.decode_block(block, stored).unwrap()[block.output()]);
+    }
+    assert_eq!(decoded, content);
+}
+
+#[test]
+fn long_runs_of_one_repeated_block_are_split_into_bounded_batches() {
+    let blocks = 2 * MAX_BATCH_BLOCKS + 3;
+    let content = [7u8; 16].repeat(blocks);
+    let sender = private_key("sender");
+    let options = WriteOptions::new(sender.duplicate(), vec![sender.public_key()])
+        .with_chunking(Chunking::Fixed(16));
+    let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("data").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(true, 0).unwrap(),
+            Some(content.len() as u64),
+            std::io::Cursor::new(content.clone()),
+        )
+        .unwrap();
+    let bytes = writer.finish().unwrap();
+    let keys = OpenOptions::default().with_access_keys(AccessKeys::new().with_key(sender));
+    let view = drive(&bytes, keys).0.unwrap();
+    let batches = view
+        .plan_range("data", 0..content.len() as u64)
+        .unwrap()
+        .batches(1024)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(batches.len(), 3);
+    assert!(
+        batches
+            .iter()
+            .all(|batch| batch.blocks().len() <= MAX_BATCH_BLOCKS)
+    );
+    let mut decoded = Vec::new();
+    for batch in &batches {
+        let BlockRequest::Local { offset, len } = batch.request() else {
+            panic!("unexpected external block");
+        };
+        let response = &bytes[offset as usize..(offset + len) as usize];
+        for (block, stored) in batch.split(response).unwrap() {
+            decoded.extend_from_slice(&view.decode_block(block, stored).unwrap()[block.output()]);
+        }
     }
     assert_eq!(decoded, content);
 }
