@@ -1,17 +1,14 @@
 use super::opener::{ArchiveOpener, OpenSettings};
+use super::planning::{BlockRequest, PlannedBlock, ReadPlan};
 use super::{AccessProvenance, AppendSnapshot, ArchiveView, FileId, ResolvedAccess, Span};
 use crate::archive::index::ArchiveIndex;
 use crate::archive::types::{
     BlockHash, BlockLocation, ContentState, Entry, ExternalLocation, ReadRange,
 };
-use crate::block;
 #[cfg(feature = "crypt4gh")]
 use crate::crypto::FileKey;
 use crate::crypto::{self, PrivateKey};
 use crate::error::PithosError;
-use crate::format::block::{
-    BlockIndexEntry, BlockLocation as FormatBlockLocation, ProcessingFlags,
-};
 use crate::format::directory::Directory;
 use crate::format::encryption::RecipientData;
 use crate::format::file_entry::{BlockDataEntry, BlockDataState};
@@ -355,9 +352,9 @@ where
     }
 
     pub fn copy_to<W: Write + ?Sized>(&self, path: &str, sink: &mut W) -> Result<(), PithosError> {
-        let (id, _) = self.view.content_id(path)?;
+        let (id, size) = self.view.content_id(path)?;
         self.require_content_available(id)?;
-        self.copy_plan(id, self.view.index.full_file_plan(id)?, sink)
+        self.copy_plan(self.view.plan(id, ReadRange::new(0..size, size)?)?, sink)
     }
 
     pub fn copy_range_to<W: Write + ?Sized>(
@@ -366,10 +363,7 @@ where
         range: Range<u64>,
         sink: &mut W,
     ) -> Result<(), PithosError> {
-        let (id, size) = self.view.content_id(path)?;
-        let range = ReadRange::new(range, size)?;
-        self.require_content_available(id)?;
-        self.copy_plan(id, self.view.index.range_plan(id, range)?, sink)
+        self.copy_plan(self.view.plan_range(path, range)?, sink)
     }
 
     #[cfg(feature = "crypt4gh")]
@@ -424,14 +418,16 @@ where
     ) -> Result<(), ContentOperationError<CallbackError>> {
         self.require_content_available(id)
             .map_err(ContentOperationError::Core)?;
-        let plan = self
+        let size = self
             .view
-            .index
-            .full_file_plan(id)
+            .content_size(id)
             .map_err(ContentOperationError::Core)?;
-        for block in plan.blocks {
-            let plaintext = self
-                .verified_block(id, &block)
+        let plan = ReadRange::new(0..size, size)
+            .and_then(|range| self.view.plan(id, range))
+            .map_err(ContentOperationError::Core)?;
+        for block in plan {
+            let plaintext = block
+                .and_then(|block| self.verified_block(&block))
                 .map_err(ContentOperationError::Core)?;
             operation(plaintext).map_err(ContentOperationError::Callback)?;
         }
@@ -444,69 +440,28 @@ where
 
     fn copy_plan<W: Write + ?Sized>(
         &self,
-        id: FileId,
-        plan: super::planning::ReadPlan,
+        plan: ReadPlan<'_>,
         sink: &mut W,
     ) -> Result<(), PithosError> {
-        for block in plan.blocks {
-            let plaintext = self.verified_block(id, &block)?;
-            sink.write_all(&plaintext[block.output])?;
+        for block in plan {
+            let block = block?;
+            let plaintext = self.verified_block(&block)?;
+            sink.write_all(&plaintext[block.output()])?;
         }
         Ok(())
     }
 
-    fn verified_block(
-        &self,
-        id: FileId,
-        planned: &super::planning::PlannedBlock,
-    ) -> Result<Zeroizing<Vec<u8>>, PithosError> {
-        if planned.descriptor.stored_size > self.view.limits.max_stored_block_bytes {
-            return Err(PithosError::LimitExceeded {
-                field: "stored block",
-                limit: self.view.limits.max_stored_block_bytes,
-                actual: planned.descriptor.stored_size,
-            });
-        }
-        if planned.descriptor.original_size > self.view.limits.max_decoded_block_bytes {
-            return Err(PithosError::LimitExceeded {
-                field: "decoded block",
-                limit: self.view.limits.max_decoded_block_bytes,
-                actual: planned.descriptor.original_size,
-            });
-        }
-        let stored = match &planned.descriptor.location {
-            BlockLocation::Local(span) => {
-                let mut marker = [0; 4];
-                self.source.read_exact_at(span.start(), &mut marker)?;
-                crate::format::block::decode_block_marker(&mut marker.as_slice())?;
-                let payload_start =
-                    span.start()
-                        .checked_add(4)
-                        .ok_or(PithosError::InvalidDirectoryRange {
-                            operation: "read block payload",
-                        })?;
-                read_source(
-                    &self.source,
-                    payload_start,
-                    planned.descriptor.stored_size,
-                    "block",
-                )?
-            }
-            BlockLocation::External(location) => {
-                let expected_len =
-                    planned
-                        .descriptor
-                        .stored_size
-                        .checked_add(4)
-                        .ok_or_else(|| {
-                            PithosError::ExternalBlockFraming("response size overflow".into())
-                        })?;
+    /// Fetches one planned block with a single read and verifies it.
+    fn verified_block(&self, block: &PlannedBlock) -> Result<Zeroizing<Vec<u8>>, PithosError> {
+        let stored = match block.request() {
+            BlockRequest::Local { offset, len } => read_source(&self.source, offset, len, "block")?,
+            BlockRequest::External { location, len } => {
                 let response = self.external.resolve(
                     self.external_access_policy.as_deref().ok_or(
                         PithosError::UnsupportedFeature(ArchiveFeature::ExternalStorage),
                     )?,
-                    location,
-                    expected_len,
+                    &location,
+                    len,
                     self.view
                         .limits
                         .max_stored_block_bytes
@@ -515,38 +470,15 @@ where
                             PithosError::ExternalBlockFraming("response policy overflow".into())
                         })?,
                 )?;
-                if response.len() as u64 != expected_len {
+                if response.len() as u64 != len {
                     return Err(PithosError::ExternalBlockFraming(
                         "response does not match expected size".into(),
                     ));
                 }
-                let (mut marker, stored) = response.split_at(4);
-                crate::format::block::decode_block_marker(&mut marker)?;
-                stored.to_vec()
+                response
             }
         };
-        let meta = BlockIndexEntry {
-            offset: 0,
-            stored_size: planned.descriptor.stored_size,
-            original_size: planned.descriptor.original_size,
-            flags: ProcessingFlags::from_byte(planned.descriptor.processing.to_byte()),
-            location: FormatBlockLocation::Local,
-        };
-        let key = self
-            .view
-            .access
-            .block_key(id, planned.hash)
-            .ok_or(PithosError::ContentUnavailable)?;
-        block::verify(
-            stored,
-            key,
-            planned.hash.0,
-            &meta,
-            block::Limits {
-                max_stored_bytes: self.view.limits.max_stored_block_bytes,
-                max_decoded_bytes: self.view.limits.max_decoded_block_bytes,
-            },
-        )
+        self.view.decode_block(block, &Zeroizing::new(stored))
     }
 }
 

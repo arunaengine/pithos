@@ -28,6 +28,7 @@ pub(crate) use path_validation::{
     validate_directory_entries, validate_new_candidate, validate_symlink_target,
 };
 pub use pieces::{Composition, Piece, PieceEncoder, compose};
+pub use planning::{BlockRequest, PlannedBlock, ReadPlan};
 #[cfg(feature = "crypt4gh")]
 pub(crate) use reader::ContentOperationError;
 pub use reader::{
@@ -71,6 +72,7 @@ pub use writer::{
 mod tests {
     use super::access::{AccessProvenance, ResolvedAccess};
     use super::index::build_effective_index;
+    use super::planning::ReadPlan;
     use super::types::*;
     use super::validation::IndexLimits;
     use crate::error::PithosError;
@@ -93,6 +95,13 @@ mod tests {
             original_size: size,
             processing: Processing::from_byte(0, FormatVersion::V1_1).unwrap(),
             location: BlockLocation::External(ExternalLocation::new("opaque")),
+        }
+    }
+
+    fn test_limits() -> crate::block::Limits {
+        crate::block::Limits {
+            max_stored_bytes: 1024,
+            max_decoded_bytes: 1024,
         }
     }
 
@@ -409,7 +418,12 @@ mod tests {
             Entry::File(_)
         ));
         assert!(matches!(
-            index.full_file_plan(FileId(1)),
+            ReadPlan::new(
+                &index,
+                FileId(1),
+                ReadRange::new(0..10, 10).unwrap(),
+                test_limits()
+            ),
             Err(crate::error::PithosError::ContentUnavailable)
         ));
     }
@@ -430,10 +444,13 @@ mod tests {
         value.descriptors = vec![(first, descriptor(4)), (second, descriptor(6))];
         let index = build_effective_index(&[value], 1_000, IndexLimits::default()).unwrap();
         let range = ReadRange::new(3..7, 10).unwrap();
-        let plan = index.range_plan(FileId(1), range).unwrap();
-        assert_eq!(plan.blocks.len(), 2);
-        assert_eq!(plan.blocks[0].output, 3..4);
-        assert_eq!(plan.blocks[1].output, 0..3);
+        let plan = ReadPlan::new(&index, FileId(1), range, test_limits())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].output(), 3..4);
+        assert_eq!(plan[1].output(), 0..3);
     }
 
     #[test]

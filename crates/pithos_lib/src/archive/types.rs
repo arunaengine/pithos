@@ -263,6 +263,10 @@ impl BlockReferences {
     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = BlockHash> + '_ {
         self.0.iter().copied()
     }
+
+    pub(crate) fn as_slice(&self) -> &[BlockHash] {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,7 +1,6 @@
-use crate::archive::planning::{ReadPlan, full_file_plan, range_plan};
 use crate::archive::types::{
-    ArchivePath, BlockDescriptor, BlockHash, ContentState, Entry, FileId, ReadRange, RelationId,
-    SegmentEntry, Span, ValidatedSegment,
+    ArchivePath, BlockDescriptor, BlockHash, ContentState, Entry, FileId, RelationId, SegmentEntry,
+    Span, ValidatedSegment,
 };
 use crate::archive::validation::{IndexLimits, validate_aggregate, validate_entry};
 use crate::error::PithosError;
@@ -92,14 +91,6 @@ impl ArchiveIndex {
         Option<FileId>,
     ) {
         (self.entries, self.descriptors, self.maximum_id)
-    }
-
-    pub(crate) fn full_file_plan(&self, id: FileId) -> Result<ReadPlan, PithosError> {
-        full_file_plan(self, id)
-    }
-
-    pub(crate) fn range_plan(&self, id: FileId, range: ReadRange) -> Result<ReadPlan, PithosError> {
-        range_plan(self, id, range)
     }
 }
 

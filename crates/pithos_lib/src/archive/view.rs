@@ -1,14 +1,19 @@
 use super::access::ResolvedAccess;
 use super::index::ArchiveIndex;
+use super::planning::{PlannedBlock, ReadPlan};
 #[cfg(feature = "crypt4gh")]
 use super::reader::AccessKeys;
 use super::reader::{ArchiveEntry, ContentAvailability, OpenLimits, archive_entry};
 use super::snapshot::AppendSnapshot;
-use super::types::{ArchivePath, FileId, Span, ValidatedSegment};
+use super::types::{ArchivePath, FileId, ReadRange, Span, ValidatedSegment};
 use super::validation::IndexLimits;
+use crate::block;
 use crate::error::PithosError;
+use crate::format::block::{BlockIndexEntry, BlockLocation, ProcessingFlags};
 use crate::format::header::FormatVersion;
 use std::collections::BTreeMap;
+use std::ops::Range;
+use zeroize::Zeroizing;
 
 /// Validated archive metadata without a byte source.
 ///
@@ -55,6 +60,67 @@ impl ArchiveView {
             .map(|entry| archive_entry(&self.index, entry, &self.content_availability)))
     }
 
+    /// Plans a read of `range` within the content of `path`.
+    ///
+    /// Fails before any block is planned when the content is unavailable or needs an
+    /// unsupported feature.
+    pub fn plan_range(&self, path: &str, range: Range<u64>) -> Result<ReadPlan<'_>, PithosError> {
+        let (id, size) = self.content_id(path)?;
+        let range = ReadRange::new(range, size)?;
+        self.require_content_available(id)?;
+        self.plan(id, range)
+    }
+
+    pub(crate) fn plan(&self, id: FileId, range: ReadRange) -> Result<ReadPlan<'_>, PithosError> {
+        ReadPlan::new(&self.index, id, range, self.block_limits())
+    }
+
+    /// Decodes one planned block from its stored bytes, `BLCK` followed by the payload.
+    ///
+    /// Checks the marker, the sizes, decryption, decompression and the block identity, and
+    /// returns the whole verified block. This is CPU work without I/O, so callers may run it
+    /// on a blocking pool.
+    pub fn decode_block(
+        &self,
+        block: &PlannedBlock,
+        stored: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, PithosError> {
+        let expected = block.framed_len();
+        if stored.len() as u64 != expected {
+            return Err(PithosError::BlockSizeMismatch {
+                expected,
+                actual: stored.len() as u64,
+            });
+        }
+        let (mut marker, payload) = stored.split_at(4);
+        crate::format::block::decode_block_marker(&mut marker)?;
+        let key = self
+            .access
+            .block_key(block.file, block.hash)
+            .ok_or(PithosError::ContentUnavailable)?;
+        let meta = BlockIndexEntry {
+            offset: 0,
+            stored_size: block.descriptor.stored_size,
+            original_size: block.descriptor.original_size,
+            flags: ProcessingFlags::from_byte(block.descriptor.processing.to_byte()),
+            location: BlockLocation::Local,
+        };
+        block::verify(
+            Zeroizing::new(payload.to_vec()),
+            key,
+            block.hash.0,
+            &meta,
+            self.block_limits(),
+        )
+    }
+
+    pub(crate) fn block_limits(&self) -> block::Limits {
+        block::Limits {
+            max_stored_bytes: self.limits.max_stored_block_bytes,
+            max_decoded_bytes: self.limits.max_decoded_block_bytes,
+        }
+    }
+
     /// Transfers the validated state to append and grant planning.
     pub(crate) fn into_append_snapshot(self) -> AppendSnapshot {
         let Self {
@@ -88,6 +154,17 @@ impl ArchiveView {
             PithosError::InvalidBlockDataState("only data/metadata entries have content".into())
         })?;
         Ok((entry.id, content.size))
+    }
+
+    #[cfg(feature = "crypt4gh")]
+    pub(crate) fn content_size(&self, id: FileId) -> Result<u64, PithosError> {
+        self.index
+            .entry(id)
+            .and_then(|entry| entry.entry.content())
+            .map(|content| content.size)
+            .ok_or_else(|| {
+                PithosError::InvalidBlockDataState("only data/metadata entries have content".into())
+            })
     }
 
     pub(crate) fn require_content_available(&self, id: FileId) -> Result<(), PithosError> {
