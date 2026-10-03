@@ -348,3 +348,117 @@ fn a_composition_with_the_block_count_of_5_tib_opens_with_default_limits() {
         [(BLOCKS - 2).to_be_bytes(), (BLOCKS - 1).to_be_bytes()].concat()
     );
 }
+
+/// Encodes one part at `offset` in fragments that do not match blocks or BLAKE3 chunks, and
+/// returns its record after a storage round trip.
+fn hashed_piece(key_id: u64, offset: u64, part: &[u8], processing: ProcessingOptions) -> Piece {
+    let mut encoder = PieceEncoder::new(key_id, vec![public_key("recipient1")], processing)
+        .unwrap()
+        .with_block_size(BLOCK)
+        .unwrap()
+        .with_content_offset(offset)
+        .unwrap();
+    for fragment in part.chunks(777) {
+        encoder.write(fragment).unwrap();
+    }
+    encoder.flush().unwrap();
+    Piece::from_bytes(&encoder.finish().unwrap().to_bytes()).unwrap()
+}
+
+/// Encodes consecutive parts of `file` with the given sizes at their running offsets.
+fn hashed_parts(file: &[u8], sizes: &[usize]) -> Vec<Piece> {
+    let mut offset = 0;
+    let processing = ProcessingOptions::new(true, 3).unwrap();
+    let mut pieces = Vec::new();
+    for (index, size) in sizes.iter().enumerate() {
+        let part = &file[offset..offset + size];
+        pieces.push(hashed_piece(
+            index as u64 + 1,
+            offset as u64,
+            part,
+            processing,
+        ));
+        offset += size;
+    }
+    assert_eq!(offset, file.len());
+    pieces
+}
+
+fn content_hash(pieces: &[Piece]) -> Option<[u8; 32]> {
+    let path = ArchivePath::new("object").unwrap();
+    compose(path, EntryMetadata::new(0, 0, 0o644), pieces)
+        .unwrap()
+        .content_hash()
+}
+
+#[test]
+fn content_hash_of_aligned_parts_is_the_blake3_of_the_file() {
+    let file = content(5, 700_000);
+    let part = 200 * 1024;
+    let equal = [part, part, part, 700_000 - 3 * part];
+    let varied = [3072, 1024, 70 * 1024, 0, 5120, 128 * 1024, 488_032];
+    for sizes in [&equal[..], &varied[..]] {
+        let pieces = hashed_parts(&file, sizes);
+        assert_eq!(content_hash(&pieces), Some(*blake3::hash(&file).as_bytes()));
+    }
+}
+
+#[test]
+fn content_hash_of_one_piece_and_of_an_empty_file() {
+    let file = content(6, 131_079);
+    for len in [0, 1, 500, 1024, 1025, 65_536, 131_079] {
+        let pieces = hashed_parts(&file[..len], &[len]);
+        let expected = *blake3::hash(&file[..len]).as_bytes();
+        assert_eq!(content_hash(&pieces), Some(expected), "{len}");
+    }
+    assert_eq!(content_hash(&[]), Some(*blake3::hash(b"").as_bytes()));
+}
+
+#[test]
+fn content_hash_is_unknown_for_wrong_offsets_or_missing_values() {
+    let file = content(7, 5000);
+    let processing = ProcessingOptions::new(true, 0).unwrap();
+    let first = hashed_piece(1, 0, &file[..1024], processing);
+    let wrong = hashed_piece(2, 2048, &file[1024..], processing);
+    assert_eq!(content_hash(&[first.clone(), wrong]), None);
+    let second = hashed_piece(2, 1024, &file[1024..], processing);
+    assert_eq!(content_hash(std::slice::from_ref(&second)), None);
+    assert!(content_hash(&[first.clone(), second]).is_some());
+
+    let encoder = PieceEncoder::new(2, vec![public_key("recipient1")], processing).unwrap();
+    let mut encoder = encoder.with_content_hash(false).unwrap();
+    encoder.push(&file[1024..]).unwrap();
+    assert_eq!(content_hash(&[first, encoder.finish().unwrap()]), None);
+
+    let encoder = || PieceEncoder::new(1, vec![public_key("recipient1")], processing).unwrap();
+    assert!(matches!(
+        encoder().with_content_offset(1000),
+        Err(PithosError::InvalidContentOffset(1000))
+    ));
+    let mut started = encoder();
+    started.write(b"content").unwrap();
+    assert!(matches!(
+        started.with_content_offset(0),
+        Err(PithosError::PieceContentStarted)
+    ));
+}
+
+#[test]
+fn unique_key_pieces_record_no_content_hash_unless_asked() {
+    let file = content(8, 3000);
+    let unique = ProcessingOptions::new(true, 0)
+        .unwrap()
+        .with_key_mode(BlockKeyMode::Unique)
+        .unwrap();
+    assert_eq!(content_hash(&[hashed_piece(1, 0, &file, unique)]), None);
+    let mut encoder = PieceEncoder::new(1, vec![public_key("recipient1")], unique)
+        .unwrap()
+        .with_content_hash(true)
+        .unwrap();
+    encoder.push(&file).unwrap();
+    let piece = Piece::from_bytes(&encoder.finish().unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        content_hash(&[piece]),
+        Some(*blake3::hash(&file).as_bytes())
+    );
+}
