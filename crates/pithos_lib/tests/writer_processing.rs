@@ -119,3 +119,37 @@ fn short_writes_are_counted_and_completed_without_saturating_offsets() {
     archive.copy_to("data", &mut copied).unwrap();
     assert_eq!(copied, b"short writes");
 }
+
+#[test]
+fn the_largest_fixed_block_reads_with_default_limits() {
+    let size = 64 * 1024 * 1024;
+    let mut data = vec![0; size];
+    blake3::Hasher::new()
+        .update(b"incompressible block")
+        .finalize_xof()
+        .fill(&mut data);
+    let sender = PrivateKey::generate();
+    let reader = sender.duplicate();
+    let mut writer = ArchiveWriter::create(
+        Vec::new(),
+        WriteOptions::new(sender, vec![reader.public_key()]).with_chunking(Chunking::Fixed(size)),
+    )
+    .unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("large.bin").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(true, 0).unwrap(),
+            Some(size as u64),
+            Cursor::new(&data),
+        )
+        .unwrap();
+    let archive = Archive::open(
+        MemorySource::new(writer.finish().unwrap()),
+        OpenOptions::default().with_access_keys(AccessKeys::new().with_key(reader)),
+    )
+    .unwrap();
+    let mut output = Vec::new();
+    archive.copy_to("large.bin", &mut output).unwrap();
+    assert!(output == data, "the large block did not round trip");
+}

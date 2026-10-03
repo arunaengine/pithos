@@ -92,7 +92,11 @@ impl Default for OpenLimits {
             max_relationships: 1_000_000,
             max_accessible_block_references: 2_097_152,
             max_opaque_metadata_bytes: 128 * 1024 * 1024,
-            max_stored_block_bytes: 64 * 1024 * 1024,
+            // The worst case of a block at the decoded limit: the zstd bound plus nonce and tag.
+            max_stored_block_bytes: zstd::zstd_safe::compress_bound(
+                DEFAULT_MAX_DECODED_BLOCK_BYTES as usize,
+            ) as u64
+                + 28,
             max_decoded_block_bytes: DEFAULT_MAX_DECODED_BLOCK_BYTES,
         }
     }
