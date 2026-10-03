@@ -13,15 +13,21 @@ use crate::error::PithosError;
 use crate::format::directory::Directory;
 use crate::format::header::{FileHeader, FormatVersion};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroizing;
 
-/// One exact byte range the opener needs next.
+/// One exact byte range the opener needs next. It belongs to the opener that issued it, so
+/// another opener rejects it even when the range is the same.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadRequest {
+    opener: u64,
     offset: u64,
     len: u64,
     sequence: u64,
 }
+
+/// The source of opener identities. Every opener of this process gets a distinct value.
+static NEXT_OPENER: AtomicU64 = AtomicU64::new(0);
 
 impl ReadRequest {
     pub fn offset(&self) -> u64 {
@@ -68,6 +74,7 @@ pub(super) struct OpenSettings {
 /// # }
 /// ```
 pub struct ArchiveOpener {
+    identity: u64,
     archive_len: u64,
     settings: OpenSettings,
     next_sequence: u64,
@@ -120,6 +127,7 @@ impl ArchiveOpener {
             });
         }
         let mut opener = Self {
+            identity: NEXT_OPENER.fetch_add(1, Ordering::Relaxed),
             archive_len,
             settings,
             next_sequence: 0,
@@ -137,9 +145,10 @@ impl ArchiveOpener {
 
     /// Accepts the bytes for the outstanding request.
     ///
-    /// A response to another request or of the wrong length is rejected and the request stays
-    /// outstanding. Any other error ends the open. The opener takes the response so it can
-    /// release a directory's bytes as soon as they are decoded.
+    /// A response to another request, including any request of another opener, or of the wrong
+    /// length is rejected and the request stays outstanding. Any other error ends the open. The
+    /// opener takes the response so it can release a directory's bytes as soon as they are
+    /// decoded.
     pub fn feed(&mut self, request: ReadRequest, response: Vec<u8>) -> Result<(), PithosError> {
         let response = Zeroizing::new(response);
         if self.pending != Some(request) {
@@ -175,6 +184,7 @@ impl ArchiveOpener {
 
     fn issue(&mut self, offset: u64, len: u64) {
         self.pending = Some(ReadRequest {
+            opener: self.identity,
             offset,
             len,
             sequence: self.next_sequence,

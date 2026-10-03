@@ -131,6 +131,41 @@ fn feed_rejects_wrong_lengths_unknown_and_repeated_responses() {
 }
 
 #[test]
+fn feed_rejects_header_and_same_span_footer_requests_of_other_openers() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bytes = std::fs::read(fixture(&temporary, "recipient1")).unwrap();
+    let len = bytes.len() as u64;
+    let mut opener = ArchiveOpener::new(len, recipient()).unwrap();
+    let mut other = ArchiveOpener::new(len, recipient()).unwrap();
+    let header = opener.request().unwrap();
+    let foreign_header = other.request().unwrap();
+    assert_eq!(
+        (foreign_header.offset(), foreign_header.len()),
+        (header.offset(), header.len())
+    );
+    assert!(matches!(
+        opener.feed(foreign_header, bytes[..6].to_vec()),
+        Err(PithosError::UnexpectedReadResponse)
+    ));
+    opener.feed(header, bytes[..6].to_vec()).unwrap();
+    other.feed(foreign_header, bytes[..6].to_vec()).unwrap();
+
+    let footer = opener.request().unwrap();
+    let foreign_footer = other.request().unwrap();
+    assert_eq!(
+        (foreign_footer.offset(), foreign_footer.len()),
+        (footer.offset(), footer.len())
+    );
+    let tail = bytes[bytes.len() - 12..].to_vec();
+    assert!(matches!(
+        opener.feed(foreign_footer, tail.clone()),
+        Err(PithosError::UnexpectedReadResponse)
+    ));
+    assert_eq!(opener.request(), Some(footer));
+    opener.feed(footer, tail).unwrap();
+}
+
+#[test]
 fn limits_are_checked_before_a_directory_is_requested() {
     let temporary = tempfile::tempdir().unwrap();
     let bytes = std::fs::read(append_fixture(&temporary).archive).unwrap();
