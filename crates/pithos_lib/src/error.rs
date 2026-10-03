@@ -87,6 +87,8 @@ pub enum PithosError {
     UnsupportedBlockListPieces,
     #[error("block list piece key id {0} is already used by a file or another piece")]
     PieceKeyIdConflict(u64),
+    #[error("invalid piece record")]
+    InvalidPieceRecord,
     #[error("duplicate encoded recipient file id")]
     DuplicateRecipientFileId,
     #[error("reserved processing bits are set: {0:#04x}")]

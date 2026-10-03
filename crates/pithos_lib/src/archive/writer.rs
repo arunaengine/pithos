@@ -109,7 +109,7 @@ impl ProcessingOptions {
         self.compression_level
     }
 
-    fn flags(self) -> ProcessingFlags {
+    pub(crate) fn flags(self) -> ProcessingFlags {
         ProcessingFlags::new(self.encrypted, Some(self.compression_level))
     }
 }

@@ -8,6 +8,7 @@ mod access;
 mod append;
 mod index;
 mod path_validation;
+mod pieces;
 mod planning;
 mod reader;
 #[cfg(test)]
@@ -23,6 +24,7 @@ pub(crate) use index::build_effective_index;
 pub(crate) use path_validation::{
     validate_directory_entries, validate_new_candidate, validate_symlink_target,
 };
+pub use pieces::{Piece, PieceEncoder};
 pub(crate) use reader::ContentOperationError;
 pub use reader::{
     AccessKeys, Archive, ArchiveEntry, ArchiveFeature, ArchiveReference, EntryKind,
