@@ -1,7 +1,8 @@
 use super::async_reader::{AsyncArchive, AsyncExternalBlockResolver, BlockingHook};
-use super::planning::{BlockBatch, BlockBatches};
+use super::planning::{BlockBatch, BlockBatches, BlockRequest, PlannedBlock};
 use super::view::ArchiveView;
 use crate::error::PithosError;
+use crate::format::block::ProcessingFlags;
 use crate::source::AsyncArchiveSource;
 use futures_core::Stream;
 use std::collections::VecDeque;
@@ -13,11 +14,14 @@ use zeroize::Zeroizing;
 
 /// Bounds for one range stream.
 ///
-/// A batch reserves its response length, one more copy of its largest stored block (the payload
-/// copy made while decoding), the decoded size of its blocks, and the planned output of blocks
-/// that are only partly in the range. After decoding, the batch keeps only its planned output,
-/// which is released as the chunks are delivered. A batch that does not fit next to the work
-/// already buffered waits; when nothing else is buffered it starts alone, even if it is larger.
+/// Each request reserves its response, the planned output of its blocks, and the largest
+/// working set of decoding one of them: the payload copy, the decrypted bytes of an encrypted
+/// compressed block, the decoded block and a copy of a partial output. After decoding, the
+/// request keeps only its planned output, which is released as the chunks are delivered.
+///
+/// Adjacent blocks share a request only while the whole reservation fits `max_buffered_bytes`.
+/// A request that does not fit next to the work already buffered waits. The only request that
+/// may exceed the bound is a single block whose own reservation is larger; it starts alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadLimits {
     /// Source or external requests that may be outstanding at once. Zero counts as one.
@@ -41,7 +45,7 @@ impl Default for ReadLimits {
 type Pending<'a, T> = Pin<Box<dyn Future<Output = Result<T, PithosError>> + Send + 'a>>;
 
 enum State<'a> {
-    Fetching(Pending<'a, Vec<u8>>, BlockBatch),
+    Fetching(Pending<'a, Vec<u8>>, Vec<PlannedBlock>),
     Decoding(Pending<'a, Vec<Vec<u8>>>),
     Ready(VecDeque<Vec<u8>>),
     Failed(PithosError),
@@ -57,7 +61,7 @@ struct Slot<'a> {
 pub struct RangeStream<'a, S, E, B> {
     archive: &'a AsyncArchive<S, E, B>,
     batches: Option<BlockBatches<'a>>,
-    waiting: Option<(BlockBatch, u64)>,
+    waiting: VecDeque<Group>,
     slots: VecDeque<Slot<'a>>,
     limits: ReadLimits,
     buffered: u64,
@@ -78,7 +82,7 @@ where
         Self {
             archive,
             batches: Some(batches),
-            waiting: None,
+            waiting: VecDeque::new(),
             slots: VecDeque::new(),
             limits,
             buffered: 0,
@@ -86,16 +90,20 @@ where
         }
     }
 
+    /// The bytes currently reserved by requests that are fetched, decoded or waiting for
+    /// delivery, as described in [`ReadLimits`].
+    pub fn buffered_bytes(&self) -> u64 {
+        self.buffered
+    }
+
     /// Starts requests while the in-flight and byte bounds allow. Returns whether any started.
     fn admit(&mut self) -> bool {
         let mut admitted = false;
         while self.fetching < self.limits.max_in_flight.max(1) {
-            let (batch, reserved) = match self.waiting.take() {
-                Some(next) => next,
-                None => match self.batches.as_mut().and_then(Iterator::next) {
+            if self.waiting.is_empty() {
+                match self.batches.as_mut().and_then(Iterator::next) {
                     Some(Ok(batch)) => {
-                        let reserved = reservation(&batch);
-                        (batch, reserved)
+                        self.waiting = split(&batch, self.limits.max_buffered_bytes);
                     }
                     Some(Err(error)) => {
                         self.batches = None;
@@ -109,20 +117,24 @@ where
                         self.batches = None;
                         break;
                     }
-                },
+                }
+            }
+            let Some(group) = self.waiting.pop_front() else {
+                continue;
             };
+            let reserved = group.reserved();
             if !self.slots.is_empty()
                 && self.buffered.saturating_add(reserved) > self.limits.max_buffered_bytes
             {
-                self.waiting = Some((batch, reserved));
+                self.waiting.push_front(group);
                 break;
             }
             self.buffered = self.buffered.saturating_add(reserved);
             self.fetching += 1;
-            let fetch = Box::pin(self.archive.fetch(batch.request()));
+            let fetch = Box::pin(self.archive.fetch(group.request()));
             self.slots.push_back(Slot {
                 reserved,
-                state: State::Fetching(fetch, batch),
+                state: State::Fetching(fetch, group.blocks),
             });
             admitted = true;
         }
@@ -139,7 +151,7 @@ where
                     State::Fetching(fetch, _) => match fetch.as_mut().poll(cx) {
                         Poll::Ready(result) => {
                             self.fetching -= 1;
-                            let State::Fetching(_, batch) =
+                            let State::Fetching(_, blocks) =
                                 std::mem::replace(&mut slot.state, State::Taken)
                             else {
                                 unreachable!("the slot was fetching");
@@ -149,7 +161,7 @@ where
                                     let view = Arc::clone(&self.archive.view);
                                     let stored = Zeroizing::new(stored);
                                     State::Decoding(Box::pin(self.archive.hook.spawn_blocking(
-                                        move || decode_batch(&view, &batch, &stored),
+                                        move || decode_group(&view, &blocks, &stored),
                                     )))
                                 }
                                 Err(error) => State::Failed(error),
@@ -179,7 +191,7 @@ where
         }
         if failed {
             self.batches = None;
-            self.waiting = None;
+            self.waiting.clear();
         }
         progressed
     }
@@ -187,7 +199,7 @@ where
     /// Delivers the next chunk in file order, if the first batch has one ready.
     fn deliver(&mut self) -> Option<Option<Result<Vec<u8>, PithosError>>> {
         let Some(slot) = self.slots.front_mut() else {
-            let finished = self.batches.is_none() && self.waiting.is_none();
+            let finished = self.batches.is_none() && self.waiting.is_empty();
             return finished.then_some(None);
         };
         let item = match &mut slot.state {
@@ -210,7 +222,7 @@ where
                 // Dropping the remaining slots cancels their requests.
                 self.slots.clear();
                 self.batches = None;
-                self.waiting = None;
+                self.waiting.clear();
                 Err(error)
             }
             State::Fetching(..) | State::Decoding(_) | State::Taken => return None,
@@ -249,38 +261,94 @@ where
     }
 }
 
-/// The bytes a batch may hold at once. See [`ReadLimits`].
-fn reservation(batch: &BlockBatch) -> u64 {
-    batch.blocks().iter().fold(
-        batch
-            .blocks()
-            .iter()
-            .map(|block| block.framed_len())
-            .max()
-            .unwrap_or(0),
-        |total, block| {
-            let output = block.output.len() as u64;
-            let partial = if output == block.descriptor.original_size {
-                0
-            } else {
-                output
-            };
-            total
-                .saturating_add(block.framed_len())
-                .saturating_add(block.descriptor.original_size)
-                .saturating_add(partial)
-        },
-    )
+/// Adjacent planned blocks fetched by one request, with the parts of their reservation.
+#[derive(Default)]
+struct Group {
+    blocks: Vec<PlannedBlock>,
+    response: u64,
+    output: u64,
+    working: u64,
 }
 
-/// Decodes every block of a batch and keeps only the planned output of each.
-fn decode_batch(
+impl Group {
+    /// The bytes this request may hold at once. See [`ReadLimits`].
+    fn reserved(&self) -> u64 {
+        self.response
+            .saturating_add(self.output)
+            .saturating_add(self.working)
+    }
+
+    fn push(&mut self, block: PlannedBlock) {
+        let framed = block.framed_len();
+        let original = block.descriptor.original_size;
+        let output = block.output.len() as u64;
+        let flags = ProcessingFlags::from_byte(block.descriptor.processing.to_byte());
+        // Decrypting before decompressing holds the payload copy and the decrypted bytes.
+        let decrypted = if flags.is_encrypted() && flags.get_compression_level() > 0 {
+            framed
+        } else {
+            0
+        };
+        let partial = if output == original { 0 } else { output };
+        let working = framed
+            .saturating_add(decrypted)
+            .saturating_add(original)
+            .saturating_add(partial);
+        self.response = self.response.saturating_add(framed);
+        self.output = self.output.saturating_add(output);
+        self.working = self.working.max(working);
+        self.blocks.push(block);
+    }
+
+    fn request(&self) -> BlockRequest {
+        let mut request = self.blocks[0].request();
+        if let BlockRequest::Local { len, .. } = &mut request {
+            *len = self.response;
+        }
+        request
+    }
+}
+
+/// Splits a batch into requests whose reservation fits `max_bytes`, keeping file order.
+/// A block that does not fit even alone becomes a request of its own.
+fn split(batch: &BlockBatch, max_bytes: u64) -> VecDeque<Group> {
+    let mut groups = VecDeque::new();
+    let mut current = Group::default();
+    for block in batch.blocks() {
+        let mut candidate = Group {
+            blocks: Vec::new(),
+            ..current
+        };
+        candidate.push(block.clone());
+        if !current.blocks.is_empty() && candidate.reserved() > max_bytes {
+            groups.push_back(std::mem::take(&mut current));
+        }
+        current.push(block.clone());
+    }
+    if !current.blocks.is_empty() {
+        groups.push_back(current);
+    }
+    groups
+}
+
+/// Decodes every block of a request and keeps only the planned output of each.
+fn decode_group(
     view: &ArchiveView,
-    batch: &BlockBatch,
+    blocks: &[PlannedBlock],
     stored: &[u8],
 ) -> Result<Vec<Vec<u8>>, PithosError> {
-    let mut chunks = Vec::with_capacity(batch.blocks().len());
-    for (block, bytes) in batch.split(stored)? {
+    let expected = blocks.iter().map(PlannedBlock::framed_len).sum::<u64>();
+    if stored.len() as u64 != expected {
+        return Err(PithosError::BlockSizeMismatch {
+            expected,
+            actual: stored.len() as u64,
+        });
+    }
+    let mut chunks = Vec::with_capacity(blocks.len());
+    let mut rest = stored;
+    for block in blocks {
+        let (bytes, tail) = rest.split_at(block.framed_len() as usize);
+        rest = tail;
         let mut plaintext = view.decode_block(block, bytes)?;
         let output = block.output();
         chunks.push(if output.start == 0 && output.end == plaintext.len() {
