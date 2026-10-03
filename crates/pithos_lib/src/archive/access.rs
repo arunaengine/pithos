@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 /// Recovered file secrets have one crate-private owner and never enter an index.
 pub(crate) struct ResolvedAccess {
-    keys: BTreeMap<FileId, FileKey>,
+    /// Boxed keys stay in place when the map rearranges its nodes, so no stale copy remains.
+    keys: BTreeMap<FileId, Box<FileKey>>,
     block_keys: BTreeMap<FileId, BTreeMap<crate::archive::types::BlockHash, BlockKey>>,
     provenance: BTreeMap<FileId, AccessProvenance>,
     /// Piece key ids of each file whose block list was sealed in pieces.
@@ -48,7 +49,7 @@ impl ResolvedAccess {
                 Ok(())
             }
             None => {
-                self.keys.insert(id, FileKey::from_protocol(key));
+                self.keys.insert(id, Box::new(FileKey::from_protocol(key)));
                 self.provenance.insert(id, provenance);
                 Ok(())
             }
@@ -56,7 +57,7 @@ impl ResolvedAccess {
     }
 
     pub(crate) fn key(&self, id: FileId) -> Option<&FileKey> {
-        self.keys.get(&id)
+        self.keys.get(&id).map(Box::as_ref)
     }
 
     #[cfg(feature = "crypt4gh")]
@@ -73,9 +74,9 @@ impl ResolvedAccess {
         match self.pieces.get(&id) {
             Some(key_ids) => key_ids
                 .iter()
-                .map(|key_id| self.keys.get(key_id).map(|key| (*key_id, key)))
+                .map(|key_id| self.key(*key_id).map(|key| (*key_id, key)))
                 .collect(),
-            None => self.keys.get(&id).map(|key| vec![(id, key)]),
+            None => self.key(id).map(|key| vec![(id, key)]),
         }
     }
 

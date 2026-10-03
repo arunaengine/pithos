@@ -580,13 +580,13 @@ impl<T> Reservable for Vec<T> {
     }
 }
 
-impl<T: zeroize::Zeroize> Reservable for Zeroizing<Vec<T>> {
+impl<T: Copy + zeroize::Zeroize> Reservable for Zeroizing<Vec<T>> {
     fn reserve_capacity(
         &mut self,
         additional: usize,
         field: &'static str,
     ) -> Result<(), PithosError> {
-        self.try_reserve(additional)
+        crate::format::primitives::reserve_secret(self, additional, field)
             .map_err(|_| allocation_failed(field, additional))
     }
 }
@@ -647,8 +647,11 @@ fn allocation_failed(field: &'static str, size: usize) -> PithosError {
     }
 }
 
+/// Appends one block reference. `positions` maps each hash to its first position rather than
+/// to its key, so the map keeps no secret copies.
 fn append_block_reference(
     entry: &mut FileEntry,
+    positions: &mut HashMap<[u8; 32], usize>,
     hash: [u8; 32],
     key: &crate::crypto::BlockKey,
 ) -> Result<(), PithosError> {
@@ -657,7 +660,12 @@ fn append_block_reference(
             "block data already/still encrypted".into(),
         ));
     };
+    reserve(positions, 1, "block references")?;
     reserve(references, 1, "entry block references")?;
+    let position = *positions.entry(hash).or_insert(references.len());
+    if position < references.len() && references[position].1 != *key.expose_for_protocol() {
+        return Err(PithosError::DuplicateBlockReference);
+    }
     references.push((hash, *key.expose_for_protocol()));
     Ok(())
 }
@@ -1042,16 +1050,9 @@ impl<W: Write> ArchiveWriter<W> {
                 Err(error) => return self.poison(error),
             };
             let hash = encoded.hash;
-            if let Err(error) = reserve(&mut block_references, 1, "block references") {
-                return self.poison(error);
-            }
-            if block_references
-                .insert(hash, *encoded.key.expose_for_protocol())
-                .is_some_and(|existing| existing != *encoded.key.expose_for_protocol())
+            if let Err(error) =
+                append_block_reference(&mut delta.entry, &mut block_references, hash, &encoded.key)
             {
-                return self.poison(PithosError::DuplicateBlockReference);
-            }
-            if let Err(error) = append_block_reference(&mut delta.entry, hash, &encoded.key) {
                 return self.poison(error);
             }
             if let Some(existing) = self.directory.blocks.get(&hash) {
@@ -1293,14 +1294,8 @@ impl<W: Write> ArchiveWriter<W> {
         let BlockDataState::Decrypted(references) = &delta.entry.block_data else {
             return Err(PithosError::WriterUnsealedBlockList);
         };
-        let mut keys = HashMap::with_capacity(references.len());
-        let actual = references.iter().try_fold(0u64, |total, (hash, key)| {
-            if keys
-                .insert(*hash, *key)
-                .is_some_and(|existing| existing != *key)
-            {
-                return Err(PithosError::DuplicateBlockReference);
-            }
+        crate::format::file_entry::validate_unique_block_references(references)?;
+        let actual = references.iter().try_fold(0u64, |total, (hash, _)| {
             let descriptor_size = delta
                 .descriptors
                 .get(hash)

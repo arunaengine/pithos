@@ -226,6 +226,7 @@ impl PieceEncoder {
             checked_add(self.content_offset, self.original_size)?;
             tree.update(plaintext);
         }
+        crate::format::primitives::reserve_secret(&mut self.entries, 1, "block references")?;
         self.entries
             .push((encoded.hash, *encoded.key.expose_for_protocol()));
         if !self.seen.insert(encoded.hash) {
@@ -254,7 +255,8 @@ impl PieceEncoder {
             return Err(PithosError::UnflushedPieceBytes);
         }
         let piece_key = FileKey::from_bytes(StaticSecret::random().to_bytes());
-        let mut list = Zeroizing::new(Vec::new());
+        // An exact capacity keeps the plaintext list from moving to a new buffer while written.
+        let mut list = Zeroizing::new(Vec::with_capacity(10 + self.entries.len() * 64));
         encode_decrypted_block_list(&self.entries, &mut *list)?;
         let sealed_list =
             crypto::seal_file_block_list_with_nonce(&piece_key, &list, crypto::random_nonce())?;

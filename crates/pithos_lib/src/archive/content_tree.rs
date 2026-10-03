@@ -90,7 +90,10 @@ impl TreeHasher {
                 bytes = rest;
                 continue;
             }
-            let take = (unit - self.pending.len()).min(bytes.len());
+            // Reserving a whole unit once keeps plaintext from being copied on growth.
+            let filled = self.pending.len();
+            self.pending.reserve_exact(UNIT_LEN as usize - filled);
+            let take = (unit - filled).min(bytes.len());
             self.pending.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
             if self.pending.len() == unit {
