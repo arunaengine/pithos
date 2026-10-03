@@ -14,7 +14,6 @@ use crate::format::primitives::{
     bounded_len, decode_string, encode_string, reserve, write_len_prefix,
 };
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use crc32fast::Hasher;
 use indexmap::IndexMap;
 use integer_encoding::{VarIntReader, VarIntWriter};
 use std::cmp::Ordering;
@@ -579,6 +578,7 @@ pub(crate) fn encode_complete_directory(
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub(crate) fn update_directory_len(directory: &mut Directory) -> Result<(), SerializationError> {
     let mut bytes = Vec::new();
     encode_directory(directory, &mut bytes)?;
@@ -587,12 +587,11 @@ pub(crate) fn update_directory_len(directory: &mut Directory) -> Result<(), Seri
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn update_directory_crc(directory: &mut Directory) -> Result<(), SerializationError> {
     let mut bytes = Vec::new();
     encode_directory(directory, &mut bytes)?;
-    let mut hasher = Hasher::new();
-    hasher.update(&bytes[..bytes.len() - 4]);
-    directory.crc32 = hasher.finalize();
+    directory.crc32 = crc32fast::hash(&bytes[..bytes.len() - 4]);
     Ok(())
 }
 

@@ -492,7 +492,7 @@ impl Write for AppendSink {
         #[cfg(test)]
         if accepted == bytes.len() {
             let is_marker = bytes == b"BLCK";
-            let is_directory = bytes == b"PITHOSDR";
+            let is_directory = bytes.starts_with(b"PITHOSDR");
             let after_payload = self.after_block_marker && !is_marker;
             self.after_block_marker = is_marker;
             let fail = match self.failure {

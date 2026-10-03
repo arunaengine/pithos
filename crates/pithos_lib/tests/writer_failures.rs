@@ -367,11 +367,13 @@ struct FailDuringDirectory {
 impl Write for FailDuringDirectory {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.writes += 1;
-        if self.writes == 5 {
+        if self.writes == 4 {
             return Err(io::Error::other("mid-directory failure"));
         }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
+        // The third write starts the directory; accept only part of it.
+        let accepted = if self.writes == 3 { 8 } else { bytes.len() };
+        self.bytes.extend_from_slice(&bytes[..accepted]);
+        Ok(accepted)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())

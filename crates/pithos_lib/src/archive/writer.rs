@@ -15,6 +15,7 @@ use crate::error::PithosError;
 use crate::format::block::{BlockHeader, BlockIndexEntry, BlockLocation, ProcessingFlags};
 use crate::format::directory::{Directory, DirectoryEntries};
 use crate::format::encryption::{EncryptionSection, RecipientData};
+use crate::format::error::SerializationError;
 use crate::format::file_entry::{BlockDataState, FileEntry, FileType, Reference};
 use crate::format::header::FormatVersion;
 use crate::format::{directory, header};
@@ -1419,10 +1420,9 @@ impl<W: Write> ArchiveWriter<W> {
             self.validate_required_access_records()?;
             self.seal_recipient_lists()?;
             self.validate_publishable()?;
-            directory::update_directory_len(&mut self.directory)?;
-            directory::update_directory_crc(&mut self.directory)?;
+            let bytes = directory::encode_complete_directory(&self.directory)?;
             if let Some(snapshot) = &self.append_snapshot {
-                let span = Span::new(self.sink.offset, self.directory.dir_len)?;
+                let span = Span::new(self.sink.offset, bytes.len() as u64)?;
                 let child = validated_segment_from_directory(
                     self.version,
                     &self.directory,
@@ -1431,7 +1431,9 @@ impl<W: Write> ArchiveWriter<W> {
                 )?;
                 snapshot.validate_prospective_child(child)?;
             }
-            directory::encode_directory(&self.directory, &mut self.sink)?;
+            self.sink
+                .write_all(&bytes)
+                .map_err(SerializationError::from)?;
             self.sink.flush()?;
             Ok(())
         })();
