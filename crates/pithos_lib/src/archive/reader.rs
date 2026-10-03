@@ -2,16 +2,14 @@ use super::opener::{ArchiveOpener, OpenSettings};
 use super::planning::{BlockRequest, PlannedBlock, ReadPlan};
 use super::{AccessProvenance, AppendSnapshot, ArchiveView, FileId, ResolvedAccess, Span};
 use crate::archive::index::ArchiveIndex;
-use crate::archive::types::{
-    BlockHash, BlockLocation, ContentState, Entry, ExternalLocation, ReadRange,
-};
+use crate::archive::types::{BlockLocation, ContentState, Entry, ExternalLocation, ReadRange};
 #[cfg(feature = "crypt4gh")]
 use crate::crypto::FileKey;
 use crate::crypto::{self, PrivateKey};
 use crate::error::PithosError;
 use crate::format::directory::Directory;
 use crate::format::encryption::RecipientData;
-use crate::format::file_entry::{BlockDataEntry, BlockDataState};
+use crate::format::file_entry::BlockDataState;
 use crate::format::header::FormatVersion;
 use crate::format::limits::{DeserializationError, DeserializationLimits};
 use crate::source::ArchiveSource;
@@ -664,6 +662,7 @@ pub(super) fn resolve_recipients(
                 candidates.into_iter().enumerate()
             {
                 let shared = crypto::derive_shared(secret.as_bytes(), peer)?;
+                let decrypted;
                 let entries = match data {
                     RecipientData::Encrypted(bytes) => {
                         let nonce = crypto::sealed_nonce(bytes)?;
@@ -675,12 +674,14 @@ pub(super) fn resolve_recipients(
                             &nonce,
                         );
                         let plaintext = crypto::unwrap_recipient_list(&shared, bytes)?;
-                        crate::format::encryption::decode_decrypted_recipient_list(
+                        decrypted = crate::format::encryption::decode_decrypted_recipient_list(
                             &plaintext,
                             &decoded_limits,
-                        )?
+                        )?;
+                        &decrypted
                     }
-                    RecipientData::Decrypted(entries) => entries.clone(),
+                    // A plaintext list is read in place, so its keys are not copied.
+                    RecipientData::Decrypted(entries) => entries,
                 };
                 for (file_id, file_key) in entries.iter() {
                     access.insert(
@@ -711,9 +712,7 @@ pub(super) fn resolve_block_lists(
     directory.files.try_for_each_mut(|id, file| {
         let file_id = FileId(id);
         match &mut file.block_data {
-            BlockDataState::Decrypted(entries) => {
-                record_block_keys(access, file_id, entries);
-            }
+            BlockDataState::Decrypted(_) => {}
             BlockDataState::Pieces(pieces) => {
                 if pieces
                     .iter()
@@ -763,7 +762,6 @@ pub(super) fn resolve_block_lists(
                 }
                 crate::format::file_entry::validate_unique_block_references(&entries)?;
                 access.insert_pieces(file_id, key_ids);
-                record_block_keys(access, file_id, &entries);
                 file.block_data = BlockDataState::Decrypted(entries);
             }
             BlockDataState::Encrypted(bytes) => {
@@ -778,7 +776,6 @@ pub(super) fn resolve_block_lists(
                     &decoded_limits,
                     remaining_block_references,
                 )?;
-                record_block_keys(access, file_id, &entries);
                 file.block_data = BlockDataState::Decrypted(entries);
             }
         }
@@ -815,9 +812,15 @@ pub(super) fn validate_piece_keys(
     Ok(piece_keys.into_iter().max())
 }
 
-fn record_block_keys(access: &mut ResolvedAccess, file_id: FileId, entries: &[BlockDataEntry]) {
-    access.insert_block_keys(
-        file_id,
-        entries.iter().map(|(hash, key)| (BlockHash(*hash), key)),
-    );
+/// Moves every decoded block list into `access`, so each recovered key is kept once.
+pub(super) fn move_block_keys(
+    directory: &mut Directory,
+    access: &mut ResolvedAccess,
+) -> Result<(), PithosError> {
+    directory.files.try_for_each_mut(|id, file| {
+        if let BlockDataState::Decrypted(entries) = &mut file.block_data {
+            access.insert_block_keys(FileId(id), std::mem::take(entries));
+        }
+        Ok(())
+    })
 }

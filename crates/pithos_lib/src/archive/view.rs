@@ -97,7 +97,7 @@ impl ArchiveView {
         crate::format::block::decode_block_marker(&mut marker)?;
         let key = self
             .access
-            .block_key(block.file, block.hash)
+            .block_key(block.file, block.position, block.hash)
             .ok_or(PithosError::ContentUnavailable)?;
         let meta = BlockIndexEntry {
             offset: 0,
@@ -108,7 +108,7 @@ impl ArchiveView {
         };
         block::verify(
             Zeroizing::new(payload.to_vec()),
-            key,
+            &key,
             block.hash.0,
             &meta,
             self.block_limits(),

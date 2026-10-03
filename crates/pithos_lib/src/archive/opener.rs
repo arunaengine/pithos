@@ -2,7 +2,7 @@ use super::access::ResolvedAccess;
 use super::index::build_effective_index;
 use super::reader::{
     AccessKeys, DecodedDirectoryCounts, OpenLimits, OpenOptions, classify_content_availability,
-    remaining_deserialization_limits, resolve_block_lists, resolve_recipients,
+    move_block_keys, remaining_deserialization_limits, resolve_block_lists, resolve_recipients,
     validate_directory_len, validate_piece_keys,
 };
 use super::types::{FileId, Span, ValidatedSegment};
@@ -389,6 +389,7 @@ fn complete_open(
         segments.push(validated_segment_from_directory(
             version, &directory, span, parent,
         )?);
+        move_block_keys(&mut directory, &mut access)?;
     }
     let index_limits = IndexLimits {
         max_entries: limits.max_entries,

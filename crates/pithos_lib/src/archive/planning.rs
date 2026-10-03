@@ -14,6 +14,8 @@ use std::ops::Range;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedBlock {
     pub(crate) file: FileId,
+    /// The position of the block in the file's block list.
+    pub(crate) position: usize,
     pub(crate) hash: BlockHash,
     pub(crate) descriptor: BlockDescriptor,
     pub(crate) output: Range<usize>,
@@ -73,7 +75,7 @@ impl PlannedBlock {
 pub struct ReadPlan<'a> {
     index: &'a ArchiveIndex,
     file: FileId,
-    references: std::slice::Iter<'a, BlockHash>,
+    references: std::iter::Enumerate<std::slice::Iter<'a, BlockHash>>,
     cursor: u64,
     range: ReadRange,
     limits: block::Limits,
@@ -106,7 +108,7 @@ impl<'a> ReadPlan<'a> {
         Ok(Self {
             index,
             file,
-            references: references.iter(),
+            references: references.iter().enumerate(),
             cursor: 0,
             range,
             limits,
@@ -114,7 +116,11 @@ impl<'a> ReadPlan<'a> {
     }
 
     /// Plans the block at the cursor, or returns `None` when it lies before the range.
-    fn step(&mut self, hash: BlockHash) -> Result<Option<PlannedBlock>, PithosError> {
+    fn step(
+        &mut self,
+        position: usize,
+        hash: BlockHash,
+    ) -> Result<Option<PlannedBlock>, PithosError> {
         let descriptor = self
             .index
             .descriptor(hash)
@@ -127,7 +133,7 @@ impl<'a> ReadPlan<'a> {
         )?;
         self.cursor = end;
         if start >= self.range.end() {
-            self.references = [].iter();
+            self.references = [].iter().enumerate();
             return Ok(None);
         }
         if end <= self.range.start() {
@@ -143,6 +149,7 @@ impl<'a> ReadPlan<'a> {
         let output_end = convert(self.range.end().min(end) - start)?;
         Ok(Some(PlannedBlock {
             file: self.file,
+            position,
             hash,
             descriptor: descriptor.clone(),
             output: output_start..output_end,
@@ -176,12 +183,12 @@ impl Iterator for ReadPlan<'_> {
     type Item = Result<PlannedBlock, PithosError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(&hash) = self.references.next() {
-            match self.step(hash) {
+        while let Some((position, &hash)) = self.references.next() {
+            match self.step(position, hash) {
                 Ok(Some(block)) => return Some(Ok(block)),
                 Ok(None) => {}
                 Err(error) => {
-                    self.references = [].iter();
+                    self.references = [].iter().enumerate();
                     return Some(Err(error));
                 }
             }

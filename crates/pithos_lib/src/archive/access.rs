@@ -1,13 +1,16 @@
-use crate::archive::types::FileId;
+use crate::archive::types::{BlockHash, FileId};
 use crate::crypto::{BlockKey, FileKey};
 use crate::error::PithosError;
+use crate::format::file_entry::BlockDataEntry;
 use std::collections::BTreeMap;
+use zeroize::Zeroizing;
 
 /// Recovered file secrets have one crate-private owner and never enter an index.
 pub(crate) struct ResolvedAccess {
     /// Boxed keys stay in place when the map rearranges its nodes, so no stale copy remains.
     keys: BTreeMap<FileId, Box<FileKey>>,
-    block_keys: BTreeMap<FileId, BTreeMap<crate::archive::types::BlockHash, BlockKey>>,
+    /// The decoded block list of each file, in file order. It is moved here, not copied.
+    block_keys: BTreeMap<FileId, Zeroizing<Vec<BlockDataEntry>>>,
     provenance: BTreeMap<FileId, AccessProvenance>,
     /// Piece key ids of each file whose block list was sealed in pieces.
     pieces: BTreeMap<FileId, Vec<FileId>>,
@@ -80,24 +83,25 @@ impl ResolvedAccess {
         }
     }
 
-    pub(crate) fn insert_block_keys<'a>(
+    pub(crate) fn insert_block_keys(
         &mut self,
         id: FileId,
-        entries: impl IntoIterator<Item = (crate::archive::types::BlockHash, &'a [u8; 32])>,
+        entries: Zeroizing<Vec<BlockDataEntry>>,
     ) {
-        // Inserting one by one avoids the sorted copy that collecting into a map would make.
-        let mut keys = BTreeMap::new();
-        for (hash, key) in entries {
-            keys.insert(hash, BlockKey::from_protocol(key));
-        }
-        self.block_keys.insert(id, keys);
+        self.block_keys.insert(id, entries);
     }
 
+    /// The key of the block at `position` in the block list of `id`, if it has `hash`.
     pub(crate) fn block_key(
         &self,
         id: FileId,
-        hash: crate::archive::types::BlockHash,
-    ) -> Option<&BlockKey> {
-        self.block_keys.get(&id).and_then(|keys| keys.get(&hash))
+        position: usize,
+        hash: BlockHash,
+    ) -> Option<BlockKey> {
+        self.block_keys
+            .get(&id)
+            .and_then(|entries| entries.get(position))
+            .filter(|(entry_hash, _)| *entry_hash == hash.0)
+            .map(|(_, key)| BlockKey::from_protocol(key))
     }
 }
