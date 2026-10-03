@@ -362,6 +362,7 @@ pub(crate) fn random_nonce() -> [u8; 12] {
     Nonce::generate().into()
 }
 
+#[cfg(feature = "crypt4gh")]
 pub(crate) fn seal_crypt4gh_payload(
     key: &[u8; 32],
     plaintext: &[u8],

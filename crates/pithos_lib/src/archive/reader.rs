@@ -9,7 +9,9 @@ use crate::archive::types::{
 };
 use crate::archive::validation::IndexLimits;
 use crate::block;
-use crate::crypto::{self, FileKey, PrivateKey};
+#[cfg(feature = "crypt4gh")]
+use crate::crypto::FileKey;
+use crate::crypto::{self, PrivateKey};
 use crate::error::PithosError;
 use crate::format::block::{
     BlockIndexEntry, BlockLocation as FormatBlockLocation, ProcessingFlags,
@@ -26,6 +28,7 @@ use std::sync::Arc;
 
 /// Distinguishes archive failures from a presentation callback failure without
 /// making the archive core depend on the callback's error type.
+#[cfg(feature = "crypt4gh")]
 pub(crate) enum ContentOperationError<E> {
     Core(PithosError),
     Callback(E),
@@ -285,6 +288,7 @@ pub struct Archive<S, E = NoExternalBlocks> {
     segments: Vec<ValidatedSegment>,
     index_limits: IndexLimits,
     access: ResolvedAccess,
+    #[cfg(feature = "crypt4gh")]
     access_keys: AccessKeys,
     limits: OpenLimits,
     content_availability: BTreeMap<FileId, ContentAvailability>,
@@ -447,6 +451,7 @@ where
             segments,
             index_limits,
             access,
+            #[cfg(feature = "crypt4gh")]
             access_keys: options.keys,
             limits: options.limits,
             content_availability,
@@ -514,6 +519,7 @@ where
         self.copy_plan(id, self.index.range_plan(id, range)?, sink)
     }
 
+    #[cfg(feature = "crypt4gh")]
     pub(crate) fn with_crypt4gh_content<T, CallbackError>(
         &self,
         path: &str,
@@ -522,14 +528,24 @@ where
         let (id, _) = self.content_id(path).map_err(ContentOperationError::Core)?;
         self.require_content_available(id)
             .map_err(ContentOperationError::Core)?;
-        let key = self
-            .access
-            .key(id)
-            .ok_or(PithosError::ContentUnavailable)
-            .map_err(ContentOperationError::Core)?;
+        let fresh_key;
+        let (key, key_owner) = match self.access.key(id) {
+            Some(key) => (key, id),
+            None => {
+                // A file sealed in pieces has no file key, so the export gets a fresh one.
+                let first_piece = self
+                    .access
+                    .grant_keys(id)
+                    .and_then(|keys| keys.first().map(|(key_id, _)| *key_id))
+                    .ok_or(PithosError::ContentUnavailable)
+                    .map_err(ContentOperationError::Core)?;
+                fresh_key = FileKey::from_bytes(x25519_dalek::StaticSecret::random().to_bytes());
+                (&fresh_key, first_piece)
+            }
+        };
         let provenance = self
             .access
-            .provenance(id)
+            .provenance(key_owner)
             .ok_or(PithosError::ContentUnavailable)
             .map_err(ContentOperationError::Core)?;
         let reader = self
@@ -541,6 +557,7 @@ where
         operation(id, reader, key).map_err(ContentOperationError::Callback)
     }
 
+    #[cfg(feature = "crypt4gh")]
     pub(crate) fn for_each_verified_file_block<CallbackError>(
         &self,
         id: FileId,

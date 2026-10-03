@@ -59,6 +59,7 @@ impl ResolvedAccess {
         self.keys.get(&id)
     }
 
+    #[cfg(feature = "crypt4gh")]
     pub(crate) fn provenance(&self, id: FileId) -> Option<AccessProvenance> {
         self.provenance.get(&id).copied()
     }

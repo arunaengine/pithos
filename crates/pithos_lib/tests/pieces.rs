@@ -236,3 +236,22 @@ fn a_reader_grant_for_a_composed_file_carries_every_piece_key() {
     archive.copy_to("object", &mut output).unwrap();
     assert_eq!(output, [first, second].concat());
 }
+
+#[cfg(feature = "crypt4gh")]
+#[test]
+fn a_composed_file_exports_to_crypt4gh_with_a_fresh_data_key() {
+    let parts = vec![encode(1, &content(6, 900)), encode(2, &content(7, 600))];
+    let archive = open(assemble(&parts), recipient());
+    let mut exported = Vec::new();
+    pithos_lib::adapters::crypt4gh::export(
+        &archive,
+        "object",
+        vec![public_key("recipient2")],
+        &mut exported,
+    )
+    .unwrap();
+    assert!(exported.starts_with(b"crypt4gh"));
+    // One recipient packet, then one segment: nonce, 1500 ciphertext bytes and a tag.
+    let header_len = 16 + u32::from_le_bytes(exported[16..20].try_into().unwrap()) as usize;
+    assert_eq!(exported.len(), header_len + 12 + 1500 + 16);
+}

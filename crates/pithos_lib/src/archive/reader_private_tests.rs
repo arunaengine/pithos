@@ -1223,12 +1223,15 @@ fn archive_external_blocks_validate_exact_framing_and_share_read_paths() {
     archive.copy_range_to("data", 1..4, &mut range).unwrap();
     let output = temporary.path().join("external-output");
     extract(&archive, "data", &output).unwrap();
-    let mut crypt4gh = Vec::new();
-    crypt4gh::export(&archive, "data", vec![public("recipient2")], &mut crypt4gh).unwrap();
     assert_eq!(std::fs::read(output.join("data")).unwrap(), full);
     assert_eq!(range, &full[1..4]);
-    assert!(!crypt4gh.is_empty());
-    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    #[cfg(feature = "crypt4gh")]
+    {
+        let mut crypt4gh = Vec::new();
+        crypt4gh::export(&archive, "data", vec![public("recipient2")], &mut crypt4gh).unwrap();
+        assert!(!crypt4gh.is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+    }
     let (expected_len, policy) = expected.lock().unwrap()[0];
     assert_eq!(expected_len, response.len() as u64);
     assert_eq!(policy, OpenLimits::default().max_stored_block_bytes + 4);
@@ -1522,16 +1525,20 @@ fn unsupported_external_content_preflights_the_whole_file_and_adapters() {
     ));
     assert!(sink.0.is_empty());
 
-    let mut exported = Vec::new();
-    assert!(matches!(
-        crypt4gh::export(&archive, "data", vec![public("recipient2")], &mut exported,),
-        Err(crate::adapters::crypt4gh::Crypt4GHError::Archive {
-            source: PithosError::UnsupportedFeature(ArchiveFeature::ExternalStorage),
-            ..
-        })
-    ));
-    assert!(exported.is_empty());
+    #[cfg(feature = "crypt4gh")]
+    {
+        let mut exported = Vec::new();
+        assert!(matches!(
+            crypt4gh::export(&archive, "data", vec![public("recipient2")], &mut exported,),
+            Err(crate::adapters::crypt4gh::Crypt4GHError::Archive {
+                source: PithosError::UnsupportedFeature(ArchiveFeature::ExternalStorage),
+                ..
+            })
+        ));
+        assert!(exported.is_empty());
+    }
 }
+#[cfg(feature = "crypt4gh")]
 use crate::adapters::crypt4gh;
 use crate::fs::extract;
 

@@ -35,6 +35,7 @@
 //! use pithos_lib::format::header::FileHeader;
 //! ```
 
+#[cfg(any(feature = "ro-crate", feature = "crypt4gh"))]
 pub mod adapters;
 pub mod archive;
 mod block;

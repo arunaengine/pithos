@@ -11,6 +11,10 @@ Add the crate to an application using Rust 1.88 or newer:
 pithos_lib = "0.8"
 ```
 
+The default features `ro-crate` and `crypt4gh` enable the RO-Crate conversion and Crypt4GH
+export adapters. Use `default-features = false` to build only the archive format, reader,
+writer and Linux filesystem operations.
+
 ## Create an archive
 
 A base archive needs no keys and accepts only local, uncompressed, unencrypted content:
@@ -71,6 +75,7 @@ See [`examples/create.rs`](examples/create.rs) for the maintained version and th
 - Read a complete entry with `copy_to` or a checked range with `copy_range_to`.
 - Use `fs::extract`, `fs::append_files`, `fs::grant_readers`, and `fs::ingest` for Linux host operations.
 - Use `adapters::ro_crate` for local directory/ZIP conversion and `adapters::crypt4gh::export` for Crypt4GH output.
+- Seal parts of one file independently with `archive::PieceEncoder` and join the stored parts later with `archive::compose`, which opens no key. Keep `Composition::metadata_digest` in trusted storage and pass it to `OpenOptions::with_expected_metadata_digest`.
 
 Compiled examples are included with the package: [`create`](examples/create.rs), [`open_list`](examples/open_list.rs), [`read_ranges`](examples/read_ranges.rs), [`extract`](examples/extract.rs), [`append`](examples/append.rs), [`grant_readers`](examples/grant_readers.rs), [`ro_crate`](examples/ro_crate.rs), and [`crypt4gh`](examples/crypt4gh.rs). They are local-only and return errors to their caller.
 

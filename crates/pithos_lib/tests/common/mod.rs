@@ -2,6 +2,7 @@ pub mod append;
 pub mod archive;
 pub mod fixtures;
 pub mod keys;
+#[cfg(feature = "ro-crate")]
 pub mod ro_crate;
 pub mod writer;
 

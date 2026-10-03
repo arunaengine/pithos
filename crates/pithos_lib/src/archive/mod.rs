@@ -25,6 +25,7 @@ pub(crate) use path_validation::{
     validate_directory_entries, validate_new_candidate, validate_symlink_target,
 };
 pub use pieces::{Composition, Piece, PieceEncoder, compose};
+#[cfg(feature = "crypt4gh")]
 pub(crate) use reader::ContentOperationError;
 pub use reader::{
     AccessKeys, Archive, ArchiveEntry, ArchiveFeature, ArchiveReference, EntryKind,
