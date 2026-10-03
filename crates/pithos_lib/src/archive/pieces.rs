@@ -15,9 +15,7 @@ use crate::crypto::{self, FileKey, PublicKey};
 use crate::error::PithosError;
 use crate::format::block::{BlockIndexEntry, BlockLocation, ProcessingFlags};
 use crate::format::directory::{Directory, DirectoryEntries, encode_complete_directory};
-use crate::format::encryption::{
-    EncryptionSection, RecipientData, RecipientSection, encode_decrypted_recipient_list,
-};
+use crate::format::encryption::{EncryptionSection, RecipientData, RecipientSection};
 use crate::format::file_entry::{
     BlockDataEntry, BlockDataState, BlockListPiece, FileEntry, FileType,
     encode_decrypted_block_list,
@@ -263,11 +261,11 @@ impl PieceEncoder {
 
         let sender = StaticSecret::random();
         let sender_public = DalekPublicKey::from(&sender).to_bytes();
-        let mut records = Zeroizing::new(Vec::new());
-        encode_decrypted_recipient_list(
-            &[(self.key_id, *piece_key.expose_for_protocol())],
-            &mut *records,
-        )?;
+        // Written straight from the borrowed key into reserved room, so no plain copy remains.
+        let mut records = Zeroizing::new(Vec::with_capacity(1 + 10 + 32));
+        records.push(1);
+        records.write_varint(self.key_id)?;
+        records.extend_from_slice(piece_key.expose_for_protocol());
         let mut grants = Vec::with_capacity(self.recipients.len());
         for recipient in &self.recipients {
             let nonce = crypto::random_nonce();
