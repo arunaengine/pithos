@@ -933,6 +933,15 @@ deliberately reuse a nonce under the same key. It MUST authenticate and decrypt
 an encrypted value successfully before using its plaintext or releasing output
 derived from it.
 
+**Grant authentication.** A recipient record is addressed to a reader's private
+key when its recipient public key is that key's public key. When that public key
+is also the sender public key of an EncryptionSection, every record in that
+section is addressed to it as well (sender-key recovery). A reader MUST try
+every encrypted record addressed to one of its keys. If any of them fails
+authentication, the reader MUST fail the open, even when another record grants
+the same or other keys. A key for which no record exists only makes the content
+it would unlock unavailable (Section 8.2).
+
 **Nonce scope of block payloads.** A ChaCha20-Poly1305 payload uses the block key
 as its AEAD key, and an AES-256-GCM payload uses the derived payload key, so the
 two ciphers never share an AEAD key. A unique key seals exactly one payload. A
@@ -1035,6 +1044,12 @@ recipient counts, ciphertext lengths, and the segment timing of grants are
 visible. `RecipientData::Decrypted` exposes its file-key grants and provides no
 grant confidentiality.
 
+An addressed grant that fails authentication makes the open fail (Section 5.3).
+This has an availability cost: with untrusted metadata, anyone who can append to
+or change the archive can add a forged grant addressed to a reader and so prevent
+that reader from opening unrelated content. Applications that keep the metadata
+digest (Section 4.3.4) detect such changes.
+
 Version 1.0 recipient wrapping uses a raw static X25519 shared secret directly as
 its AEAD key, with no KDF, label, or AAD. That construction has no domain
 separation, and each static sender-recipient key pair has one nonce-collision
@@ -1131,8 +1146,10 @@ For the table, an encrypted BlockDataState, which includes a `Pieces` state,
 requires encrypted-block-list capability, and an encrypted RecipientData
 required to obtain its file key or piece keys requires encrypted-recipient-list
 capability. Content sealed in pieces is unavailable until the key of every piece
-is available. A content read that needs either unsupported list form is
-unavailable even when its block flags themselves are otherwise supported.
+is available. A missing grant only makes content unavailable; a grant addressed
+to the reader that fails authentication makes the open fail (Section 5.3). A
+content read that needs either unsupported list form is unavailable even when
+its block flags themselves are otherwise supported.
 
 Readers MUST reject an unsupported header version and any unknown tag rather
 than list the archive, because the structure of such input is not known.
@@ -1599,5 +1616,6 @@ byte and then refreshing the CRC.
 | Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01, PV-RECIPIENT-WRAP-11, PV-UNIQUE-KEY-HELLO, PV-AES-GCM-HELLO | Decode/decrypt to stated output |
 | Ciphers and key modes | 5.2, 5.3 | PV-UNIQUE-KEY-HELLO, PV-AES-GCM-HELLO; *case:* both ciphers in one archive and in one file, where a reused descriptor keeps its cipher across files and appends; *case:* unique keys with AES-256-GCM, with and without compression, where every repeated block is stored again | Read every file and range as written |
 | Version 1.1 pieces and grants | 1.3, 4.4.2, 5.3, 8.2 | CV-PIECES-HELLO-766, PV-RECIPIENT-WRAP-11; *case:* tag `02` in a version 1.0 archive; *case:* a reader granted only some of a file's piece keys | Valid archive; content readable only with every piece key; reject tag `02` in version 1.0; a partly granted file is unavailable |
-| Version 1.0 compatibility | 1.3, 5.3 | CV-BASE-EMPTY-146, CV-LOCAL-HELLO-279, PV-RECIPIENT-WRAP-01; *case:* an append and a reader grant on a version 1.0 archive keep header `0x0100` and the version 1.0 grant construction | Readable under the version 1.0 rules; the same grants open nothing under the version 1.1 rules, and the reverse |
+| Version 1.0 compatibility | 1.3, 5.3 | CV-BASE-EMPTY-146, CV-LOCAL-HELLO-279, PV-RECIPIENT-WRAP-01; *case:* an append and a reader grant on a version 1.0 archive keep header `0x0100` and the version 1.0 grant construction | Readable under the version 1.0 rules; under the version 1.1 rules the same grants fail authentication and the open fails, and the reverse |
+| Grant authentication | 5.3, 7, 8.2 | *case:* one changed ciphertext byte in a grant addressed to the reader, while an older grant still gives access, for a recipient key and for a sender key through sender-key recovery; *case:* a reader with no grant | The open fails for an addressed grant that fails authentication; with no grant the open succeeds, the content is unavailable, and reads fail without output |
 | Whole-file hash of joined parts (informative) | Appendix A | *case:* aligned parts, a short last part, empty parts, one part, and an empty file; *case:* a part that ends inside a 1024-byte chunk | The hash equals the BLAKE3 of the full read; no hash for the misaligned part |

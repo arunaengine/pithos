@@ -8,6 +8,7 @@ use pithos_lib::archive::{
     EntryKind, EntryMetadata, OpenLimits, OpenOptions, PayloadCipher, Piece, PieceEncoder,
     ProcessingOptions, WriteOptions, compose,
 };
+use pithos_lib::crypto::CryptoError;
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::fs::{append_files, grant_readers};
 use pithos_lib::source::MemorySource;
@@ -135,6 +136,84 @@ fn patch_flags(bytes: &mut [u8], hash: [u8; 32], flags: u8) {
     }
     bytes[position] = flags;
     refresh_crc(bytes);
+}
+
+/// Encrypted grant ranges of the terminal directory, found by walking its encoded form
+/// (Section 4.3).
+struct Layout {
+    grants: Vec<std::ops::Range<usize>>,
+}
+
+fn layout(bytes: &[u8]) -> Layout {
+    let skip_bytes = |at: &mut usize| {
+        let len = read_uleb(bytes, at) as usize;
+        *at += len;
+    };
+    let skip_option = |at: &mut usize| {
+        *at += 1;
+        if bytes[*at - 1] == 1 {
+            skip_bytes(at);
+        }
+    };
+    let mut at = terminal_directory_start(bytes) + 8;
+    at += 1;
+    if bytes[at - 1] == 1 {
+        read_uleb(bytes, &mut at);
+        read_uleb(bytes, &mut at);
+    }
+    for _ in 0..read_uleb(bytes, &mut at) {
+        read_uleb(bytes, &mut at);
+        skip_bytes(&mut at);
+        at += 2;
+        match bytes[at - 1] {
+            0 => skip_bytes(&mut at),
+            1 => at += 64 * read_uleb(bytes, &mut at) as usize,
+            _ => {
+                for _ in 0..read_uleb(bytes, &mut at) {
+                    read_uleb(bytes, &mut at);
+                    skip_bytes(&mut at);
+                }
+            }
+        }
+        for _ in 0..4 {
+            read_uleb(bytes, &mut at);
+        }
+        for _ in 0..2 * read_uleb(bytes, &mut at) {
+            read_uleb(bytes, &mut at);
+        }
+        skip_option(&mut at);
+    }
+    for _ in 0..read_uleb(bytes, &mut at) {
+        at += 32;
+        for _ in 0..3 {
+            read_uleb(bytes, &mut at);
+        }
+        at += 1;
+        skip_option(&mut at);
+    }
+    for _ in 0..read_uleb(bytes, &mut at) {
+        read_uleb(bytes, &mut at);
+        skip_bytes(&mut at);
+    }
+    let mut grants = Vec::new();
+    for _ in 0..read_uleb(bytes, &mut at) {
+        at += 32;
+        for _ in 0..read_uleb(bytes, &mut at) {
+            at += 33;
+            if bytes[at - 1] == 0 {
+                let len = read_uleb(bytes, &mut at) as usize;
+                grants.push(at..at + len);
+                at += len;
+            } else {
+                for _ in 0..read_uleb(bytes, &mut at) {
+                    read_uleb(bytes, &mut at);
+                    at += 32;
+                }
+            }
+        }
+    }
+    assert_eq!(at + 12, bytes.len(), "the walk must end at the footer");
+    Layout { grants }
 }
 
 fn refresh_crc(bytes: &mut [u8]) {
@@ -368,10 +447,10 @@ fn version_1_0_archives_keep_the_1_0_grant_rules() {
         assert_eq!(read(&archive, "appended.txt"), b"appended payload");
     }
 
-    // Under the version 1.1 rules the same grants derive other keys and open nothing.
+    // Under the version 1.1 rules the same grants derive other keys and fail authentication.
     set_version(&mut bytes, 1);
     for reader in ["recipient1", "recipient2"] {
-        assert_no_access(&bytes, reader, "appended.txt");
+        assert_grant_rejected(&bytes, reader);
     }
 
     // The reverse holds for a version 1.1 grant read under the version 1.0 rules.
@@ -382,18 +461,73 @@ fn version_1_0_archives_keep_the_1_0_grant_rules() {
         b"current payload"
     );
     set_version(&mut current, 0);
-    assert_no_access(&current, "recipient1", "data");
+    assert_grant_rejected(&current, "recipient1");
 }
 
-/// A grant that fails authentication for its recipient either fails the open or leaves the
-/// content unavailable. Both outcomes release nothing.
-fn assert_no_access(bytes: &[u8], reader: &str, path: &str) {
-    match Archive::open(
+/// A grant addressed to the reader that fails authentication fails the open.
+fn assert_grant_rejected(bytes: &[u8], reader: &str) {
+    let result = Archive::open(
         MemorySource::new(bytes.to_vec()),
         OpenOptions::default().with_access_keys(keys(&[reader])),
-    ) {
-        Ok(archive) => assert!(!available(&archive, path)),
-        Err(error) => assert!(matches!(error, PithosError::Crypt(_)), "{error:?}"),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(PithosError::Crypt(CryptoError::AuthenticationFailed))
+        ),
+        "{reader}"
+    );
+}
+
+/// Without a grant the open succeeds, and the content is unavailable and releases nothing.
+fn assert_missing_grant(bytes: &[u8], reader: &str, path: &str) {
+    let archive = open(bytes.to_vec(), keys(&[reader]));
+    assert!(!available(&archive, path));
+    let mut output = Vec::new();
+    assert!(archive.copy_to(path, &mut output).is_err());
+    assert!(archive.copy_range_to(path, 0..1, &mut output).is_err());
+    assert!(output.is_empty());
+}
+
+#[test]
+fn an_addressed_grant_that_fails_authentication_fails_the_open() {
+    let temporary = tempfile::tempdir().unwrap();
+    let base = write_archive(&[("data", encrypted(0), b"base payload")]);
+    let path = write_temporary(temporary.path(), "archive.pith", &base);
+    let source = write_temporary(temporary.path(), "appended", b"appended payload");
+    append_files(
+        &path,
+        AppendOptions::new(private_key("sender"), vec![public_key("recipient1")]),
+        &[source],
+    )
+    .unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    for reader in ["recipient1", "sender"] {
+        let archive = open(bytes.clone(), keys(&[reader]));
+        assert_eq!(read(&archive, "data"), b"base payload");
+        assert_eq!(read(&archive, "appended"), b"appended payload");
+    }
+
+    // The base grants still give access to `data`, but the changed appended grants fail.
+    // The sender key reaches them through sender-key recovery.
+    let grants = layout(&bytes).grants;
+    assert!(!grants.is_empty());
+    for grant in grants {
+        bytes[grant.end - 1] ^= 1;
+    }
+    refresh_crc(&mut bytes);
+    for reader in ["recipient1", "sender"] {
+        assert_grant_rejected(&bytes, reader);
+    }
+    assert!(matches!(
+        Archive::open(
+            MemorySource::new(bytes.clone()),
+            OpenOptions::default().with_access_keys(keys(&["recipient2", "recipient1"])),
+        ),
+        Err(PithosError::Crypt(CryptoError::AuthenticationFailed))
+    ));
+    for path in ["data", "appended"] {
+        assert_missing_grant(&bytes, "recipient2", path);
     }
 }
 
