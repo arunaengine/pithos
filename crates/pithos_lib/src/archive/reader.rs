@@ -1,12 +1,10 @@
-use super::{
-    AccessProvenance, AppendSnapshot, ArchiveView, FileId, ResolvedAccess, Span,
-    build_effective_index, decode_validated_directory, validated_segment_from_directory,
-};
+use super::decode_validated_directory;
+use super::opener::{DecodedChain, OpenSettings, complete_open};
+use super::{AccessProvenance, AppendSnapshot, ArchiveView, FileId, ResolvedAccess, Span};
 use crate::archive::index::ArchiveIndex;
 use crate::archive::types::{
-    BlockHash, BlockLocation, ContentState, Entry, ExternalLocation, ReadRange, ValidatedSegment,
+    BlockHash, BlockLocation, ContentState, Entry, ExternalLocation, ReadRange,
 };
-use crate::archive::validation::IndexLimits;
 use crate::block;
 #[cfg(feature = "crypt4gh")]
 use crate::crypto::FileKey;
@@ -21,7 +19,7 @@ use crate::format::file_entry::{BlockDataEntry, BlockDataState};
 use crate::format::header::{FileHeader, FormatVersion};
 use crate::format::limits::DeserializationLimits;
 use crate::source::ArchiveSource;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 
@@ -37,7 +35,7 @@ use x25519_dalek::PublicKey as DalekPublicKey;
 use zeroize::Zeroizing;
 
 #[derive(Default)]
-struct DecodedDirectoryCounts {
+pub(super) struct DecodedDirectoryCounts {
     entries: u64,
     descriptors: u64,
     references: u64,
@@ -46,7 +44,7 @@ struct DecodedDirectoryCounts {
 }
 
 impl DecodedDirectoryCounts {
-    fn record(&mut self, directory: &Directory) {
+    pub(super) fn record(&mut self, directory: &Directory) {
         self.entries += directory.files.len() as u64;
         self.descriptors += directory.blocks.len() as u64;
         self.references += directory
@@ -244,6 +242,20 @@ impl<E> OpenOptions<E> {
         self.external_access_policy = Some(policy);
         self
     }
+
+    /// Splits off the read-time external resolver and access policy.
+    pub(super) fn into_parts(
+        self,
+    ) -> (OpenSettings, E, Option<Arc<dyn ExternalBlockAccessPolicy>>) {
+        let settings = OpenSettings {
+            limits: self.limits,
+            keys: self.keys,
+            expected_metadata_digest: self.expected_metadata_digest,
+            external_enabled: self.external_resolver_supplied
+                && self.external_access_policy.is_some(),
+        };
+        (settings, self.external, self.external_access_policy)
+    }
 }
 
 /// Public, secret-free entry shape returned by an opened archive.
@@ -294,6 +306,8 @@ where
     /// Opens, frames, validates, resolves access metadata, and indexes an archive.
     pub fn open(source: S, options: OpenOptions<E>) -> Result<Self, PithosError> {
         let archive_len = source.len()?;
+        let (mut settings, external, external_access_policy) = options.into_parts();
+        let limits = settings.limits;
         let mut header = [0; FileHeader::ENCODED_LEN];
         source.read_exact_at(0, &mut header)?;
         let header = crate::format::header::decode_header(&mut header.as_slice())?;
@@ -304,21 +318,21 @@ where
             },
         )?;
 
-        let (terminal_start, terminal_len) = terminal_span(&source, archive_len, options.limits)?;
+        let (terminal_start, terminal_len) = terminal_span(&source, archive_len, limits)?;
         let mut raw = Vec::new();
         let mut total_directory_bytes = 0u64;
         let mut next = Some((terminal_start, terminal_len));
         let mut child_start = archive_len;
         let mut visited = HashSet::new();
         let mut decoded = DecodedDirectoryCounts::default();
-        let mut remaining_block_references = options.limits.max_accessible_block_references;
+        let mut remaining_block_references = limits.max_accessible_block_references;
         let mut directory_hashes = Vec::new();
         while let Some((start, len)) = next {
-            validate_directory_len(len, options.limits)?;
-            if raw.len() as u64 > options.limits.max_parent_directories {
+            validate_directory_len(len, limits)?;
+            if raw.len() as u64 > limits.max_parent_directories {
                 return Err(PithosError::LimitExceeded {
                     field: "parent directories",
-                    limit: options.limits.max_parent_directories,
+                    limit: limits.max_parent_directories,
                     actual: raw.len() as u64,
                 });
             }
@@ -333,13 +347,13 @@ where
                     .checked_add(len)
                     .ok_or(PithosError::LimitExceeded {
                         field: "total directory bytes",
-                        limit: options.limits.max_total_directory_bytes,
+                        limit: limits.max_total_directory_bytes,
                         actual: u64::MAX,
                     })?;
-            if total_directory_bytes > options.limits.max_total_directory_bytes {
+            if total_directory_bytes > limits.max_total_directory_bytes {
                 return Err(PithosError::LimitExceeded {
                     field: "total directory bytes",
-                    limit: options.limits.max_total_directory_bytes,
+                    limit: limits.max_total_directory_bytes,
                     actual: total_directory_bytes,
                 });
             }
@@ -347,7 +361,7 @@ where
             directory_hashes.push(*blake3::hash(&bytes).as_bytes());
             let directory = decode_validated_directory(
                 &bytes,
-                &remaining_deserialization_limits(options.limits, &decoded),
+                &remaining_deserialization_limits(limits, &decoded),
                 &mut remaining_block_references,
             )?;
             decoded.record(&directory);
@@ -355,102 +369,24 @@ where
             child_start = start;
             raw.push((directory, span));
         }
-        raw.reverse();
-        directory_hashes.reverse();
-        let metadata_digest = crate::archive::metadata_digest(&directory_hashes);
-        if options
-            .expected_metadata_digest
-            .is_some_and(|expected| expected != metadata_digest)
-        {
-            return Err(PithosError::MetadataDigestMismatch);
-        }
-        let maximum_piece_key = validate_piece_keys(version, &raw)?;
-
-        let mut first_grants = HashMap::new();
-        for (directory, _) in &raw {
-            for (sender, section) in &directory.encryption {
-                for (recipient, recipient_section) in &section.recipients {
-                    let pair = (*sender, *recipient);
-                    if let Some(first) = first_grants.get(&pair)
-                        && *first != &recipient_section.recipient_data
-                    {
-                        return Err(PithosError::ConflictingRecipientGrant);
-                    }
-                    first_grants
-                        .entry(pair)
-                        .or_insert(&recipient_section.recipient_data);
-                }
-            }
-        }
-
-        let mut access = ResolvedAccess::new();
-        let mut recovery_order = 0usize;
-        for (segment, (directory, _)) in raw.iter().enumerate() {
-            resolve_recipients(
-                version,
-                directory,
-                &options.keys,
-                segment,
-                &mut recovery_order,
-                &mut access,
-                options.limits,
-            )?;
-        }
-
-        let mut segments: Vec<ValidatedSegment> = Vec::new();
-        for (segment_index, (directory, span)) in raw.into_iter().enumerate() {
-            let mut directory = directory;
-            resolve_block_lists(
-                &mut directory,
-                &mut access,
-                &mut remaining_block_references,
-                options.limits,
-            )?;
-            let parent = segment_index
-                .checked_sub(1)
-                .map(|index| segments[index].span);
-            segments.push(validated_segment_from_directory(
-                version, &directory, span, parent,
-            )?);
-        }
-        let index_limits = IndexLimits {
-            max_entries: options.limits.max_entries,
-            max_descriptors: options.limits.max_descriptors,
-            max_references: options.limits.max_references,
-            max_relationships: options.limits.max_relationships,
-            max_segments: options.limits.max_parent_directories.saturating_add(1),
+        let chain = DecodedChain {
+            version,
+            terminal: Span::new(terminal_start, terminal_len)?,
+            raw,
+            remaining_block_references,
+            directory_hashes,
         };
-        let mut index = build_effective_index(&segments, archive_len, index_limits)?;
-        index.cover_piece_keys(maximum_piece_key.map(FileId));
-        let content_availability = classify_content_availability(
-            &index,
-            options.external_resolver_supplied,
-            options.external_access_policy.is_some(),
-        )?;
-        for span in index.local_block_spans() {
+        let view = complete_open(archive_len, &mut settings, chain)?;
+        for span in view.index.local_block_spans() {
             let mut marker = [0; 4];
             source.read_exact_at(span.start(), &mut marker)?;
             crate::format::block::decode_block_marker(&mut marker.as_slice())?;
         }
-
         Ok(Self {
             source,
-            external: options.external,
-            external_access_policy: options.external_access_policy,
-            view: ArchiveView {
-                archive_len,
-                version,
-                metadata_digest,
-                terminal_directory: Span::new(terminal_start, terminal_len)?,
-                index,
-                segments,
-                index_limits,
-                access,
-                #[cfg(feature = "crypt4gh")]
-                access_keys: options.keys,
-                limits: options.limits,
-                content_availability,
-            },
+            external,
+            external_access_policy,
+            view,
         })
     }
 
@@ -728,12 +664,10 @@ pub(super) fn archive_entry(
     }
 }
 
-fn classify_content_availability(
+pub(super) fn classify_content_availability(
     index: &ArchiveIndex,
-    external_resolver_supplied: bool,
-    external_access_policy_supplied: bool,
+    external_supported: bool,
 ) -> Result<BTreeMap<FileId, ContentAvailability>, PithosError> {
-    let external_supported = external_resolver_supplied && external_access_policy_supplied;
     let mut availability = BTreeMap::new();
     for entry in index.entries() {
         let Some(content) = entry.entry.content() else {
@@ -776,7 +710,7 @@ fn deserialization_limits(limits: OpenLimits) -> DeserializationLimits {
     }
 }
 
-fn remaining_deserialization_limits(
+pub(super) fn remaining_deserialization_limits(
     limits: OpenLimits,
     decoded: &DecodedDirectoryCounts,
 ) -> DeserializationLimits {
@@ -817,7 +751,7 @@ fn terminal_span<S: ArchiveSource>(
     Ok((start, len))
 }
 
-fn validate_directory_len(len: u64, limits: OpenLimits) -> Result<(), PithosError> {
+pub(super) fn validate_directory_len(len: u64, limits: OpenLimits) -> Result<(), PithosError> {
     if len < 25 {
         return Err(PithosError::DirectoryLengthMismatch {
             expected: 25,
@@ -854,7 +788,7 @@ fn read_source<S: ArchiveSource>(
     Ok(bytes)
 }
 
-fn resolve_recipients(
+pub(super) fn resolve_recipients(
     version: FormatVersion,
     directory: &Directory,
     keys: &AccessKeys,
@@ -924,7 +858,7 @@ fn resolve_recipients(
     Ok(())
 }
 
-fn resolve_block_lists(
+pub(super) fn resolve_block_lists(
     directory: &mut Directory,
     access: &mut ResolvedAccess,
     remaining_block_references: &mut u64,
@@ -995,7 +929,7 @@ fn resolve_block_lists(
 
 /// Checks the version 1.1 piece rules across the selected chain. Returns the largest piece
 /// key id, which new file ids must stay above.
-fn validate_piece_keys(
+pub(super) fn validate_piece_keys(
     version: FormatVersion,
     raw: &[(Directory, Span)],
 ) -> Result<Option<u64>, PithosError> {

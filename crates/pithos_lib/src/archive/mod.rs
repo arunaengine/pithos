@@ -8,6 +8,7 @@ mod access;
 mod append;
 mod content_tree;
 mod index;
+mod opener;
 mod path_validation;
 mod pieces;
 mod planning;
@@ -22,7 +23,6 @@ mod writer;
 
 pub(crate) use access::{AccessProvenance, ResolvedAccess};
 pub use append::{AppendDurability, AppendObservation, AppendOptions};
-pub(crate) use index::build_effective_index;
 pub(crate) use path_validation::{
     validate_directory_entries, validate_new_candidate, validate_symlink_target,
 };
