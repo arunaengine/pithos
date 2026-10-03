@@ -3,7 +3,8 @@ use super::reader::{
     ExternalBlockResolver, OpenLimits, OpenOptions,
 };
 use crate::archive::{
-    ArchivePath, ArchiveWriter, CdcConfig, EntryMetadata, ProcessingOptions, WriteOptions,
+    ArchivePath, ArchiveWriter, BlockKeyMode, CdcConfig, EntryMetadata, ProcessingOptions,
+    WriteOptions,
 };
 use crate::crypto::{self, FileKey, PrivateKey, PublicKey};
 use crate::error::PithosError;
@@ -1719,4 +1720,121 @@ fn an_append_changes_the_metadata_digest() {
         ),
         Err(PithosError::MetadataDigestMismatch)
     ));
+}
+
+fn fixture_with_processing(
+    content: &[u8],
+    processing: ProcessingOptions,
+) -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("processing.pith");
+    let options = WriteOptions::new(private("sender"), vec![public("recipient1")])
+        .with_cdc(CdcConfig::new(64, 256, 1024).unwrap());
+    let mut writer = ArchiveWriter::create(File::create(&path).unwrap(), options).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("data").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            processing,
+            Some(content.len() as u64),
+            Cursor::new(content),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    (temp, path)
+}
+
+fn unique_processing() -> ProcessingOptions {
+    ProcessingOptions::new(true, 0)
+        .unwrap()
+        .with_key_mode(BlockKeyMode::Unique)
+        .unwrap()
+}
+
+#[test]
+fn unique_key_blocks_round_trip_and_store_every_repeat() {
+    // Zero bytes split into two equal 1024-byte chunks.
+    let content = vec![0u8; 2048];
+    let (_convergent_dir, convergent) =
+        fixture_with_processing(&content, ProcessingOptions::new(true, 0).unwrap());
+    assert_eq!(decode_terminal_directory(&convergent).blocks.len(), 1);
+
+    let (_temporary, path) = fixture_with_processing(&content, unique_processing());
+    let blocks = decode_terminal_directory(&path).blocks;
+    assert_eq!(blocks.len(), 2);
+    assert!(blocks.values().all(|block| block.flags.0 == 0x18));
+    assert!(
+        !blocks
+            .keys()
+            .any(|hash| *hash == *blake3::hash(&content[..1024]).as_bytes())
+    );
+    let archive = open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+    let mut output = Vec::new();
+    archive.copy_to("data", &mut output).unwrap();
+    assert_eq!(output, content);
+}
+
+#[test]
+fn unique_key_flags_are_rejected_in_version_1_0_archives() {
+    for (processing, expected) in [
+        (ProcessingOptions::new(true, 0).unwrap(), None),
+        (unique_processing(), Some(0x18)),
+    ] {
+        let (_temporary, path) = fixture_with_processing(b"version gated block", processing);
+        let mut legacy = std::fs::read(&path).unwrap();
+        legacy[5] = 0x00;
+        let result = Archive::open(MemorySource::new(legacy), OpenOptions::default());
+        match expected {
+            None => assert!(result.is_ok()),
+            Some(flags) => assert!(matches!(
+                result,
+                Err(PithosError::UnsupportedProcessingFlags(actual)) if actual == flags
+            )),
+        }
+    }
+}
+
+#[test]
+fn unique_key_flags_require_encryption() {
+    let (_temporary, path) = fixture_with_processing(b"plain unique block", unique_processing());
+    rewrite_terminal_directory(&path, |directory| {
+        directory
+            .blocks
+            .first_mut()
+            .unwrap()
+            .1
+            .flags
+            .set_encryption(false);
+    });
+    assert!(matches!(
+        open_without_keys(&path),
+        Err(PithosError::ProcessingRequiresEncryption(0x10))
+    ));
+}
+
+#[test]
+fn unique_key_blocks_verify_payload_and_identity_before_output() {
+    let content = b"unique key payload long enough for every corruption position";
+    for byte in [0, 12, 40] {
+        let (_temporary, path) = fixture_with_processing(content, unique_processing());
+        corrupt_payload(&path, byte);
+        assert_copy_failure_without_sink(&path);
+    }
+    let (_temporary, path) = fixture_with_processing(content, unique_processing());
+    rewrite_terminal_directory(&path, |directory| {
+        directory
+            .blocks
+            .first_mut()
+            .unwrap()
+            .1
+            .flags
+            .set_unique_key(false);
+    });
+    let archive = open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+    let mut sink = RecordingSink(Vec::new());
+    assert!(matches!(
+        archive.copy_to("data", &mut sink),
+        Err(PithosError::BlockHashMismatch { .. })
+    ));
+    assert!(sink.0.is_empty());
 }

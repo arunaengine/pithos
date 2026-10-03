@@ -1,9 +1,69 @@
 mod common;
 
 use common::append::{WITHHELD_ID, append, append_fixture, append_with_cdc, archive_with_entry};
-use pithos_lib::archive::CdcConfig;
+use common::util::{open, private_key, public_key};
+use pithos_lib::archive::{
+    AccessKeys, AppendOptions, ArchivePath, ArchiveWriter, BlockKeyMode, CdcConfig, EntryMetadata,
+    ProcessingOptions, WriteOptions,
+};
 use pithos_lib::error::PithosError;
-use pithos_lib::fs::FsError;
+use pithos_lib::fs::{FsError, append_files};
+use std::io::Cursor;
+use std::path::PathBuf;
+
+/// A version 1.0 base archive. It has no grants, so only its header differs from 1.1.
+fn version_1_0_base_archive(temporary: &tempfile::TempDir) -> PathBuf {
+    let mut writer = ArchiveWriter::create(Vec::new(), WriteOptions::base()).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("base.txt").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(false, 0).unwrap(),
+            None,
+            Cursor::new(b"base payload"),
+        )
+        .unwrap();
+    let mut bytes = writer.finish().unwrap();
+    bytes[4..6].copy_from_slice(&[0x01, 0x00]);
+    let path = temporary.path().join("legacy.pith");
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn appends_to_version_1_0_archives_reject_version_1_1_processing_before_writing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let archive = version_1_0_base_archive(&temporary);
+    let original = std::fs::read(&archive).unwrap();
+    let source = temporary.path().join("appended.txt");
+    std::fs::write(&source, b"appended payload").unwrap();
+    let options = || AppendOptions::new(private_key("sender"), vec![public_key("recipient1")]);
+    let unique = ProcessingOptions::default()
+        .with_key_mode(BlockKeyMode::Unique)
+        .unwrap();
+    assert!(matches!(
+        append_files(
+            &archive,
+            options().with_processing(unique),
+            std::slice::from_ref(&source)
+        ),
+        Err(FsError::Core {
+            source: PithosError::UnsupportedProcessingFlags(_),
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(&archive).unwrap(), original);
+
+    append_files(&archive, options(), &[source]).unwrap();
+    let mut contents = Vec::new();
+    open(
+        &archive,
+        AccessKeys::new().with_key(private_key("recipient1")),
+    )
+    .copy_to("appended.txt", &mut contents)
+    .unwrap();
+    assert_eq!(contents, b"appended payload");
+}
 
 #[test]
 fn direct_append_file_workflow_adds_a_file() {

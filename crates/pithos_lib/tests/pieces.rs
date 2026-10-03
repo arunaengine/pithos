@@ -2,8 +2,8 @@ mod common;
 
 use common::util::{private_key, public_key};
 use pithos_lib::archive::{
-    AccessKeys, AppendOptions, Archive, ArchivePath, EntryKind, EntryMetadata, OpenOptions, Piece,
-    PieceEncoder, ProcessingOptions, compose,
+    AccessKeys, AppendOptions, Archive, ArchivePath, BlockKeyMode, EntryKind, EntryMetadata,
+    OpenOptions, Piece, PieceEncoder, ProcessingOptions, compose,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
@@ -12,12 +12,12 @@ const BLOCK: usize = 1000;
 
 /// Encodes `content` as one piece in fixed blocks and returns its stored bytes and record.
 fn encode(key_id: u64, content: &[u8]) -> (Vec<u8>, Piece) {
-    let mut encoder = PieceEncoder::new(
-        key_id,
-        vec![public_key("recipient1")],
-        ProcessingOptions::new(true, 3).unwrap(),
-    )
-    .unwrap();
+    encode_with(key_id, content, ProcessingOptions::new(true, 3).unwrap())
+}
+
+fn encode_with(key_id: u64, content: &[u8], processing: ProcessingOptions) -> (Vec<u8>, Piece) {
+    let mut encoder =
+        PieceEncoder::new(key_id, vec![public_key("recipient1")], processing).unwrap();
     let mut stored = Vec::new();
     for block in content.chunks(BLOCK) {
         stored.extend(encoder.push(block).unwrap());
@@ -92,6 +92,28 @@ fn composed_pieces_read_back_as_one_file_with_ranges_across_pieces() {
             available: true
         }
     ));
+}
+
+#[test]
+fn unique_key_pieces_store_every_block_and_compose_with_convergent_pieces() {
+    let repeated = [content(8, BLOCK), content(8, BLOCK)].concat();
+    let convergent = ProcessingOptions::new(true, 0).unwrap();
+    let unique = convergent.with_key_mode(BlockKeyMode::Unique).unwrap();
+    let parts = vec![
+        encode_with(1, &repeated, unique),
+        encode_with(2, &repeated, convergent),
+        encode_with(3, &repeated, unique),
+    ];
+    // Each stored block is `BLCK`, a nonce, the plaintext and a tag. Unique keys store both
+    // copies; convergent keys store the repeat once.
+    let stored_block = (4 + 12 + BLOCK + 16) as u64;
+    assert_eq!(parts[0].1.stored_len(), 2 * stored_block);
+    assert_eq!(parts[1].1.stored_len(), stored_block);
+    assert_eq!(parts[2].1.stored_len(), 2 * stored_block);
+    let archive = open(assemble(&parts), recipient());
+    let mut output = Vec::new();
+    archive.copy_to("object", &mut output).unwrap();
+    assert_eq!(output, repeated.repeat(3));
 }
 
 #[test]
