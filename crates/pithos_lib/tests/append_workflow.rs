@@ -44,7 +44,8 @@ fn appends_to_version_1_0_archives_reject_version_1_1_processing_before_writing(
     let aes = ProcessingOptions::default()
         .with_cipher(PayloadCipher::Aes256Gcm)
         .unwrap();
-    for processing in [unique, aes] {
+    let both = unique.with_cipher(PayloadCipher::Aes256Gcm).unwrap();
+    for processing in [unique, aes, both] {
         assert!(matches!(
             append_files(
                 &archive,

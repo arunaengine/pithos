@@ -1930,3 +1930,85 @@ fn ciphers_mix_per_descriptor_and_reused_blocks_keep_their_cipher() {
         assert_eq!(output, expected, "{name}");
     }
 }
+
+#[test]
+fn version_1_1_processing_round_trips_compressed_blocks() {
+    let content = b"compressible version 1.1 payload ".repeat(64);
+    for (processing, extra) in [
+        (aes_processing(), 0x20),
+        (unique_processing(), 0x10),
+        (
+            unique_processing()
+                .with_cipher(PayloadCipher::Aes256Gcm)
+                .unwrap(),
+            0x30,
+        ),
+    ] {
+        let processing = ProcessingOptions::new(true, 3)
+            .unwrap()
+            .with_key_mode(processing.key_mode())
+            .unwrap()
+            .with_cipher(processing.cipher())
+            .unwrap();
+        let (_temporary, path) = fixture_with_processing(&content, processing);
+        let blocks = decode_terminal_directory(&path).blocks;
+        assert!(!blocks.is_empty());
+        for block in blocks.values() {
+            assert_eq!(block.flags.0, 0x08 | extra | 3);
+            assert!(block.stored_size < block.original_size);
+        }
+        let archive = open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+        let mut output = Vec::new();
+        archive.copy_to("data", &mut output).unwrap();
+        assert_eq!(output, content);
+    }
+}
+
+#[test]
+fn version_1_1_appends_reuse_ciphers_and_give_unique_blocks_fresh_identities() {
+    let content = b"block shared by the base archive and every append";
+    let (temporary, path) =
+        fixture_with_processing(content, ProcessingOptions::new(true, 0).unwrap());
+    let base_blocks = decode_terminal_directory(&path).blocks;
+    assert_eq!(base_blocks.len(), 1);
+    assert_eq!(base_blocks[0].flags.0, 0x08);
+    let mut identities = std::collections::HashSet::from([*base_blocks.keys().next().unwrap()]);
+    let names = ["aes", "unique", "unique-aes"];
+    for (name, processing, new_flags) in [
+        (names[0], aes_processing(), None),
+        (names[1], unique_processing(), Some(0x18)),
+        (
+            names[2],
+            unique_processing()
+                .with_cipher(PayloadCipher::Aes256Gcm)
+                .unwrap(),
+            Some(0x38),
+        ),
+    ] {
+        let source = temporary.path().join(name);
+        std::fs::write(&source, content).unwrap();
+        crate::fs::append_files(
+            &path,
+            crate::archive::AppendOptions::new(private("recipient1"), vec![public("recipient1")])
+                .with_processing(processing),
+            &[source],
+        )
+        .unwrap();
+        let blocks = decode_terminal_directory(&path).blocks;
+        match new_flags {
+            // The content-derived block reuses the ancestor's ChaCha20-Poly1305 descriptor.
+            None => assert!(blocks.is_empty()),
+            Some(flags) => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].flags.0, flags);
+                assert!(identities.insert(*blocks.keys().next().unwrap()));
+            }
+        }
+    }
+    let archive = open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+    for name in ["data"].into_iter().chain(names) {
+        let mut output = Vec::new();
+        archive.copy_to(name, &mut output).unwrap();
+        assert_eq!(output, content, "{name}");
+    }
+}
