@@ -36,7 +36,7 @@ fn public_open_rejects_the_legacy_varint_header() {
     assert!(matches!(
         Archive::open(MemorySource::new(bytes), OpenOptions::default()),
         Err(PithosError::UnsupportedFileVersion {
-            supported: 0x0100,
+            supported: 0x0101,
             actual: 0x8002,
         })
     ));

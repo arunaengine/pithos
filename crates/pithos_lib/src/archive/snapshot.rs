@@ -7,6 +7,7 @@ use crate::archive::validation::IndexLimits;
 use crate::crypto::{FileKey, PublicKey};
 use crate::error::PithosError;
 use crate::format::encryption::EncryptionSection;
+use crate::format::header::FormatVersion;
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use std::sync::Arc;
 /// segments for pure prospective merge, but not the source, decoded directories, or reader facade.
 pub(crate) struct AppendSnapshot {
     archive_len: u64,
+    version: FormatVersion,
     terminal_directory: Span,
     maximum_id: Option<FileId>,
     descriptors: IndexMap<BlockHash, BlockDescriptor>,
@@ -49,6 +51,7 @@ pub(crate) enum SnapshotEntryKind {
 impl AppendSnapshot {
     pub(crate) fn new(
         archive_len: u64,
+        version: FormatVersion,
         terminal_directory: Span,
         index: ArchiveIndex,
         segments: Vec<ValidatedSegment>,
@@ -86,6 +89,7 @@ impl AppendSnapshot {
         }
         Self {
             archive_len,
+            version,
             terminal_directory,
             maximum_id,
             descriptors,
@@ -102,6 +106,10 @@ impl AppendSnapshot {
 
     pub(crate) fn archive_len(&self) -> u64 {
         self.archive_len
+    }
+
+    pub(crate) fn version(&self) -> FormatVersion {
+        self.version
     }
 
     pub(crate) fn terminal_directory(&self) -> Span {

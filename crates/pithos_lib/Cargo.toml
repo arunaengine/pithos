@@ -36,12 +36,14 @@ crc32fast = "1.5.0"
 cap-std = "4.0.2"
 digest = "0.11.3"
 fastcdc = "4.0.1"
+hkdf = "0.13.0"
 indexmap = "2.11.0"
 integer-encoding = "4.1.0"
 libc = "0.2.178"
 pkcs8 = { version = "0.11.0", features = ["pem", "alloc"] }
 ro-crate-rs = { version = "0.5.1", default-features = false }
 rustix = { version = "1.1.4", features = ["fs"] }
+sha2 = "0.11.0"
 shake = "0.1.0"
 thiserror = { workspace = true }
 tracing = { workspace = true }

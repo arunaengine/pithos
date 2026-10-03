@@ -311,6 +311,13 @@ fn recover_first_file_key(path: &Path) -> FileKey {
         panic!("writer recipient data was not encrypted");
     };
     let shared = crypto::derive_shared(recipient.as_bytes(), sender).unwrap();
+    let shared = crypto::grant_wrapping_key(
+        crate::format::header::FormatVersion::V1_1,
+        shared,
+        sender,
+        &recipient_public,
+        &crypto::sealed_nonce(data).unwrap(),
+    );
     let plaintext = crypto::unwrap_recipient_list(&shared, data).unwrap();
     let records = crate::format::encryption::decode_decrypted_recipient_list(
         &plaintext,
@@ -747,10 +754,18 @@ fn archive_rejects_conflicting_recovered_file_keys_at_open() {
     rewrite_terminal_directory(&path, |directory| {
         let sender = StaticSecret::from([9; 32]);
         let recipient = DalekPublicKey::from(&reader);
-        let shared = sender.diffie_hellman(&recipient);
+        let shared = crypto::derive_shared(sender.as_bytes(), recipient.as_bytes()).unwrap();
+        let nonce = [5; 12];
+        let key = crypto::grant_wrapping_key(
+            crate::format::header::FormatVersion::V1_1,
+            shared,
+            &DalekPublicKey::from(&sender).to_bytes(),
+            recipient.as_bytes(),
+            &nonce,
+        );
         let mut plaintext = vec![1, 0];
         plaintext.extend_from_slice(&[0x77; 32]);
-        let encrypted = crypto::seal_crypt4gh_payload(shared.as_bytes(), &plaintext).unwrap();
+        let encrypted = crypto::wrap_recipient_list_with_nonce(&key, &plaintext, nonce).unwrap();
         directory.encryption.insert(
             DalekPublicKey::from(&sender).to_bytes(),
             EncryptionSection {

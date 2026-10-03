@@ -1,19 +1,23 @@
 //! Current Pithos cryptographic roles and protocol operations.
 //!
 //! The byte formats deliberately remain in the established protocol: every sealed value is
-//! `nonce || ciphertext || tag` and always uses empty associated data.
+//! `nonce || ciphertext || tag` and always uses empty associated data. Version 1.1 changes only
+//! how a recipient grant's wrapping key is derived.
 
+use crate::format::header::FormatVersion;
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
     aead::{Aead, Generate, Payload},
 };
 use digest::{ExtendableOutput, Update, XofReader};
+use hkdf::Hkdf;
 use pkcs8::der::EncodePem;
 use pkcs8::der::pem::PemLabel;
 use pkcs8::{
     Document, LineEnding, ObjectIdentifier, PrivateKeyInfoRef, SecretDocument,
     SubjectPublicKeyInfoRef, der,
 };
+use sha2::Sha256;
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
@@ -247,6 +251,44 @@ pub(crate) fn derive_shared(
         return Err(CryptoError::NonContributoryPublicKey);
     }
     Ok(SharedSecret(shared.to_bytes()))
+}
+
+/// HKDF info prefix of a version 1.1 recipient grant; the sender and recipient keys follow.
+const GRANT_KEY_INFO: &[u8] = b"pithos 1.1 recipient grant";
+
+/// Wrapping key of one recipient grant. Version 1.0 uses the raw shared secret. Version 1.1
+/// derives a key per grant with HKDF-SHA256, salted with the grant nonce, bound to both keys.
+pub(crate) fn grant_wrapping_key(
+    version: FormatVersion,
+    shared: SharedSecret,
+    sender: &[u8; 32],
+    recipient: &[u8; 32],
+    nonce: &[u8; 12],
+) -> SharedSecret {
+    match version {
+        FormatVersion::V1_0 => shared,
+        FormatVersion::V1_1 => {
+            let mut info = Zeroizing::new([0u8; GRANT_KEY_INFO.len() + 64]);
+            info[..GRANT_KEY_INFO.len()].copy_from_slice(GRANT_KEY_INFO);
+            info[GRANT_KEY_INFO.len()..GRANT_KEY_INFO.len() + 32].copy_from_slice(sender);
+            info[GRANT_KEY_INFO.len() + 32..].copy_from_slice(recipient);
+            let mut key = SharedSecret([0; 32]);
+            Hkdf::<Sha256>::new(Some(&nonce[..]), shared.expose_for_protocol())
+                .expand(&info[..], &mut key.0)
+                .expect("32 bytes is a valid HKDF-SHA256 output length");
+            key
+        }
+    }
+}
+
+/// The nonce stored at the start of a sealed value, needed before its key can be derived.
+pub(crate) fn sealed_nonce(payload: &[u8]) -> Result<[u8; 12], CryptoError> {
+    if payload.len() < 15 {
+        return Err(CryptoError::EncryptedPayloadTooShort);
+    }
+    let mut nonce = [0; 12];
+    nonce.copy_from_slice(&payload[..12]);
+    Ok(nonce)
 }
 
 pub(crate) fn validate_x25519_public_key(public: &[u8; 32]) -> Result<(), CryptoError> {

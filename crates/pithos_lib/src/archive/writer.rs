@@ -14,7 +14,7 @@ use crate::format::block::{BlockHeader, BlockIndexEntry, BlockLocation, Processi
 use crate::format::directory::{Directory, DirectoryEntries};
 use crate::format::encryption::{EncryptionSection, RecipientData};
 use crate::format::file_entry::{BlockDataState, FileEntry, FileType, Reference};
-use crate::format::header::FileHeader;
+use crate::format::header::FormatVersion;
 use crate::format::{directory, header};
 use fastcdc::v2020::{Normalization, StreamCDC};
 use indexmap::IndexMap;
@@ -532,6 +532,7 @@ impl<W: Write> Write for CountingSink<W> {
 /// A streaming archive writer. Dropping it leaves an intentionally incomplete sink.
 pub struct ArchiveWriter<W: Write> {
     mode: ArchiveWriterMode,
+    version: FormatVersion,
     cdc: CdcConfig,
     sink: CountingSink<W>,
     directory: Directory,
@@ -587,7 +588,7 @@ impl<W: Write> ArchiveWriter<W> {
         };
         let directory = Directory::new(None, DirectoryEntries::new(), encryption);
         let mut sink = CountingSink { sink, offset: 0 };
-        if let Err(error) = header::encode_header(&FileHeader::default(), &mut sink) {
+        if let Err(error) = header::encode_header(&FormatVersion::CURRENT.header(), &mut sink) {
             return Err(CreateError {
                 error: error.into(),
                 sink: sink.into_inner(),
@@ -595,6 +596,7 @@ impl<W: Write> ArchiveWriter<W> {
         }
         Ok(Self {
             mode,
+            version: FormatVersion::CURRENT,
             cdc,
             sink,
             directory,
@@ -633,6 +635,7 @@ impl<W: Write> ArchiveWriter<W> {
         let directory = Directory::new(Some((parent.start(), parent.len())), files, encryption);
         Ok(Self {
             mode: ArchiveWriterMode::Encrypted { sender },
+            version: snapshot.version(),
             cdc,
             sink: CountingSink {
                 sink,
@@ -1316,10 +1319,15 @@ impl<W: Write> ArchiveWriter<W> {
             return Ok(());
         };
         for (recipient_key, recipient) in &mut section.recipients {
-            let recipient_key = LegacyPublicKey::from(*recipient_key);
-            let shared_key =
-                crate::crypto::derive_shared(sender.as_bytes(), recipient_key.as_bytes())?;
+            let shared = crate::crypto::derive_shared(sender.as_bytes(), recipient_key)?;
             let nonce = self.runtime.recipient_list_nonce()?;
+            let shared_key = crate::crypto::grant_wrapping_key(
+                self.version,
+                shared,
+                &sender_public,
+                recipient_key,
+                &nonce,
+            );
             self.runtime
                 .seal_recipient_list(&mut recipient.recipient_data, shared_key, nonce)?;
         }
@@ -1584,6 +1592,52 @@ mod tests {
     }
 
     #[test]
+    fn recipient_grants_follow_the_archive_version_rules() {
+        for (version, other) in [
+            (FormatVersion::V1_0, FormatVersion::V1_1),
+            (FormatVersion::V1_1, FormatVersion::V1_0),
+        ] {
+            let sender = PrivateKey::generate();
+            let mut writer = ArchiveWriter::create(
+                Vec::new(),
+                WriteOptions::new(sender.duplicate(), vec![sender.public_key()]),
+            )
+            .unwrap();
+            writer.version = version;
+            writer
+                .add_file(
+                    ArchivePath::new("data").unwrap(),
+                    EntryMetadata::new(0, 0, 0o644),
+                    ProcessingOptions::default(),
+                    None,
+                    Cursor::new(b"content"),
+                )
+                .unwrap();
+            let mut bytes = writer.finish().unwrap();
+            bytes[4..6].copy_from_slice(&version.wire().to_be_bytes());
+            let open = |bytes: Vec<u8>| {
+                Archive::open(
+                    MemorySource::new(bytes),
+                    OpenOptions::default()
+                        .with_access_keys(AccessKeys::new().with_key(sender.duplicate())),
+                )
+            };
+            let mut output = Vec::new();
+            open(bytes.clone())
+                .unwrap()
+                .copy_to("data", &mut output)
+                .unwrap();
+            assert_eq!(output, b"content");
+
+            bytes[4..6].copy_from_slice(&other.wire().to_be_bytes());
+            assert!(
+                open(bytes).is_err(),
+                "{other:?} rules opened a {version:?} grant"
+            );
+        }
+    }
+
+    #[test]
     fn injected_transform_failure_poison_preserves_live_directory() {
         let mut writer = ArchiveWriter::with_test_runtime(
             Vec::new(),
@@ -1661,9 +1715,9 @@ mod tests {
         let archive = write();
         assert_eq!(
             blake3::hash(&archive).to_hex().as_str(),
-            "ed87c4bc6481475e5d1a2af8906b75728231c451e1db93fca3aa4318efcdbf49"
+            "e2a3b75a71ab0e1db03f0e1b5fa9a9f183822248616397e6d727455eb7730eb2"
         );
-        assert_eq!(&archive[..6], b"PITH\x01\x00");
+        assert_eq!(&archive[..6], b"PITH\x01\x01");
         assert_eq!(
             archive
                 .windows(8)

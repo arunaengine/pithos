@@ -1,4 +1,4 @@
-//! Reproducible verification for the Pithos 1.0 draft vectors in Appendix B.
+//! Reproducible verification for the Pithos draft vectors in Appendix B.
 //!
 //! This repository-only test model is not an alternate production codec.
 
@@ -316,7 +316,10 @@ fn production_base_writer_reproduces_cv_local_hello() {
             Cursor::new(b"hello"),
         )
         .unwrap();
-    assert_eq!(writer.finish().unwrap(), appendix_hex("CV-LOCAL-HELLO-279"));
+    // A version 1.1 base archive differs from the version 1.0 vector only in its header.
+    let mut expected = appendix_hex("CV-LOCAL-HELLO-279");
+    expected[5] = 0x01;
+    assert_eq!(writer.finish().unwrap(), expected);
 }
 
 #[test]
@@ -547,8 +550,37 @@ fn processing_known_answers_match_appendix_b() {
     stored.extend_from_slice(&ciphertext);
     assert_eq!(
         stored,
-        appendix_recipient_wrap(),
+        appendix_recipient_wrap("PV-RECIPIENT-WRAP-01"),
         "recipient-wrap bytes must match Appendix B"
+    );
+
+    let alice_public = PublicKey::from(&alice).to_bytes();
+    assert_eq!(
+        alice_public,
+        hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+    );
+    let mut info = b"pithos 1.1 recipient grant".to_vec();
+    info.extend_from_slice(&alice_public);
+    info.extend_from_slice(bob.as_bytes());
+    let mut key = [0; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(nonce.as_slice()), &shared)
+        .expand(&info, &mut key)
+        .unwrap();
+    assert_eq!(
+        key,
+        hex("16894ee78d378733e5148de641263d7503e3131e51ee894d60a56caa36c7caaa")
+    );
+    let mut stored = nonce.to_vec();
+    stored.extend_from_slice(
+        &ChaCha20Poly1305::new_from_slice(&key)
+            .unwrap()
+            .encrypt(&nonce, plaintext.as_ref())
+            .unwrap(),
+    );
+    assert_eq!(
+        stored,
+        appendix_recipient_wrap("PV-RECIPIENT-WRAP-11"),
+        "version 1.1 recipient-wrap bytes must match Appendix B"
     );
 }
 
@@ -567,8 +599,8 @@ fn appendix_zstd_bytes(id: &str) -> Vec<u8> {
         .collect()
 }
 
-fn appendix_recipient_wrap() -> Vec<u8> {
-    let start = SPEC.find("PV-RECIPIENT-WRAP-01").unwrap();
+fn appendix_recipient_wrap(id: &str) -> Vec<u8> {
+    let start = SPEC.find(&format!("`{id}`")).unwrap();
     let block = SPEC[start..].split("```text\n").nth(1).unwrap();
     block
         .split("```")

@@ -1,8 +1,8 @@
 # Pithos File Format Specification
 
-**Version:** 1.0
+**Version:** 1.1
 **Status:** Draft
-**Date:** July 2026
+**Date:** October 2026
 **Purpose:** Next-generation file format for scientific data management, optimized for object storage with built-in deduplication, encryption, and metadata support
 
 ## 1. Introduction
@@ -15,8 +15,9 @@ Pithos is an append-only archive format designed for efficient storage and shari
 data model only; implementations may use different declarations. Normative
 prose and encoded-form tables govern conformance and the bytes on disk.
 
-This document defines Pithos 1.0. Where a current 0.8 implementation differs,
-this document governs.
+This document defines Pithos 1.1 and the version 1.0 rules it keeps. Version 1.0
+archives remain valid; Section 1.3 lists every difference between the versions.
+Where a current 0.8 implementation differs, this document governs.
 
 ### 1.1 Reader's Guide
 
@@ -55,6 +56,20 @@ this document governs.
 - **salvage mode:** A recovery mode that may locate an older Directory after a
   normal terminal-Directory lookup fails; its result is incomplete and is not a
   normal archive view.
+
+### 1.3 Version Differences
+
+Version 1.1 keeps every version 1.0 structure and encoding. The header version
+selects the rules for the whole archive, including every appended segment.
+Version 1.1 differs from version 1.0 only in these points:
+
+1. The header version is `0x0101` (Section 4.1).
+2. A recipient grant's wrapping key is derived with HKDF-SHA256 instead of using
+   the raw X25519 shared secret (Section 5.3).
+
+Readers MUST support both versions. Writers MUST create new archives as version
+1.1. An append MUST follow the version of the archive it extends, so appending
+to a version 1.0 archive uses the version 1.0 rules.
 
 ## 2. Core Design Principles
 
@@ -133,7 +148,7 @@ A FileHeader identifies a Pithos file and its format version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub magic: [u8; 4],    // b"PITH"
-    pub version: u16,      // fixed-width big-endian, 0x0100 for 1.0
+    pub version: u16,      // fixed-width big-endian, 0x0100 for 1.0, 0x0101 for 1.1
 }
 ```
 
@@ -144,8 +159,9 @@ pub struct FileHeader {
 | `magic` | Exactly 4 bytes: ASCII `PITH` |
 | `version` | Fixed-width `u16be` |
 
-Readers MUST reject a header whose magic is not `PITH` or whose version is not
-`0x0100`. The encoded form is exactly six bytes: `PITH 01 00`.
+Readers MUST reject a header whose magic is not `PITH` or whose version is
+neither `0x0100` nor `0x0101`. The encoded form is exactly six bytes: `PITH 01 01`
+for version 1.1 and `PITH 01 00` for version 1.0.
 
 ### 4.2 Block Storage
 
@@ -785,11 +801,20 @@ label or length prefix is included. A block payload with encryption enabled is
 encrypted with its block key.
 
 A file key is 32 random bytes. It encrypts the decrypted block list for a file.
-For each recipient record, the recipient wrapping key is the raw 32-byte X25519
-shared secret between the sender private key and recipient public key. That
-shared secret is used directly as the ChaCha20-Poly1305 key to encrypt the
-decrypted recipient list; no intermediate KDF is used. Implementations MUST
-reject non-contributory X25519 public keys.
+For each recipient record, the shared secret is the raw 32-byte X25519 shared
+secret between the sender private key and recipient public key. The wrapping key
+encrypts the decrypted recipient list with ChaCha20-Poly1305:
+
+- **Version 1.0:** the wrapping key is the shared secret itself.
+- **Version 1.1:** the wrapping key is the 32-byte HKDF-SHA256 output
+  (RFC 5869) with the record's 12-byte nonce as salt, the shared secret as input
+  key material, and info `pithos 1.1 recipient grant` (26 ASCII bytes) followed
+  by the sender public key and then the recipient public key. The keys are the
+  ones stored in the Directory: the EncryptionSection key and the recipient
+  record key.
+
+Each version 1.1 grant therefore has its own key, bound to both public keys.
+Implementations MUST reject non-contributory X25519 public keys.
 
 An implementation MUST generate every nonce independently and uniformly at
 random with a cryptographically secure random number generator and MUST NOT
@@ -797,8 +822,8 @@ deliberately reuse a nonce under the same key. It MUST authenticate and decrypt
 an encrypted value successfully before using its plaintext or releasing output
 derived from it.
 
-Version 1.0 deliberately has no SHAKE256 label, intermediate X25519 KDF, or
-AAD. A redesign of any of these inputs requires a new format version.
+Neither version uses a SHAKE256 label or AAD. A redesign of any cryptographic
+input requires a new format version.
 
 ### 5.4 Compression
 
@@ -862,13 +887,15 @@ recipient counts, ciphertext lengths, and the segment timing of grants are
 visible. `RecipientData::Decrypted` exposes its file-key grants and provides no
 grant confidentiality.
 
-Recipient wrapping uses a raw static X25519 shared secret directly as its AEAD
-key, with no KDF, label, or AAD. Consequently, the construction has no domain
+Version 1.0 recipient wrapping uses a raw static X25519 shared secret directly as
+its AEAD key, with no KDF, label, or AAD. That construction has no domain
 separation, and each static sender-recipient key pair has one nonce-collision
-scope across all archives that use it; uniformly random CSPRNG nonces reduce but
-cannot eliminate collision risk. The plaintext-derived Directory block hash
-exposes block equality, and equal plaintext also derives the same convergent
-block key.
+scope across all archives that use it. Version 1.1 derives every wrapping key
+with HKDF-SHA256 from the shared secret, the grant's random nonce and both public
+keys. This adds domain separation and gives each grant its own key, so a nonce
+can only collide within one grant. Appends to version 1.0 archives keep the
+version 1.0 construction. The plaintext-derived Directory block hash exposes
+block equality, and equal plaintext also derives the same convergent block key.
 
 Readers must verify each block as required by Section 5.2 before releasing its
 output. Networked external resolution can expose a caller to unsafe targets and
@@ -882,7 +909,7 @@ policy; Sections 8.3 and 4.4.3 define these requirements.
 
 ### 8.1 Base Reader and Writer
 
-A base reader supports the version 1.0 structure, including its required
+A base reader supports the version 1.0 and 1.1 structure, including its required
 validation, and can read local blocks whose ProcessingFlags have compression
 value `0` and encryption bit `0`. It supports decrypted BlockDataState lists.
 A base writer can create an archive containing only such local blocks and an
@@ -977,6 +1004,7 @@ Extensions MUST maintain backwards compatibility for reading.
 ### 10.2 Version Numbers
 
 - Version 1.0: `0x0100`
+- Version 1.1: `0x0101`
 
 ### 10.3 Default Values
 
@@ -1009,8 +1037,9 @@ as test input.
 Hex offsets are zero-based file offsets. Each hex line contains at most 16 bytes;
 `0000:` is an offset, not encoded data. Integers without a fixed-width suffix use
 shortest ULEB128 in these deterministic vectors, although Section 3.1 also
-permits bounded non-minimal forms. `u64be` and `u32be` are big-endian. The header
-is always
+permits bounded non-minimal forms. `u64be` and `u32be` are big-endian. The
+canonical archives are version 1.0 archives, which every reader accepts, so their
+header is always
 `50 49 54 48 01 00` (`PITH`, version `0x0100`); the other magic values are
 `42 4c 43 4b` (`BLCK`) and `50 49 54 48 4f 53 44 52` (`PITHOSDR`).
 
@@ -1172,6 +1201,20 @@ Successful decryption yields exactly the stated 34-byte RecipientData
 plaintext. Fixed nonces are permitted here only as test inputs; writers use
 random nonces as required by Section 5.3.
 
+`PV-RECIPIENT-WRAP-11` is the version 1.1 known-answer test with the same
+inputs. The sender public key is Alice's public key
+`8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a` and the
+recipient public key is Bob's. The derived wrapping key is
+`16894ee78d378733e5148de641263d7503e3131e51ee894d60a56caa36c7caaa`, and the
+stored `nonce || ciphertext || tag` is:
+
+```text
+0000: 00 01 02 03 04 05 06 07 08 09 0a 0b 25 3f 85 dd
+0010: 25 c7 5f b6 81 1b 4d 7c 0d 8e 14 3f b3 fc de 6d
+0020: 59 94 e4 8a 32 ca 15 61 6a 2f 26 f9 9b 3c 42 da
+0030: 43 a0 94 bb cc 91 e1 c5 a6 53 62 9a d4 a1
+```
+
 ### B.4 Acceptance and Rejection Mutations
 
 Each `AV-*` or `RV-*` vector is a mutation of the named canonical vector.
@@ -1207,4 +1250,4 @@ archive.
 | Directory framing, CRC, and chain | 4.3, 4.3.1, 4.3.2 | CV-BASE-EMPTY-146, CV-APPEND-EMPTY-28, RV-PARENT, RV-UNDERFLOW, RV-TRAILING, RV-CRC, RV-CROSS-SIZE | Valid archive or reject archive as stated |
 | Entries and paths | 4.3.3, 4.4.1, 4.4.3 | CV-LOCAL-HELLO-279, RV-DUPLICATES, RV-PATH, RV-SYMLINK, RV-FILETYPE, RV-PERMISSIONS | Valid archive or reject archive as stated |
 | Block locations and extents | 4.2.2, 4.2.5, 4.2.6, 8.2 | CV-LOCAL-HELLO-279, RV-EXTENT, RV-SHORT-ENCRYPTED, RV-EXTERNAL | Valid archive, reject archive, content read fails before output, or content unavailable as stated |
-| Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01 | Decode/decrypt to stated output |
+| Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01, PV-RECIPIENT-WRAP-11 | Decode/decrypt to stated output |

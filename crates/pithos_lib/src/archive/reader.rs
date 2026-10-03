@@ -17,7 +17,7 @@ use crate::format::block::{
 use crate::format::directory::Directory;
 use crate::format::encryption::RecipientData;
 use crate::format::file_entry::{BlockDataEntry, BlockDataState};
-use crate::format::header::FileHeader;
+use crate::format::header::{FileHeader, FormatVersion};
 use crate::format::limits::DeserializationLimits;
 use crate::source::ArchiveSource;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -268,6 +268,7 @@ pub struct Archive<S, E = NoExternalBlocks> {
     external: E,
     external_access_policy: Option<Arc<dyn ExternalBlockAccessPolicy>>,
     archive_len: u64,
+    version: FormatVersion,
     terminal_directory: Span,
     index: ArchiveIndex,
     segments: Vec<ValidatedSegment>,
@@ -289,12 +290,12 @@ where
         let mut header = [0; FileHeader::ENCODED_LEN];
         source.read_exact_at(0, &mut header)?;
         let header = crate::format::header::decode_header(&mut header.as_slice())?;
-        if header.version != FileHeader::SUPPORTED_VERSION {
-            return Err(PithosError::UnsupportedFileVersion {
-                supported: FileHeader::SUPPORTED_VERSION,
+        let version = FormatVersion::from_wire(header.version).ok_or(
+            PithosError::UnsupportedFileVersion {
+                supported: FormatVersion::CURRENT.wire(),
                 actual: header.version,
-            });
-        }
+            },
+        )?;
 
         let (terminal_start, terminal_len) = terminal_span(&source, archive_len, options.limits)?;
         let mut raw = Vec::new();
@@ -368,6 +369,7 @@ where
         let mut recovery_order = 0usize;
         for (segment, (directory, _)) in raw.iter().enumerate() {
             resolve_recipients(
+                version,
                 directory,
                 &options.keys,
                 segment,
@@ -415,6 +417,7 @@ where
             external: options.external,
             external_access_policy: options.external_access_policy,
             archive_len,
+            version,
             terminal_directory: Span::new(terminal_start, terminal_len)?,
             index,
             segments,
@@ -436,6 +439,7 @@ where
     pub(crate) fn into_append_snapshot(self) -> AppendSnapshot {
         let Self {
             archive_len,
+            version,
             terminal_directory,
             index,
             segments,
@@ -445,6 +449,7 @@ where
         } = self;
         AppendSnapshot::new(
             archive_len,
+            version,
             terminal_directory,
             index,
             segments,
@@ -838,6 +843,7 @@ fn read_source<S: ArchiveSource>(
 }
 
 fn resolve_recipients(
+    version: FormatVersion,
     directory: &Directory,
     keys: &AccessKeys,
     segment: usize,
@@ -850,23 +856,34 @@ fn resolve_recipients(
         let secret = key.as_dalek_static_secret();
         let recipient = DalekPublicKey::from(&secret).to_bytes();
         for (sender_section, (sender, section)) in directory.encryption.iter().enumerate() {
-            let candidates: Vec<(&[u8; 32], &RecipientData)> = if sender == &recipient {
+            // Each candidate is the grant's peer key, its recipient key, and its data.
+            let candidates: Vec<(&[u8; 32], &[u8; 32], &RecipientData)> = if sender == &recipient {
                 section
                     .recipients
                     .iter()
-                    .map(|(recipient, section)| (recipient, &section.recipient_data))
+                    .map(|(recipient, section)| (recipient, recipient, &section.recipient_data))
                     .collect()
             } else {
                 section
                     .recipients
                     .get(&recipient)
-                    .map(|section| vec![(sender, &section.recipient_data)])
+                    .map(|section| vec![(sender, &recipient, &section.recipient_data)])
                     .unwrap_or_default()
             };
-            for (recipient_section, (peer, data)) in candidates.into_iter().enumerate() {
+            for (recipient_section, (peer, grant_recipient, data)) in
+                candidates.into_iter().enumerate()
+            {
                 let shared = crypto::derive_shared(secret.as_bytes(), peer)?;
                 let entries = match data {
                     RecipientData::Encrypted(bytes) => {
+                        let nonce = crypto::sealed_nonce(bytes)?;
+                        let shared = crypto::grant_wrapping_key(
+                            version,
+                            shared,
+                            sender,
+                            grant_recipient,
+                            &nonce,
+                        );
                         let plaintext = crypto::unwrap_recipient_list(&shared, bytes)?;
                         crate::format::encryption::decode_decrypted_recipient_list(
                             &plaintext,
