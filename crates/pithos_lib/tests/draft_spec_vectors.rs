@@ -723,6 +723,31 @@ fn unique_key_block_known_answer_matches_appendix_b() {
     assert_eq!(stored, appendix_text_block("PV-UNIQUE-KEY-HELLO"));
 }
 
+#[test]
+fn aes_256_gcm_block_known_answer_matches_appendix_b() {
+    use aes_gcm::Aes256Gcm;
+    let nonce: [u8; 12] = std::array::from_fn(|index| 0xb0 + index as u8);
+    let block_key = shake256(b"hello");
+    let payload_key = blake3::derive_key("pithos 1.1 aes-256-gcm payload", &block_key);
+    for value in [
+        blake3::Hash::from(block_key).to_hex(),
+        blake3::Hash::from(payload_key).to_hex(),
+    ] {
+        assert!(
+            SPEC.contains(value.as_str()),
+            "{value} missing from Appendix B"
+        );
+    }
+    let mut stored = nonce.to_vec();
+    stored.extend_from_slice(
+        &Aes256Gcm::new_from_slice(&payload_key)
+            .unwrap()
+            .encrypt(&aes_gcm::Nonce::from(nonce), b"hello".as_ref())
+            .unwrap(),
+    );
+    assert_eq!(stored, appendix_text_block("PV-AES-GCM-HELLO"));
+}
+
 fn appendix_zstd_bytes(id: &str) -> Vec<u8> {
     let row = SPEC
         .lines()

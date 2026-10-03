@@ -51,7 +51,8 @@ fn encode_with_key(
     key: BlockKey,
     nonce: [u8; 12],
 ) -> Result<EncodedBlock, PithosError> {
-    if requested_flags.is_unique_key() && !requested_flags.is_encrypted() {
+    if requested_flags.0 & ProcessingFlags::VERSION_1_1_MASK != 0 && !requested_flags.is_encrypted()
+    {
         return Err(PithosError::ProcessingRequiresEncryption(requested_flags.0));
     }
     let hash = block_hash(requested_flags, &key, plaintext);
@@ -65,7 +66,9 @@ fn encode_with_key(
             plaintext.to_vec()
         },
     );
-    if flags.is_encrypted() {
+    if flags.is_aes_256_gcm() {
+        stored = Zeroizing::new(crypto::seal_block_aes_with_nonce(&key, &stored, nonce)?);
+    } else if flags.is_encrypted() {
         stored = Zeroizing::new(crypto::seal_block_with_nonce(&key, &stored, nonce)?);
     }
     Ok(EncodedBlock {
@@ -104,7 +107,9 @@ pub(crate) fn verify(
             actual: stored.len() as u64,
         });
     }
-    let mut plaintext = if meta.flags.is_encrypted() {
+    let mut plaintext = if meta.flags.is_aes_256_gcm() {
+        crypto::open_block_aes(key, &stored)?
+    } else if meta.flags.is_encrypted() {
         crypto::open_block(key, &stored)?
     } else {
         stored
@@ -270,6 +275,76 @@ mod tests {
                 limits()
             ),
             Err(PithosError::BlockHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn aes_256_gcm_vector_matches_the_specification() {
+        let nonce = std::array::from_fn(|index| 0xb0 + index as u8);
+        let key = crypto::derive_block_key(b"hello");
+        let encoded = encode_with_key(b"hello", ProcessingFlags(0x28), key, nonce).unwrap();
+        // PV-AES-GCM-HELLO in Appendix B.
+        assert_eq!(encoded.hash, crypto::block_hash(b"hello"));
+        assert_eq!(
+            &encoded.stored[12..],
+            [
+                0x37, 0x8d, 0x6e, 0x4e, 0x73, 0xd7, 0xd5, 0xba, 0x27, 0x60, 0x8f, 0xef, 0x88, 0xed,
+                0x83, 0x96, 0x88, 0x2e, 0x54, 0xd5, 0xcd
+            ]
+        );
+        let meta = descriptor(&encoded, 5);
+        let plain = verify(
+            encoded.stored.clone(),
+            &encoded.key,
+            encoded.hash,
+            &meta,
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(&*plain, b"hello");
+
+        // The same key opens neither cipher's payload as the other.
+        let mut chacha = meta.clone();
+        chacha.flags.set_aes_256_gcm(false);
+        assert!(matches!(
+            verify(
+                encoded.stored,
+                &encoded.key,
+                encoded.hash,
+                &chacha,
+                limits()
+            ),
+            Err(PithosError::Crypt(_))
+        ));
+        assert!(matches!(
+            encode(b"hello", ProcessingFlags(0x20), [0; 12]),
+            Err(PithosError::ProcessingRequiresEncryption(0x20))
+        ));
+    }
+
+    #[test]
+    fn unique_keys_and_aes_256_gcm_combine() {
+        let plain = b"unique key sealed with AES-256-GCM";
+        let mut flags = unique_flags(0);
+        flags.set_aes_256_gcm(true);
+        let encoded = encode(plain, flags, [3; 12]).unwrap();
+        assert_eq!(encoded.flags.0, 0x38);
+        assert_eq!(encoded.hash, crypto::keyed_block_hash(&encoded.key, plain));
+        let meta = descriptor(&encoded, plain.len());
+        let output = verify(
+            encoded.stored.clone(),
+            &encoded.key,
+            encoded.hash,
+            &meta,
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(&*output, plain);
+        let mut corrupt = encoded.stored;
+        corrupt[20] ^= 1;
+        assert!(matches!(
+            verify(corrupt, &encoded.key, encoded.hash, &meta, limits()),
+            Err(PithosError::Crypt(_))
         ));
     }
 

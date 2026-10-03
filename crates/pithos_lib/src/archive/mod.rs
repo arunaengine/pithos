@@ -59,7 +59,8 @@ pub(crate) fn decode_validated_directory(
 }
 pub use writer::{
     ArchiveWriter, BlockKeyMode, CdcConfig, CreateError, EntryMetadata, EntryReference,
-    FinishError, IncompleteWriter, ProcessingOptions, WriteOptions, WriterError, WrittenEntry,
+    FinishError, IncompleteWriter, PayloadCipher, ProcessingOptions, WriteOptions, WriterError,
+    WrittenEntry,
 };
 
 #[cfg(test)]
@@ -131,20 +132,23 @@ mod tests {
                 Err(PithosError::ReservedProcessingBits(0x40))
             ));
         }
-        assert_eq!(
-            Processing::from_byte(0x1b, FormatVersion::V1_1)
-                .unwrap()
-                .to_byte(),
-            0x1b
-        );
-        assert!(matches!(
-            Processing::from_byte(0x1b, FormatVersion::V1_0),
-            Err(PithosError::UnsupportedProcessingFlags(0x1b))
-        ));
-        assert!(matches!(
-            Processing::from_byte(0x13, FormatVersion::V1_1),
-            Err(PithosError::ProcessingRequiresEncryption(0x13))
-        ));
+        for flags in [0x1b, 0x2b, 0x3b] {
+            assert_eq!(
+                Processing::from_byte(flags, FormatVersion::V1_1)
+                    .unwrap()
+                    .to_byte(),
+                flags
+            );
+            assert!(matches!(
+                Processing::from_byte(flags, FormatVersion::V1_0),
+                Err(PithosError::UnsupportedProcessingFlags(actual)) if actual == flags
+            ));
+            let plain = flags & !0x08;
+            assert!(matches!(
+                Processing::from_byte(plain, FormatVersion::V1_1),
+                Err(PithosError::ProcessingRequiresEncryption(actual)) if actual == plain
+            ));
+        }
     }
 
     #[test]

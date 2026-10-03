@@ -490,21 +490,23 @@ pub fn compose(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::BlockKeyMode;
+    use crate::archive::{BlockKeyMode, PayloadCipher};
 
     #[test]
-    fn piece_records_carry_unique_key_flags_and_reject_invalid_ones() {
+    fn piece_records_carry_version_1_1_flags_and_reject_invalid_ones() {
         let recipient = crate::crypto::PrivateKey::generate().public_key();
         let processing = ProcessingOptions::new(true, 0)
             .unwrap()
             .with_key_mode(BlockKeyMode::Unique)
+            .unwrap()
+            .with_cipher(PayloadCipher::Aes256Gcm)
             .unwrap();
         let mut encoder = PieceEncoder::new(1, vec![recipient], processing).unwrap();
         encoder.push(b"unique block").unwrap();
         let mut piece = encoder.finish().unwrap();
-        assert_eq!(piece.blocks[0].flags.0, 0x18);
+        assert_eq!(piece.blocks[0].flags.0, 0x38);
         assert_eq!(Piece::from_bytes(&piece.to_bytes()).unwrap(), piece);
-        for flags in [0x10, 0x40] {
+        for flags in [0x10, 0x20, 0x40] {
             piece.blocks[0].flags = ProcessingFlags(flags);
             assert!(matches!(
                 Piece::from_bytes(&piece.to_bytes()),

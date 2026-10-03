@@ -1,13 +1,14 @@
 //! Current Pithos cryptographic roles and protocol operations.
 //!
 //! The byte formats deliberately remain in the established protocol: every sealed value is
-//! `nonce || ciphertext || tag` and always uses empty associated data. Version 1.1 changes only
-//! how a recipient grant's wrapping key is derived.
+//! `nonce || ciphertext || tag` and always uses empty associated data. Version 1.1 derives
+//! recipient grant keys with HKDF and adds unique block keys and AES-256-GCM block payloads.
 
 use crate::format::header::FormatVersion;
+use aes_gcm::Aes256Gcm;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, KeyInit, Nonce,
-    aead::{Aead, Generate, Payload},
+    aead::{self, Aead, AeadCore, Generate, Payload, consts::U12},
 };
 use digest::{ExtendableOutput, Update, XofReader};
 use hkdf::Hkdf;
@@ -342,6 +343,28 @@ pub(crate) fn open_block(
     open_empty_aad(key.expose_for_protocol(), payload)
 }
 
+/// BLAKE3 key derivation context of the AES-256-GCM payload key of a block key.
+const AES_PAYLOAD_CONTEXT: &str = "pithos 1.1 aes-256-gcm payload";
+
+fn aes_payload_key(key: &BlockKey) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(blake3::derive_key(AES_PAYLOAD_CONTEXT, &key.0))
+}
+
+pub(crate) fn seal_block_aes_with_nonce(
+    key: &BlockKey,
+    plaintext: &[u8],
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, CryptoError> {
+    seal_with::<Aes256Gcm>(&aes_payload_key(key), plaintext, nonce)
+}
+
+pub(crate) fn open_block_aes(
+    key: &BlockKey,
+    payload: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    open_with::<Aes256Gcm>(&aes_payload_key(key), payload)
+}
+
 pub(crate) fn seal_file_block_list_with_nonce(
     key: &FileKey,
     plaintext: &[u8],
@@ -389,11 +412,22 @@ fn seal_empty_aad(
     plaintext: &[u8],
     nonce: [u8; 12],
 ) -> Result<Vec<u8>, CryptoError> {
-    let cipher =
-        ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::CipherInitialization)?;
+    seal_with::<ChaCha20Poly1305>(key, plaintext, nonce)
+}
+
+fn open_empty_aad(key: &[u8; 32], payload: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    open_with::<ChaCha20Poly1305>(key, payload)
+}
+
+fn seal_with<C: KeyInit + Aead + AeadCore<NonceSize = U12>>(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = C::new_from_slice(key).map_err(|_| CryptoError::CipherInitialization)?;
     let ciphertext = cipher
         .encrypt(
-            &Nonce::from(nonce),
+            &aead::Nonce::<C>::from(nonce),
             Payload {
                 msg: plaintext,
                 aad: b"",
@@ -406,19 +440,21 @@ fn seal_empty_aad(
     Ok(payload)
 }
 
-fn open_empty_aad(key: &[u8; 32], payload: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+fn open_with<C: KeyInit + Aead + AeadCore<NonceSize = U12>>(
+    key: &[u8; 32],
+    payload: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if payload.len() < 15 {
         return Err(CryptoError::EncryptedPayloadTooShort);
     }
     let (nonce, ciphertext) = payload.split_at(12);
-    let cipher =
-        ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::CipherInitialization)?;
+    let cipher = C::new_from_slice(key).map_err(|_| CryptoError::CipherInitialization)?;
     let nonce: [u8; 12] = nonce
         .try_into()
         .map_err(|_| CryptoError::EncryptedPayloadTooShort)?;
     cipher
         .decrypt(
-            &Nonce::from(nonce),
+            &aead::Nonce::<C>::from(nonce),
             Payload {
                 msg: ciphertext,
                 aad: b"",

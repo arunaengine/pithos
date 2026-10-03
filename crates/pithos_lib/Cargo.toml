@@ -33,6 +33,7 @@ fuzzing = ["crypt4gh"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+aes-gcm = "0.11.1"
 blake2 = { version = "0.10.6", optional = true }
 blake3 = "1.8.2"
 byteorder = "1.5.0"

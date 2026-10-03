@@ -72,6 +72,9 @@ Version 1.1 differs from version 1.0 only in these points:
 4. An encrypted block may use a unique random key instead of its convergent key
    (ProcessingFlags bit 4, Section 4.2.3). Its block hash is then a keyed BLAKE3
    identity (Section 5.2), and the block is never deduplicated (Section 5.3).
+5. An encrypted block payload may use AES-256-GCM instead of ChaCha20-Poly1305
+   (ProcessingFlags bit 5, Sections 4.2.3 and 5.3). Block lists, pieces and
+   recipient grants keep ChaCha20-Poly1305.
 
 Readers MUST support both versions. Writers MUST create new archives as version
 1.1. An append MUST follow the version of the archive it extends, so appending
@@ -226,7 +229,7 @@ Readers MUST reject duplicate block hashes in one directory and MUST use the
 #### 4.2.3 Processing Flags
 
 ProcessingFlags records the compression level, whether a block is encrypted and,
-in version 1.1, how an encrypted block is keyed.
+in version 1.1, how an encrypted block is keyed and sealed.
 
 ```rust
 /// Processing flags packed into one byte
@@ -249,7 +252,10 @@ bitflags::bitflags! {
         // Bit 4: Unique random block key (version 1.1, requires bit 3)
         const UNIQUE_KEY = 0b0001_0000;
 
-        // Bits 5-7: Reserved for future use (MUST be zero)
+        // Bit 5: AES-256-GCM payload (version 1.1, requires bit 3)
+        const AES_256_GCM = 0b0010_0000;
+
+        // Bits 6-7: Reserved for future use (MUST be zero)
     }
 }
 ```
@@ -261,14 +267,15 @@ bitflags::bitflags! {
 | 0-2 | Compression: `0` means the stored payload is not compressed; `1` through `7` each mean the stored payload is one standard Zstandard frame |
 | 3 | Encryption enabled: `0` is disabled; `1` is enabled |
 | 4 | Unique key (version 1.1): `0` means the block key is convergent; `1` means it is a unique random key (Section 5.3) |
-| 5-7 | Reserved; all bits MUST be zero |
+| 5 | AES-256-GCM (version 1.1): `0` means the payload is sealed with ChaCha20-Poly1305; `1` means it is sealed with AES-256-GCM (Section 5.3) |
+| 6-7 | Reserved; all bits MUST be zero |
 
 ProcessingFlags is stored as exactly one byte. Readers MUST reject a value with
-any reserved bit set. Bit 4 is valid only in a version 1.1 archive and only
-when bit 3 is set. Readers MUST reject a descriptor that sets bit 4 in a version
-1.0 archive or without bit 3. The same rules apply wherever a writer records
-these flags. For example, an encrypted unique-key block with no compression has
-the flags byte `18`.
+any reserved bit set. Bits 4 and 5 are valid only in a version 1.1 archive and
+only when bit 3 is set. Readers MUST reject a descriptor that sets either bit in
+a version 1.0 archive or without bit 3. The same rules apply wherever a writer
+records these flags. For example, encrypted blocks with no compression have the
+flags byte `18` with a unique key, `28` with AES-256-GCM, and `38` with both.
 
 #### 4.2.4 Block Location
 
@@ -849,10 +856,12 @@ until its required transforms, size, and hash have all been verified.
 ### 5.3 Convergent Encryption
 
 Encryption is optional. An implementation that supports encryption MUST use
-X25519, SHAKE256, and ChaCha20-Poly1305 as specified here.
+X25519, SHAKE256, and ChaCha20-Poly1305 as specified here. Version 1.1 adds
+BLAKE3 key derivation and, for blocks that set ProcessingFlags bit 5,
+AES-256-GCM.
 
-All encryption keys are 32 bytes. ChaCha20-Poly1305 uses a 12-byte nonce and
-produces a 16-byte authentication tag. Every encrypted value is stored as
+All encryption keys are 32 bytes. ChaCha20-Poly1305 and AES-256-GCM each use a
+12-byte nonce and produce a 16-byte authentication tag. Every encrypted value is stored as
 `nonce || ciphertext || tag`; the nonce is part of the stored byte vector. The
 additional authenticated data (AAD) is empty.
 
@@ -869,6 +878,22 @@ before, and MUST NOT use that key for any other block. Unique-key blocks are
 therefore never deduplicated: each occurrence is stored with its own key and
 block hash (Section 5.2). The block list carries the unique key like any other
 block key.
+
+In version 1.1, a block whose ProcessingFlags bit 5 is set has an AES-256-GCM
+payload instead of a ChaCha20-Poly1305 payload. Its payload key is the 32-byte
+BLAKE3 `derive_key` output with the context string
+`pithos 1.1 aes-256-gcm payload` (30 ASCII bytes) and the block key as key
+material. The block key itself is convergent or unique as described above, and
+it is the key stored in the block list. The payload is stored as
+`nonce || ciphertext || tag` with empty AAD. Block lists, pieces and recipient
+grants always use ChaCha20-Poly1305.
+
+The cipher is a property of each effective descriptor, not of the archive. One
+archive, and one file, MAY contain blocks sealed with both ciphers. A writer
+that reuses an existing descriptor for a convergent block hash, by
+deduplication or composition, keeps that descriptor's cipher. Requesting
+AES-256-GCM therefore does not guarantee that every block of a file uses it.
+Readers MUST select the cipher from each block's effective descriptor.
 
 A file key is 32 random bytes. It encrypts the decrypted block list for a file.
 In version 1.1, a piece key is 32 random bytes and encrypts the decrypted block
@@ -895,6 +920,21 @@ random with a cryptographically secure random number generator and MUST NOT
 deliberately reuse a nonce under the same key. It MUST authenticate and decrypt
 an encrypted value successfully before using its plaintext or releasing output
 derived from it.
+
+**Nonce scope of block payloads.** A ChaCha20-Poly1305 payload uses the block key
+as its AEAD key, and an AES-256-GCM payload uses the derived payload key, so the
+two ciphers never share an AEAD key. A unique key seals exactly one payload. A
+convergent key is the same for every encryption of the same block plaintext, by
+any writer and in any archive. All those encryptions share one key and one
+random-nonce scope. NIST SP 800-38D Section 8.3 limits AES-GCM with random
+96-bit nonces to at most 2^32 invocations of the encryption function per key.
+Writers SHOULD apply the same limit to ChaCha20-Poly1305 block payloads. A
+repeated nonce under one key exposes the XOR of the two stored payloads, which
+can differ in compression, and AES-256-GCM also loses authenticity under that
+key; the block hash check still rejects altered plaintext. Writers SHOULD reuse
+an existing stored block instead of encrypting a convergent block again.
+Deployments that may encrypt one plaintext more often than this bound across
+all archives SHOULD use unique keys.
 
 Neither version uses a SHAKE256 label or AAD. A redesign of any cryptographic
 input requires a new format version.
@@ -986,6 +1026,10 @@ holds a block key can test a guessed plaintext against that block's hash. A whol
 kept outside the archive is separate from the keyed block identity and still
 reveals equal files.
 
+The payload cipher (ChaCha20-Poly1305 or AES-256-GCM) does not change what is
+hidden. Every encryption of one convergent block shares one key and one nonce
+scope across all archives; Section 5.3 states the resulting invocation bound.
+
 Pieces are joined in the order the Directory stores them. Their strictly
 increasing key IDs and the `file_size` check detect some reordering and missing
 pieces, but without authenticated metadata a modified Directory can still drop or
@@ -1018,12 +1062,14 @@ negotiation record.
 | Block compression | ProcessingFlags compression bits are `1` through `7` |
 | Block encryption | ProcessingFlags encryption bit is `1` |
 | Unique block keys | ProcessingFlags bit 4 is `1` (version 1.1) |
+| AES-256-GCM payloads | ProcessingFlags bit 5 is `1` (version 1.1) |
 | Encrypted block lists | BlockDataState tag is `00` (`Encrypted`) or, in version 1.1, `02` (`Pieces`) |
 | Encrypted recipient lists | RecipientData tag is `00` (`Encrypted`) |
 | External storage | BlockLocation tag is `01` (`External`) |
 
-Compression, block encryption, unique block keys, encrypted block lists,
-encrypted recipient lists, and external storage are optional capabilities. An
+Compression, block encryption, unique block keys, AES-256-GCM payloads,
+encrypted block lists, encrypted recipient lists, and external storage are
+optional capabilities. An
 implementation that supports an optional capability MUST process it according
 to its definition in this specification.
 
@@ -1045,6 +1091,7 @@ uncompressed or unencrypted bytes.
 | Compressed local: local, compression `1` through `7`, encryption `0` | Listed | Readable only with block-compression capability; otherwise unavailable |
 | Encrypted local: local, compression `0`, encryption `1` | Listed | Readable only with block-encryption capability and any encrypted-list capability needed to obtain its block key; otherwise unavailable |
 | Unique-key local: local, encryption `1`, bit 4 `1` | Listed | Readable only with block-encryption and unique-block-key capability and any encrypted-list capability needed to obtain its block key; otherwise unavailable |
+| AES-256-GCM local: local, encryption `1`, bit 5 `1` | Listed | Readable only with block-encryption and AES-256-GCM capability and any encrypted-list capability needed to obtain its block key; otherwise unavailable |
 | External: BlockLocation `External` | Listed | Readable only with external-storage capability and every capability required by its flags and data states; otherwise unavailable |
 | Combined: compression and encryption, at either location | Listed | Readable only when every indicated capability is supported; otherwise unavailable |
 
@@ -1085,7 +1132,7 @@ Non-POSIX platforms MAY retain them as metadata without an ACL mapping.
 
 The format reserves space for future extensions:
 - FileType values 4-255
-- ProcessingFlags bits 5-7
+- ProcessingFlags bits 6-7
 - Custom relationship types starting at 1000
 - BlockDataState tags `03` through `ff`
 
@@ -1421,6 +1468,22 @@ plain BLAKE3 digest of `hello`. The stored ChaCha20-Poly1305
 0020: d2
 ```
 
+`PV-AES-GCM-HELLO` is a version 1.1 known-answer test for one AES-256-GCM block
+with a convergent key (Section 5.3). The plaintext is ASCII `hello` and the flags
+byte is `28` (no compression, encryption, AES-256-GCM). The block key is
+`SHAKE256("hello")`,
+`1234075ae4a1e77316cf2d8000974581a343b9ebbca7e3d1db83394c30f22162`, and the
+derived payload key is
+`7207849ab2398b3765b8c0ec4c43646d7e0ccdae28ed3d393f037a5a0febf245`. The block
+hash is the plain BLAKE3 digest of `hello`. With the test nonce bytes `b0`
+through `bb`, the stored `nonce || ciphertext || tag` is:
+
+```text
+0000: b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 ba bb 37 8d 6e 4e
+0010: 73 d7 d5 ba 27 60 8f ef 88 ed 83 96 88 2e 54 d5
+0020: cd
+```
+
 ### B.4 Acceptance and Rejection Mutations
 
 Each `AV-*` or `RV-*` vector is a mutation of the named canonical vector.
@@ -1456,5 +1519,5 @@ archive.
 | Directory framing, CRC, and chain | 4.3, 4.3.1, 4.3.2 | CV-BASE-EMPTY-146, CV-APPEND-EMPTY-28, RV-PARENT, RV-UNDERFLOW, RV-TRAILING, RV-CRC, RV-CROSS-SIZE | Valid archive or reject archive as stated |
 | Entries and paths | 4.3.3, 4.4.1, 4.4.3 | CV-LOCAL-HELLO-279, RV-DUPLICATES, RV-PATH, RV-SYMLINK, RV-FILETYPE, RV-PERMISSIONS | Valid archive or reject archive as stated |
 | Block locations and extents | 4.2.2, 4.2.5, 4.2.6, 8.2 | CV-LOCAL-HELLO-279, RV-EXTENT, RV-SHORT-ENCRYPTED, RV-EXTERNAL | Valid archive, reject archive, content read fails before output, or content unavailable as stated |
-| Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01, PV-RECIPIENT-WRAP-11, PV-UNIQUE-KEY-HELLO | Decode/decrypt to stated output |
+| Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01, PV-RECIPIENT-WRAP-11, PV-UNIQUE-KEY-HELLO, PV-AES-GCM-HELLO | Decode/decrypt to stated output |
 | Version 1.1 pieces and grants | 1.3, 4.4.2, 5.3 | CV-PIECES-HELLO-766, PV-RECIPIENT-WRAP-11 | Valid archive; content readable only with the granted key |

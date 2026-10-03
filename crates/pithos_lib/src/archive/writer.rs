@@ -89,12 +89,25 @@ pub enum BlockKeyMode {
     Unique,
 }
 
+/// The AEAD cipher that seals each new encrypted block payload.
+///
+/// The cipher belongs to each stored block, not to the archive. A content-derived block that
+/// reuses an existing descriptor keeps that descriptor's cipher, so an archive may mix ciphers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PayloadCipher {
+    #[default]
+    ChaCha20Poly1305,
+    /// AES-256-GCM under a key derived from the block key (version 1.1).
+    Aes256Gcm,
+}
+
 /// Per-block processing requested for a content entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessingOptions {
     encrypted: bool,
     compression_level: u8,
     key_mode: BlockKeyMode,
+    cipher: PayloadCipher,
 }
 
 impl ProcessingOptions {
@@ -103,6 +116,7 @@ impl ProcessingOptions {
             encrypted: true,
             compression_level: 2,
             key_mode: BlockKeyMode::ContentDerived,
+            cipher: PayloadCipher::ChaCha20Poly1305,
         }
     }
 
@@ -114,6 +128,7 @@ impl ProcessingOptions {
             encrypted,
             compression_level,
             key_mode: BlockKeyMode::ContentDerived,
+            cipher: PayloadCipher::ChaCha20Poly1305,
         })
     }
 
@@ -121,6 +136,14 @@ impl ProcessingOptions {
     /// requires a version 1.1 archive.
     pub fn with_key_mode(self, key_mode: BlockKeyMode) -> Result<Self, PithosError> {
         let options = Self { key_mode, ..self };
+        options.validate_for(FormatVersion::V1_1)?;
+        Ok(options)
+    }
+
+    /// Selects the payload cipher. [`PayloadCipher::Aes256Gcm`] requires encryption, and
+    /// writing it requires a version 1.1 archive.
+    pub fn with_cipher(self, cipher: PayloadCipher) -> Result<Self, PithosError> {
+        let options = Self { cipher, ..self };
         options.validate_for(FormatVersion::V1_1)?;
         Ok(options)
     }
@@ -134,10 +157,14 @@ impl ProcessingOptions {
     pub fn key_mode(self) -> BlockKeyMode {
         self.key_mode
     }
+    pub fn cipher(self) -> PayloadCipher {
+        self.cipher
+    }
 
     pub(crate) fn flags(self) -> ProcessingFlags {
         let mut flags = ProcessingFlags::new(self.encrypted, Some(self.compression_level));
         flags.set_unique_key(self.key_mode == BlockKeyMode::Unique);
+        flags.set_aes_256_gcm(self.cipher == PayloadCipher::Aes256Gcm);
         flags
     }
 
@@ -153,6 +180,7 @@ impl Default for ProcessingOptions {
             encrypted: true,
             compression_level: 3,
             key_mode: BlockKeyMode::ContentDerived,
+            cipher: PayloadCipher::ChaCha20Poly1305,
         }
     }
 }
@@ -1680,43 +1708,54 @@ mod tests {
     }
 
     #[test]
-    fn version_1_0_writers_reject_unique_keys_before_writing_blocks() {
-        let mut writer = ArchiveWriter::create(Vec::new(), options()).unwrap();
-        writer.version = FormatVersion::V1_0;
+    fn version_1_0_writers_reject_version_1_1_processing_before_writing_blocks() {
         let unique = ProcessingOptions::default()
             .with_key_mode(BlockKeyMode::Unique)
             .unwrap();
-        assert!(matches!(
-            writer.add_file(
-                ArchivePath::new("data").unwrap(),
-                EntryMetadata::new(0, 0, 0o644),
-                unique,
-                None,
-                Cursor::new(b"content"),
-            ),
-            Err(WriterError::Pithos(
-                PithosError::UnsupportedProcessingFlags(_)
-            ))
-        ));
-        assert!(!writer.poisoned);
-        assert_eq!(writer.sink.offset, header::FileHeader::ENCODED_LEN as u64);
-        assert_eq!(writer.metadata_snapshot().descriptors, 0);
+        let aes = ProcessingOptions::default()
+            .with_cipher(PayloadCipher::Aes256Gcm)
+            .unwrap();
+        for processing in [unique, aes] {
+            let mut writer = ArchiveWriter::create(Vec::new(), options()).unwrap();
+            writer.version = FormatVersion::V1_0;
+            assert!(matches!(
+                writer.add_file(
+                    ArchivePath::new("data").unwrap(),
+                    EntryMetadata::new(0, 0, 0o644),
+                    processing,
+                    None,
+                    Cursor::new(b"content"),
+                ),
+                Err(WriterError::Pithos(
+                    PithosError::UnsupportedProcessingFlags(_)
+                ))
+            ));
+            assert!(!writer.poisoned);
+            assert_eq!(writer.sink.offset, header::FileHeader::ENCODED_LEN as u64);
+            assert_eq!(writer.metadata_snapshot().descriptors, 0);
+        }
     }
 
     #[test]
-    fn unique_key_options_require_encryption() {
+    fn version_1_1_processing_options_require_encryption() {
+        let plain = ProcessingOptions::new(false, 0).unwrap();
         assert!(matches!(
-            ProcessingOptions::new(false, 0)
-                .unwrap()
-                .with_key_mode(BlockKeyMode::Unique),
+            plain.with_key_mode(BlockKeyMode::Unique),
             Err(PithosError::ProcessingRequiresEncryption(0x10))
         ));
-        let unique = ProcessingOptions::new(true, 5)
+        assert!(matches!(
+            plain.with_cipher(PayloadCipher::Aes256Gcm),
+            Err(PithosError::ProcessingRequiresEncryption(0x20))
+        ));
+        let both = ProcessingOptions::new(true, 5)
             .unwrap()
             .with_key_mode(BlockKeyMode::Unique)
+            .unwrap()
+            .with_cipher(PayloadCipher::Aes256Gcm)
             .unwrap();
-        assert_eq!(unique.key_mode(), BlockKeyMode::Unique);
-        assert_eq!(unique.flags().0, 0x1d);
+        assert_eq!(both.key_mode(), BlockKeyMode::Unique);
+        assert_eq!(both.cipher(), PayloadCipher::Aes256Gcm);
+        assert_eq!(both.flags().0, 0x3d);
     }
 
     #[test]

@@ -170,6 +170,7 @@ pub(crate) struct Processing {
     compression: Compression,
     encrypted: bool,
     unique_key: bool,
+    aes_256_gcm: bool,
 }
 
 impl Processing {
@@ -191,6 +192,7 @@ impl Processing {
             compression: Compression::new(value & 0x07)?,
             encrypted,
             unique_key: value & ProcessingFlags::UNIQUE_KEY_MASK != 0,
+            aes_256_gcm: value & ProcessingFlags::AES_256_GCM_MASK != 0,
         })
     }
 
@@ -198,6 +200,7 @@ impl Processing {
         self.compression.level()
             | (u8::from(self.encrypted) << 3)
             | (u8::from(self.unique_key) << 4)
+            | (u8::from(self.aes_256_gcm) << 5)
     }
 }
 
