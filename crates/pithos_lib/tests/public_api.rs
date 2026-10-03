@@ -1,10 +1,11 @@
 use pithos_lib::adapters::{crypt4gh::Crypt4GHError, ro_crate::RoCrateError};
 use pithos_lib::archive::{
     AccessKeys, AppendDurability, AppendObservation, AppendOptions, Archive, ArchiveFeature,
-    ArchivePath, ArchiveReference, ArchiveWriter, CdcConfig, CreateError, EntryKind, EntryMetadata,
-    EntryReference, ExternalBlockAccessPolicy, ExternalBlockResolver, ExternalLocation,
-    FinishError, IncompleteWriter, NoExternalBlocks, OpenLimits, OpenOptions, ProcessingOptions,
-    WriteOptions, WriterError, WrittenEntry,
+    ArchiveOpener, ArchivePath, ArchiveReference, ArchiveView, ArchiveWriter, BlockBatch,
+    BlockRequest, CdcConfig, CreateError, EntryKind, EntryMetadata, EntryReference,
+    ExternalBlockAccessPolicy, ExternalBlockResolver, ExternalLocation, FinishError,
+    IncompleteWriter, NoExternalBlocks, OpenLimits, OpenOptions, PlannedBlock, ProcessingOptions,
+    ReadPlan, ReadRequest, WriteOptions, WriterError, WrittenEntry,
 };
 use pithos_lib::crypto::{CryptoError, PrivateKey, PublicKey};
 use pithos_lib::error::PithosError;
@@ -47,6 +48,13 @@ fn standard_archive_configurations_are_send_and_sync() {
     assert_send_sync::<Archive<MemorySource, NoExternalBlocks>>();
     assert_send_sync::<Archive<MemorySource, SendSyncResolver>>();
     assert_send_sync::<SendSyncPolicy>();
+    assert_send_sync::<ArchiveOpener>();
+    assert_send_sync::<ArchiveView>();
+    assert_send_sync::<ReadRequest>();
+    assert_send_sync::<ReadPlan<'static>>();
+    assert_send_sync::<PlannedBlock>();
+    assert_send_sync::<BlockBatch>();
+    assert_send_sync::<BlockRequest>();
     assert_send_sync::<std::sync::Arc<dyn ExternalBlockAccessPolicy>>();
     let _ = OpenOptions::default().with_access_keys(AccessKeys::new());
     let _ = OpenOptions::default()
