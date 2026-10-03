@@ -1000,7 +1000,7 @@ the number of blocks.
 3. Split content into blocks (fixed-size or content-defined)
 4. Choose the ProcessingFlags of each new block. In version 1.1 an encrypted
    block MAY also set bit 4 (unique key) or bit 5 (AES-256-GCM), or both. An
-   append to a version 1.0 archive MUST NOT set either bit and SHOULD reject
+   append to a version 1.0 archive MUST NOT set either bit and MUST reject
    such a request before writing any bytes.
 5. Deduplicate convergent blocks by hash. A reused descriptor keeps its own
    flags, including its cipher. Unique-key blocks are never deduplicated.
