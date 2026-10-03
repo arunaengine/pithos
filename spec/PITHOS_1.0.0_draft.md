@@ -868,7 +868,9 @@ additional authenticated data (AAD) is empty.
 By default the block key is convergent: the first 32 output bytes of
 `SHAKE256(plaintext)`, where `plaintext` is the exact block plaintext before
 compression or encryption. No label or length prefix is included. A block
-payload with encryption enabled is encrypted with its block key.
+payload with encryption enabled and ProcessingFlags bit 5 clear is encrypted
+with its block key directly. With bit 5 set, the payload key is derived from the
+block key as described below.
 
 In version 1.1, a block whose ProcessingFlags bit 4 is set has a unique key
 instead: 32 bytes generated uniformly at random with a cryptographically secure
