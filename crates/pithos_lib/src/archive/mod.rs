@@ -6,6 +6,8 @@
 
 mod access;
 mod append;
+#[cfg(feature = "async")]
+mod async_reader;
 mod content_tree;
 mod index;
 mod opener;
@@ -23,6 +25,8 @@ mod writer;
 
 pub(crate) use access::{AccessProvenance, ResolvedAccess};
 pub use append::{AppendDurability, AppendObservation, AppendOptions};
+#[cfg(feature = "async")]
+pub use async_reader::{AsyncExternalBlockResolver, BlockingHook, InlineBlocking};
 pub use opener::{ArchiveOpener, ReadRequest};
 pub(crate) use path_validation::{
     validate_directory_entries, validate_new_candidate, validate_symlink_target,

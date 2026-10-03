@@ -4,6 +4,11 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "async")]
+mod async_source;
+#[cfg(feature = "async")]
+pub use async_source::AsyncArchiveSource;
+
 /// Context for acquisition failures at the fixed, offset-based archive boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
@@ -31,6 +36,15 @@ pub enum SourceError {
     RangeOverflow { offset: u64, length: usize },
     #[error("remote range at offset {offset}: {message}")]
     Remote { offset: u64, message: String },
+    #[error(
+        "source response at offset {offset} (revision {revision:?}): expected {expected} bytes, received {actual}"
+    )]
+    ResponseLength {
+        offset: u64,
+        expected: u64,
+        actual: u64,
+        revision: Option<String>,
+    },
 }
 
 /// An immutable, positioned byte source for an archive.
