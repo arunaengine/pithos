@@ -1034,6 +1034,12 @@ The format reserves space for future extensions:
 - FileType values 4-255
 - ProcessingFlags bits 4-7
 - Custom relationship types starting at 1000
+- BlockDataState tags `03` through `ff`
+
+A paged block index for very large files is a planned extension. It would let a
+reader fetch only the descriptors and block keys a byte range needs. Version 1.1
+keeps every block list complete in its Directory, so writers of very large files
+should use larger blocks to keep Directories small.
 
 Extensions MUST maintain backwards compatibility for reading.
 
@@ -1225,6 +1231,83 @@ Its sole block plaintext is `68 65 6c 6c 6f`; its BLAKE3 hash is
 block key in the decrypted pair is SHAKE256(`hello`)[0..32],
 `1234075ae4a1e77316cf2d8000974581a343b9ebbca7e3d1db83394c30f22162`.
 
+#### CV-PIECES-HELLO-766
+
+| Item | Value |
+| --- | --- |
+| Purpose | Version 1.1 archive whose `Data` entry `hello` is sealed in two pieces, each granted to Bob |
+| Required capability | Block encryption, encrypted block lists and encrypted recipient lists |
+| Total length | 766 bytes |
+| Expected result | Valid archive; with Bob's private key, read `hello` as ASCII `hello world`; without it, `hello` is listed with size 11 and is unavailable |
+
+Bob's keys are the RFC 7748 test keys of the recipient-wrap vectors below; his private
+key is `5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb`. For
+piece `n` (1 for `hello`, 2 for ` world`), the vector uses these fixed inputs:
+block nonce `n0` repeated 12 times, piece key byte `0n` repeated 32 times, piece
+list nonce `1n` repeated 12 times, sender private key byte `3n` repeated 32
+times, and grant nonce `4n` repeated 12 times. Block keys are convergent
+(Section 5.3), and each grant record is `01 0n` followed by the piece key.
+
+```text
+0000: 50 49 54 48 01 01 42 4c 43 4b 10 10 10 10 10 10
+0010: 10 10 10 10 10 10 8c 95 2e 75 aa 57 95 de 40 5c
+0020: a4 29 e9 97 b9 ad 24 35 31 a8 cd 42 4c 43 4b 20
+0030: 20 20 20 20 20 20 20 20 20 20 20 39 5a 8e 4a 74
+0040: 68 8b bf 2a f6 2e 6d 11 92 a4 58 be e3 f4 5d 22
+0050: cb 50 49 54 48 4f 53 44 52 00 01 00 05 68 65 6c
+0060: 6c 6f 01 02 02 01 5d 11 11 11 11 11 11 11 11 11
+0070: 11 11 11 b8 99 ae be f7 3e 3a 3b 8a 7e 15 a0 59
+0080: 49 88 7f a7 0a c7 21 ef 07 ac f9 30 80 6e 69 a6
+0090: 80 af 84 99 06 c0 11 e8 b7 d7 b7 99 d9 8a 6c 11
+00a0: a5 67 59 d9 1f 7c 8f 31 22 ce 10 31 e6 5a 22 c6
+00b0: 6f aa 66 d1 ae 1e a8 42 aa 3d cc 80 1f f4 59 83
+00c0: 6e 2e ec 6e 02 5d 12 12 12 12 12 12 12 12 12 12
+00d0: 12 12 a3 9a c0 1b 2b 0f 69 f5 be b3 61 ad af d5
+00e0: 7e dc 34 f6 82 9a ff f4 d5 7f 2e db fb 4d bf 85
+00f0: 7a ae 35 b6 7a 49 79 17 6a fa 8d 32 fa 15 27 a9
+0100: 12 a2 80 7f fc d9 56 c6 6a c4 3d a7 26 94 8b cc
+0110: 3e 35 cf b0 81 0d b8 fe fc cf 8d 7d 92 68 83 25
+0120: fb 8c 59 00 00 0b a4 03 00 00 02 ea 8f 16 3d b3
+0130: 86 82 92 5e 44 91 c5 e5 8d 4b b3 50 6e f8 c1 4e
+0140: b7 8a 86 e9 08 c5 62 4a 67 20 0f 06 21 05 08 00
+0150: cb 7a 20 2c 78 d1 fc 0b b6 98 a1 2b 4b 0c 95 13
+0160: d2 72 08 36 76 e9 55 3b 38 40 e8 93 66 71 e8 5a
+0170: 2b 22 06 08 00 0a 00 09 44 45 53 43 52 49 42 45
+0180: 53 01 09 41 4e 4e 4f 54 41 54 45 53 02 0c 44 45
+0190: 52 49 56 45 44 5f 46 52 4f 4d 03 09 53 4f 55 52
+01a0: 43 45 5f 4f 46 04 10 50 52 45 56 49 4f 55 53 5f
+01b0: 56 45 52 53 49 4f 4e 05 0c 4e 45 58 54 5f 56 45
+01c0: 52 53 49 4f 4e 06 07 50 41 52 54 5f 4f 46 07 08
+01d0: 43 4f 4e 54 41 49 4e 53 08 08 49 4e 50 55 54 5f
+01e0: 54 4f 09 0b 4f 55 54 50 55 54 5f 46 52 4f 4d 02
+01f0: 04 f5 f2 91 62 c3 1a 8d ef a1 8e 6e 74 22 24 ee
+0200: 80 6f c1 71 8a 27 8b e8 59 ba 56 20 40 2b 8f 3a
+0210: 01 de 9e db 7d 7b 7d c1 b4 d3 5b 61 c2 ec e4 35
+0220: 37 3f 83 43 c8 5b 78 67 4d ad fc 7e 14 6f 88 2b
+0230: 4f 00 3e 41 41 41 41 41 41 41 41 41 41 41 41 d5
+0240: 91 81 e5 13 df d5 0d b5 8d 13 41 09 e1 a3 4b ba
+0250: 61 34 a5 d0 ec 4d 12 7b 5b a8 a1 04 24 87 1f 0c
+0260: 18 9f 61 0a 13 c4 0b 0f 44 4b ee 26 66 e0 9a 81
+0270: b6 59 d9 22 54 73 45 1e ff fe 6b 36 db ca ef db
+0280: f7 b1 89 5d e6 20 84 50 9a 7f 5b 58 bf 01 d0 64
+0290: 18 01 de 9e db 7d 7b 7d c1 b4 d3 5b 61 c2 ec e4
+02a0: 35 37 3f 83 43 c8 5b 78 67 4d ad fc 7e 14 6f 88
+02b0: 2b 4f 00 3e 42 42 42 42 42 42 42 42 42 42 42 42
+02c0: 33 72 35 6a b6 7a 39 7b 36 d7 c8 6e cf 5c 57 37
+02d0: b2 7d 9d 62 f2 ff c3 31 bc 55 32 b9 66 1f fa 09
+02e0: 9c 3d a9 dd 19 ee f5 a5 23 66 45 93 a2 10 aa 0c
+02f0: ed c0 00 00 00 00 00 00 02 ad 3c f3 d9 39
+```
+
+| Offset range | Field | Meaning |
+| --- | --- | --- |
+| `00..05` | header | Pithos 1.1, `PITH 01 01` |
+| `06..2a` | first block | `BLCK` and the 33-byte sealed `hello` |
+| `2b..50` | second block | `BLCK` and the 34-byte sealed ` world` |
+| `51..2fd` | Directory | One file record with tag `02` and pieces 1 and 2, two encrypted block descriptors, the ten standard relationships, and two encryption sections |
+
+The Directory starts at `0x51` and `dir_len = 685`; `0x51 + 685 = 766`.
+
 ### B.3 Processing Vectors
 
 | Vector ID | Stored bytes | `original_size` | Expected plaintext | BLAKE3 |
@@ -1303,3 +1386,4 @@ archive.
 | Entries and paths | 4.3.3, 4.4.1, 4.4.3 | CV-LOCAL-HELLO-279, RV-DUPLICATES, RV-PATH, RV-SYMLINK, RV-FILETYPE, RV-PERMISSIONS | Valid archive or reject archive as stated |
 | Block locations and extents | 4.2.2, 4.2.5, 4.2.6, 8.2 | CV-LOCAL-HELLO-279, RV-EXTENT, RV-SHORT-ENCRYPTED, RV-EXTERNAL | Valid archive, reject archive, content read fails before output, or content unavailable as stated |
 | Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01, PV-RECIPIENT-WRAP-11 | Decode/decrypt to stated output |
+| Version 1.1 pieces and grants | 1.3, 4.4.2, 5.3 | CV-PIECES-HELLO-766, PV-RECIPIENT-WRAP-11 | Valid archive; content readable only with the granted key |

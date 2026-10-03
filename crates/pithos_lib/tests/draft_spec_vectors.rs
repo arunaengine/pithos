@@ -5,9 +5,9 @@
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use crc32fast::hash as crc32;
 use pithos_lib::archive::{
-    Archive, ArchivePath, ArchiveWriter, EntryKind, EntryMetadata, ExternalBlockAccessPolicy,
-    ExternalBlockResolver, ExternalLocation, OpenLimits, OpenOptions, ProcessingOptions,
-    WriteOptions,
+    AccessKeys, Archive, ArchivePath, ArchiveWriter, EntryKind, EntryMetadata,
+    ExternalBlockAccessPolicy, ExternalBlockResolver, ExternalLocation, OpenLimits, OpenOptions,
+    ProcessingOptions, WriteOptions,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
@@ -115,6 +115,122 @@ fn hello() -> Vec<u8> {
     let mut bytes = b"PITH\x01\0BLCKhello".to_vec();
     bytes.extend(directory(None, true, true));
     bytes
+}
+
+/// CV-PIECES-HELLO-766: "hello" and " world" sealed as pieces 1 and 2, granted to Bob.
+fn pieces_hello() -> Vec<u8> {
+    let seal = |key: &[u8; 32], nonce: [u8; 12], plaintext: &[u8]| {
+        let mut sealed = nonce.to_vec();
+        sealed.extend(
+            ChaCha20Poly1305::new_from_slice(key)
+                .unwrap()
+                .encrypt(&Nonce::from(nonce), plaintext)
+                .unwrap(),
+        );
+        sealed
+    };
+    let bob = PublicKey::from(hex(
+        "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+    ));
+    let mut archive = b"PITH\x01\x01".to_vec();
+    let (mut pieces, mut blocks, mut encryption) = (Vec::new(), Vec::new(), Vec::new());
+    for (key_id, plain, seed) in [(1u8, b"hello" as &[u8], 1u8), (2, b" world", 2)] {
+        let hash = *blake3::hash(plain).as_bytes();
+        let block_key = shake256(plain);
+        let stored = seal(&block_key, [0x10 * seed; 12], plain);
+        blocks.extend_from_slice(&hash);
+        uleb(archive.len() as u64, &mut blocks);
+        uleb(stored.len() as u64, &mut blocks);
+        uleb(plain.len() as u64, &mut blocks);
+        blocks.extend_from_slice(&[0x08, 0]); // encrypted, uncompressed, local
+        archive.extend_from_slice(b"BLCK");
+        archive.extend_from_slice(&stored);
+
+        let piece_key = [seed; 32];
+        let list = [&[1u8][..], &hash, &block_key].concat();
+        let sealed = seal(&piece_key, [0x10 + seed; 12], &list);
+        pieces.push(key_id);
+        uleb(sealed.len() as u64, &mut pieces);
+        pieces.extend(sealed);
+
+        let sender = StaticSecret::from([0x30 + seed; 32]);
+        let sender_public = PublicKey::from(&sender);
+        let nonce = [0x40 + seed; 12];
+        let mut info = b"pithos 1.1 recipient grant".to_vec();
+        info.extend_from_slice(sender_public.as_bytes());
+        info.extend_from_slice(bob.as_bytes());
+        let mut wrapping_key = [0; 32];
+        hkdf::Hkdf::<sha2::Sha256>::new(
+            Some(nonce.as_slice()),
+            sender.diffie_hellman(&bob).as_bytes(),
+        )
+        .expand(&info, &mut wrapping_key)
+        .unwrap();
+        let wrapped = seal(
+            &wrapping_key,
+            nonce,
+            &[&[1, key_id][..], &piece_key].concat(),
+        );
+        encryption.extend_from_slice(sender_public.as_bytes());
+        encryption.push(1);
+        encryption.extend_from_slice(bob.as_bytes());
+        encryption.push(0);
+        uleb(wrapped.len() as u64, &mut encryption);
+        encryption.extend(wrapped);
+    }
+    let mut directory = b"PITHOSDR\0\x01\0\x05hello\x01\x02\x02".to_vec();
+    directory.extend(pieces);
+    directory.extend_from_slice(&[0, 0, 11, 0xa4, 0x03, 0, 0, 2]);
+    directory.extend(blocks);
+    directory.push(10);
+    for (id, name) in RELATIONS {
+        directory.push(id);
+        directory.push(name.len() as u8);
+        directory.extend_from_slice(name.as_bytes());
+    }
+    directory.push(2);
+    directory.extend(encryption);
+    let length = directory.len() + 12;
+    directory.extend_from_slice(&(length as u64).to_be_bytes());
+    directory.extend_from_slice(&crc32(&directory).to_be_bytes());
+    archive.extend(directory);
+    archive
+}
+
+#[test]
+fn version_1_1_pieces_vector_is_rebuilt_and_read_through_its_grant() {
+    let bytes = pieces_hello();
+    assert_eq!(bytes, appendix_hex("CV-PIECES-HELLO-766"));
+
+    let mut der = vec![
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04,
+        0x20,
+    ];
+    der.extend_from_slice(&hex(
+        "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+    ));
+    let pem = pkcs8::Document::try_from(der.as_slice())
+        .unwrap()
+        .to_pem("PRIVATE KEY", pkcs8::LineEnding::LF)
+        .unwrap();
+    let bob = pithos_lib::crypto::parse_private_pem(pem.as_bytes()).unwrap();
+    let archive = Archive::open(
+        MemorySource::new(bytes.clone()),
+        OpenOptions::default().with_access_keys(AccessKeys::new().with_key(bob)),
+    )
+    .unwrap();
+    let mut output = Vec::new();
+    archive.copy_to("hello", &mut output).unwrap();
+    assert_eq!(output, b"hello world");
+
+    let locked = Archive::open(MemorySource::new(bytes), OpenOptions::default()).unwrap();
+    assert!(matches!(
+        locked.entry("hello").unwrap().unwrap().kind,
+        EntryKind::File {
+            size: 11,
+            available: false
+        }
+    ));
 }
 
 fn appendix_hex(id: &str) -> Vec<u8> {
