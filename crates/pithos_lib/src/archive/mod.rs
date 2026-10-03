@@ -28,7 +28,7 @@ pub(crate) use path_validation::{
     validate_directory_entries, validate_new_candidate, validate_symlink_target,
 };
 pub use pieces::{Composition, Piece, PieceEncoder, compose};
-pub use planning::{BlockRequest, PlannedBlock, ReadPlan};
+pub use planning::{BlockBatch, BlockBatches, BlockRequest, PlannedBlock, ReadPlan};
 #[cfg(feature = "crypt4gh")]
 pub(crate) use reader::ContentOperationError;
 pub use reader::{
@@ -71,8 +71,8 @@ pub use writer::{
 #[cfg(test)]
 mod tests {
     use super::access::{AccessProvenance, ResolvedAccess};
-    use super::index::build_effective_index;
-    use super::planning::ReadPlan;
+    use super::index::{self, build_effective_index};
+    use super::planning::{BlockBatch, BlockRequest, PlannedBlock, ReadPlan};
     use super::types::*;
     use super::validation::IndexLimits;
     use crate::error::PithosError;
@@ -451,6 +451,192 @@ mod tests {
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].output(), 3..4);
         assert_eq!(plan[1].output(), 0..3);
+    }
+
+    /// One file over `count` contiguous local blocks of one plaintext byte, read in `order`.
+    fn local_file(count: usize, order: &[usize]) -> index::ArchiveIndex {
+        let hash = |block: usize| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(block as u64).to_be_bytes());
+            BlockHash(bytes)
+        };
+        let start = 6 + 5 * count as u64;
+        let mut value = segment_at(
+            start,
+            None,
+            vec![SegmentEntry {
+                id: FileId(1),
+                path: ArchivePath::new("data").unwrap(),
+                entry: Entry::File(ContentEntry {
+                    metadata: metadata(),
+                    size: order.len() as u64,
+                    content: ContentState::Available(BlockReferences::new(
+                        order.iter().map(|block| hash(*block)).collect(),
+                    )),
+                }),
+            }],
+        );
+        value.descriptors = (0..count)
+            .map(|block| {
+                let span = Span::new(6 + 5 * block as u64, 5).unwrap();
+                (hash(block), local_descriptor(span))
+            })
+            .collect();
+        build_effective_index(&[value], start + 10, IndexLimits::default()).unwrap()
+    }
+
+    fn local_offsets(blocks: &[PlannedBlock]) -> Vec<u64> {
+        blocks
+            .iter()
+            .map(|block| match block.request() {
+                BlockRequest::Local { offset, len: 5 } => offset,
+                request => panic!("unexpected request {request:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lazy_plans_yield_only_the_blocks_of_a_range_over_many_blocks() {
+        let count = 10_000;
+        let index = local_file(count, &(0..count).collect::<Vec<_>>());
+        let size = count as u64;
+        let mut whole = ReadPlan::new(
+            &index,
+            FileId(1),
+            ReadRange::new(0..size, size).unwrap(),
+            test_limits(),
+        )
+        .unwrap();
+        let first = whole.next().unwrap().unwrap();
+        assert_eq!(local_offsets(&[first]), [6]);
+        assert_eq!(whole.count(), count - 1);
+
+        let range = ReadRange::new(4_000..4_003, size).unwrap();
+        let blocks = ReadPlan::new(&index, FileId(1), range, test_limits())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(local_offsets(&blocks), [20_006, 20_011, 20_016]);
+        assert!(blocks.iter().all(|block| block.output() == (0..1)));
+        let empty = ReadRange::new(5..5, size).unwrap();
+        assert_eq!(
+            ReadPlan::new(&index, FileId(1), empty, test_limits())
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn plans_check_block_limits_before_yielding_a_block() {
+        let index = local_file(3, &[0, 1, 2]);
+        let limits = crate::block::Limits {
+            max_stored_bytes: 0,
+            max_decoded_bytes: 1024,
+        };
+        let range = ReadRange::new(1..3, 3).unwrap();
+        let mut plan = ReadPlan::new(&index, FileId(1), range, limits).unwrap();
+        assert!(matches!(
+            plan.next(),
+            Some(Err(PithosError::LimitExceeded {
+                field: "stored block",
+                ..
+            }))
+        ));
+        assert!(plan.next().is_none());
+    }
+
+    #[test]
+    fn batches_join_contiguous_local_spans_up_to_the_byte_bound() {
+        let index = local_file(5, &[0, 1, 2, 3, 4]);
+        let range = ReadRange::new(0..5, 5).unwrap();
+        let plan = ReadPlan::new(&index, FileId(1), range, test_limits()).unwrap();
+        let batches = plan.batches(12).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            batches.iter().map(BlockBatch::request).collect::<Vec<_>>(),
+            [
+                BlockRequest::Local { offset: 6, len: 10 },
+                BlockRequest::Local {
+                    offset: 16,
+                    len: 10
+                },
+                BlockRequest::Local { offset: 26, len: 5 },
+            ]
+        );
+        let response = (0..10).collect::<Vec<u8>>();
+        let parts = batches[0].split(&response).unwrap().collect::<Vec<_>>();
+        assert_eq!(parts[0].1, &response[..5]);
+        assert_eq!(parts[1].1, &response[5..]);
+        assert_eq!(parts[1].0, &batches[0].blocks()[1]);
+        assert!(matches!(
+            batches[0].split(&response[1..]),
+            Err(PithosError::BlockSizeMismatch {
+                expected: 10,
+                actual: 9
+            })
+        ));
+        let single = ReadPlan::new(&index, FileId(1), range, test_limits()).unwrap();
+        assert_eq!(single.batches(4).count(), 5);
+    }
+
+    #[test]
+    fn shared_blocks_keep_file_order_and_only_join_contiguous_spans() {
+        let index = local_file(3, &[2, 0, 1, 2, 2]);
+        let range = ReadRange::new(0..5, 5).unwrap();
+        let blocks = ReadPlan::new(&index, FileId(1), range, test_limits())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(local_offsets(&blocks), [16, 6, 11, 16, 16]);
+        let plan = ReadPlan::new(&index, FileId(1), range, test_limits()).unwrap();
+        let batches = plan
+            .batches(u64::MAX)
+            .map(|batch| batch.unwrap().request())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches,
+            [
+                BlockRequest::Local { offset: 16, len: 5 },
+                BlockRequest::Local { offset: 6, len: 15 },
+                BlockRequest::Local { offset: 16, len: 5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn external_blocks_are_a_distinct_request_kind_and_never_join_a_batch() {
+        let first = BlockHash([1; 32]);
+        let second = BlockHash([2; 32]);
+        let mut value = segment(vec![SegmentEntry {
+            id: FileId(1),
+            path: ArchivePath::new("data").unwrap(),
+            entry: Entry::File(ContentEntry {
+                metadata: metadata(),
+                size: 10,
+                content: ContentState::Available(BlockReferences::new(vec![first, second])),
+            }),
+        }]);
+        value.descriptors = vec![(first, descriptor(4)), (second, descriptor(6))];
+        let index = build_effective_index(&[value], 1_000, IndexLimits::default()).unwrap();
+        let range = ReadRange::new(0..10, 10).unwrap();
+        let plan = ReadPlan::new(&index, FileId(1), range, test_limits()).unwrap();
+        let batches = plan
+            .batches(u64::MAX)
+            .map(|batch| batch.unwrap().request())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches,
+            [
+                BlockRequest::External {
+                    location: ExternalLocation::new("opaque"),
+                    len: 8
+                },
+                BlockRequest::External {
+                    location: ExternalLocation::new("opaque"),
+                    len: 10
+                },
+            ]
+        );
     }
 
     #[test]

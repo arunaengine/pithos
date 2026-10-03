@@ -52,6 +52,13 @@ impl PlannedBlock {
         self.output.clone()
     }
 
+    fn local_span(&self) -> Option<(u64, u64)> {
+        match &self.descriptor.location {
+            BlockLocation::Local(span) => Some((span.start(), self.framed_len())),
+            BlockLocation::External(_) => None,
+        }
+    }
+
     /// The marker plus the payload. Plans check the stored size limit, so this cannot overflow.
     pub(crate) fn framed_len(&self) -> u64 {
         self.descriptor.stored_size.saturating_add(4)
@@ -171,5 +178,97 @@ impl Iterator for ReadPlan<'_> {
             }
         }
         None
+    }
+}
+
+impl<'a> ReadPlan<'a> {
+    /// Groups consecutive local blocks whose spans are contiguous in storage into one request
+    /// of at most `max_bytes`. A larger block and every external block form their own batch.
+    pub fn batches(self, max_bytes: u64) -> BlockBatches<'a> {
+        BlockBatches {
+            plan: self,
+            max_bytes,
+            pending: None,
+        }
+    }
+}
+
+/// Consecutive planned blocks that one request can fetch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockBatch {
+    blocks: Vec<PlannedBlock>,
+}
+
+impl BlockBatch {
+    /// One request covering every block of the batch.
+    pub fn request(&self) -> BlockRequest {
+        let mut request = self.blocks[0].request();
+        if let BlockRequest::Local { len, .. } = &mut request {
+            *len = self.blocks.iter().map(PlannedBlock::framed_len).sum();
+        }
+        request
+    }
+
+    pub fn blocks(&self) -> &[PlannedBlock] {
+        &self.blocks
+    }
+
+    /// Pairs each block with its stored bytes from a response to [`BlockBatch::request`].
+    pub fn split<'b>(
+        &'b self,
+        response: &'b [u8],
+    ) -> Result<impl Iterator<Item = (&'b PlannedBlock, &'b [u8])>, PithosError> {
+        let expected = self.blocks.iter().map(PlannedBlock::framed_len).sum();
+        if response.len() as u64 != expected {
+            return Err(PithosError::BlockSizeMismatch {
+                expected,
+                actual: response.len() as u64,
+            });
+        }
+        let mut rest = response;
+        Ok(self.blocks.iter().map(move |block| {
+            let (stored, tail) = rest.split_at(block.framed_len() as usize);
+            rest = tail;
+            (block, stored)
+        }))
+    }
+}
+
+/// The batches of a read plan, in file order. See [`ReadPlan::batches`].
+pub struct BlockBatches<'a> {
+    plan: ReadPlan<'a>,
+    max_bytes: u64,
+    pending: Option<Result<PlannedBlock, PithosError>>,
+}
+
+impl Iterator for BlockBatches<'_> {
+    type Item = Result<BlockBatch, PithosError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = match self.pending.take().or_else(|| self.plan.next())? {
+            Ok(block) => block,
+            Err(error) => return Some(Err(error)),
+        };
+        let Some((offset, len)) = first.local_span() else {
+            return Some(Ok(BlockBatch {
+                blocks: vec![first],
+            }));
+        };
+        let (mut end, mut total) = (offset + len, len);
+        let mut blocks = vec![first];
+        for next in self.plan.by_ref() {
+            match next.as_ref().map(PlannedBlock::local_span) {
+                Ok(Some((offset, len))) if offset == end && total + len <= self.max_bytes => {
+                    end += len;
+                    total += len;
+                    blocks.extend(next.ok());
+                }
+                _ => {
+                    self.pending = Some(next);
+                    break;
+                }
+            }
+        }
+        Some(Ok(BlockBatch { blocks }))
     }
 }
