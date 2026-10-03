@@ -6,7 +6,7 @@
 
 use crate::archive::path_validation::validate_entry;
 use crate::archive::types::{ArchivePath, Processing};
-use crate::archive::writer::{EntryMetadata, ProcessingOptions};
+use crate::archive::writer::{Chunking, EntryMetadata, ProcessingOptions, validate_block_size};
 use crate::block;
 use crate::crypto::{self, FileKey, PublicKey};
 use crate::error::PithosError;
@@ -58,8 +58,11 @@ pub struct Piece {
     pub(crate) grants: Vec<([u8; 32], Vec<u8>)>,
 }
 
-/// Encodes the blocks of one piece. The caller chooses block boundaries and appends every
-/// returned byte string, in order, to the piece's stored bytes.
+/// Encodes the blocks of one piece. The caller appends every returned byte string, in order,
+/// to the piece's stored bytes.
+///
+/// [`PieceEncoder::write`] and [`PieceEncoder::flush`] split the content into fixed-size blocks,
+/// which is the recommended use. [`PieceEncoder::push`] instead encodes caller-chosen blocks.
 pub struct PieceEncoder {
     key_id: u64,
     recipients: Vec<[u8; 32]>,
@@ -69,6 +72,8 @@ pub struct PieceEncoder {
     seen: HashSet<[u8; 32]>,
     stored_len: u64,
     original_size: u64,
+    block_size: usize,
+    pending: Zeroizing<Vec<u8>>,
 }
 
 impl PieceEncoder {
@@ -106,13 +111,65 @@ impl PieceEncoder {
             seen: HashSet::new(),
             stored_len: 0,
             original_size: 0,
+            block_size: Chunking::DEFAULT_BLOCK_SIZE,
+            pending: Zeroizing::new(Vec::new()),
         })
+    }
+
+    /// Sets the block size used by [`PieceEncoder::write`]. The default is 4 MiB.
+    pub fn with_block_size(mut self, size: usize) -> Result<Self, PithosError> {
+        validate_block_size(size)?;
+        self.block_size = size;
+        Ok(self)
+    }
+
+    /// Adds content and returns the stored bytes of every block it completes.
+    /// Blocks have the configured size no matter how the content is split across calls.
+    /// After the last write, call [`PieceEncoder::flush`] for the short final block.
+    pub fn write(&mut self, mut content: &[u8]) -> Result<Vec<u8>, PithosError> {
+        let mut stored = Vec::new();
+        while !content.is_empty() {
+            if self.pending.is_empty() && content.len() >= self.block_size {
+                let (block, rest) = content.split_at(self.block_size);
+                stored.extend(self.encode(block)?);
+                content = rest;
+                continue;
+            }
+            // Reserving the whole block once keeps plaintext from being copied on growth.
+            self.pending.reserve_exact(self.block_size);
+            let take = (self.block_size - self.pending.len()).min(content.len());
+            self.pending.extend_from_slice(&content[..take]);
+            content = &content[take..];
+            if self.pending.len() == self.block_size {
+                stored.extend(self.flush()?);
+            }
+        }
+        Ok(stored)
+    }
+
+    /// Encodes the bytes buffered by [`PieceEncoder::write`] as one block, if there are any.
+    pub fn flush(&mut self) -> Result<Vec<u8>, PithosError> {
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let block = std::mem::take(&mut self.pending);
+        let stored = self.encode(&block);
+        self.pending = block;
+        self.pending.clear();
+        stored
     }
 
     /// Encodes one non-empty block and returns `BLCK || payload` to append to the piece.
     /// With content-derived keys, a block that repeats an earlier block of this piece returns
     /// no bytes. With unique keys, every block is stored.
     pub fn push(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, PithosError> {
+        if !self.pending.is_empty() {
+            return Err(PithosError::UnflushedPieceBytes);
+        }
+        self.encode(plaintext)
+    }
+
+    fn encode(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, PithosError> {
         if plaintext.is_empty() {
             return Err(PithosError::InvalidBlockDescriptor(
                 "piece blocks must not be empty",
@@ -143,7 +200,11 @@ impl PieceEncoder {
     }
 
     /// Seals the block list under a fresh piece key and grants that key to every recipient.
+    /// Fails if written bytes were not flushed.
     pub fn finish(self) -> Result<Piece, PithosError> {
+        if !self.pending.is_empty() {
+            return Err(PithosError::UnflushedPieceBytes);
+        }
         let piece_key = FileKey::from_bytes(StaticSecret::random().to_bytes());
         let mut list = Zeroizing::new(Vec::new());
         encode_decrypted_block_list(&self.entries, &mut *list)?;
@@ -513,5 +574,51 @@ mod tests {
                 Err(PithosError::InvalidPieceRecord)
             ));
         }
+    }
+
+    #[test]
+    fn written_fragments_give_the_same_fixed_blocks_as_pushed_blocks() {
+        let content = (0..2500u32)
+            .map(|index| (index * 7) as u8)
+            .collect::<Vec<_>>();
+        let encoder = || {
+            let recipient = crate::crypto::PrivateKey::generate().public_key();
+            let processing = ProcessingOptions::new(true, 0).unwrap();
+            let encoder = PieceEncoder::new(1, vec![recipient], processing).unwrap();
+            encoder.with_block_size(1000).unwrap()
+        };
+        let mut pushed = encoder();
+        for block in content.chunks(1000) {
+            pushed.push(block).unwrap();
+        }
+        let expected = pushed.finish().unwrap().blocks;
+        assert_eq!(expected.len(), 3);
+        for fragment in [1, 7, 1000, 4096] {
+            let mut written = encoder();
+            let mut stored = 0;
+            for part in content.chunks(fragment) {
+                stored += written.write(part).unwrap().len();
+            }
+            assert!(matches!(
+                written.push(b"block"),
+                Err(PithosError::UnflushedPieceBytes)
+            ));
+            stored += written.flush().unwrap().len();
+            assert!(written.flush().unwrap().is_empty());
+            let piece = written.finish().unwrap();
+            assert_eq!(piece.blocks, expected);
+            assert_eq!(piece.stored_len, stored as u64);
+        }
+
+        let mut unflushed = encoder();
+        unflushed.write(b"short").unwrap();
+        assert!(matches!(
+            unflushed.finish(),
+            Err(PithosError::UnflushedPieceBytes)
+        ));
+        assert!(matches!(
+            encoder().with_block_size(0),
+            Err(PithosError::InvalidBlockSize(0))
+        ));
     }
 }

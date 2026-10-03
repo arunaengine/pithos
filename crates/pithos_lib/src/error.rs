@@ -89,6 +89,8 @@ pub enum PithosError {
     PieceKeyIdConflict(u64),
     #[error("invalid piece record")]
     InvalidPieceRecord,
+    #[error("the piece encoder holds written bytes that were not flushed")]
+    UnflushedPieceBytes,
     #[error("archive metadata does not match the expected digest")]
     MetadataDigestMismatch,
     #[error("duplicate encoded recipient file id")]
