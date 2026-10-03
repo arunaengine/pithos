@@ -1,5 +1,4 @@
-use super::decode_validated_directory;
-use super::opener::{DecodedChain, OpenSettings, complete_open};
+use super::opener::{ArchiveOpener, OpenSettings};
 use super::{AccessProvenance, AppendSnapshot, ArchiveView, FileId, ResolvedAccess, Span};
 use crate::archive::index::ArchiveIndex;
 use crate::archive::types::{
@@ -16,7 +15,7 @@ use crate::format::block::{
 use crate::format::directory::Directory;
 use crate::format::encryption::RecipientData;
 use crate::format::file_entry::{BlockDataEntry, BlockDataState};
-use crate::format::header::{FileHeader, FormatVersion};
+use crate::format::header::FormatVersion;
 use crate::format::limits::DeserializationLimits;
 use crate::source::ArchiveSource;
 use std::collections::{BTreeMap, HashSet};
@@ -306,77 +305,18 @@ where
     /// Opens, frames, validates, resolves access metadata, and indexes an archive.
     pub fn open(source: S, options: OpenOptions<E>) -> Result<Self, PithosError> {
         let archive_len = source.len()?;
-        let (mut settings, external, external_access_policy) = options.into_parts();
-        let limits = settings.limits;
-        let mut header = [0; FileHeader::ENCODED_LEN];
-        source.read_exact_at(0, &mut header)?;
-        let header = crate::format::header::decode_header(&mut header.as_slice())?;
-        let version = FormatVersion::from_wire(header.version).ok_or(
-            PithosError::UnsupportedFileVersion {
-                supported: FormatVersion::CURRENT.wire(),
-                actual: header.version,
-            },
-        )?;
-
-        let (terminal_start, terminal_len) = terminal_span(&source, archive_len, limits)?;
-        let mut raw = Vec::new();
-        let mut total_directory_bytes = 0u64;
-        let mut next = Some((terminal_start, terminal_len));
-        let mut child_start = archive_len;
-        let mut visited = HashSet::new();
-        let mut decoded = DecodedDirectoryCounts::default();
-        let mut remaining_block_references = limits.max_accessible_block_references;
-        let mut directory_hashes = Vec::new();
-        while let Some((start, len)) = next {
-            validate_directory_len(len, limits)?;
-            if raw.len() as u64 > limits.max_parent_directories {
-                return Err(PithosError::LimitExceeded {
-                    field: "parent directories",
-                    limit: limits.max_parent_directories,
-                    actual: raw.len() as u64,
-                });
-            }
-            let span = Span::new(start, len)?;
-            if span.end() > child_start || !visited.insert((start, len)) {
-                return Err(PithosError::InvalidDirectoryChain {
-                    operation: "validate parent ordering",
-                });
-            }
-            total_directory_bytes =
-                total_directory_bytes
-                    .checked_add(len)
-                    .ok_or(PithosError::LimitExceeded {
-                        field: "total directory bytes",
-                        limit: limits.max_total_directory_bytes,
-                        actual: u64::MAX,
-                    })?;
-            if total_directory_bytes > limits.max_total_directory_bytes {
-                return Err(PithosError::LimitExceeded {
-                    field: "total directory bytes",
-                    limit: limits.max_total_directory_bytes,
-                    actual: total_directory_bytes,
-                });
-            }
-            let bytes = Zeroizing::new(read_source(&source, start, len, "directory")?);
-            directory_hashes.push(*blake3::hash(&bytes).as_bytes());
-            let directory = decode_validated_directory(
-                &bytes,
-                &remaining_deserialization_limits(limits, &decoded),
-                &mut remaining_block_references,
-            )?;
-            decoded.record(&directory);
-            next = directory.parent_directory_offset;
-            child_start = start;
-            raw.push((directory, span));
+        let (settings, external, external_access_policy) = options.into_parts();
+        let mut opener = ArchiveOpener::with_settings(archive_len, settings)?;
+        while let Some(request) = opener.request() {
+            let response = Zeroizing::new(read_source(
+                &source,
+                request.offset(),
+                request.len(),
+                "directory",
+            )?);
+            opener.feed(request, &response)?;
         }
-        let chain = DecodedChain {
-            version,
-            terminal: Span::new(terminal_start, terminal_len)?,
-            raw,
-            remaining_block_references,
-            directory_hashes,
-        };
-        let view = complete_open(archive_len, &mut settings, chain)?;
+        let view = opener.finish()?;
         for span in view.index.local_block_spans() {
             let mut marker = [0; 4];
             source.read_exact_at(span.start(), &mut marker)?;
@@ -727,28 +667,6 @@ pub(super) fn remaining_deserialization_limits(
         .max_relationships
         .saturating_sub(decoded.relationships);
     remaining
-}
-
-fn terminal_span<S: ArchiveSource>(
-    source: &S,
-    archive_len: u64,
-    limits: OpenLimits,
-) -> Result<(u64, u64), PithosError> {
-    if archive_len < 12 {
-        return Err(PithosError::InvalidDirectoryRange {
-            operation: "read directory footer",
-        });
-    }
-    let mut footer = [0; 12];
-    source.read_exact_at(archive_len - 12, &mut footer)?;
-    let len = u64::from_be_bytes(footer[..8].try_into().expect("fixed footer length"));
-    validate_directory_len(len, limits)?;
-    let start = archive_len
-        .checked_sub(len)
-        .ok_or(PithosError::InvalidDirectoryRange {
-            operation: "validate terminal directory",
-        })?;
-    Ok((start, len))
 }
 
 pub(super) fn validate_directory_len(len: u64, limits: OpenLimits) -> Result<(), PithosError> {

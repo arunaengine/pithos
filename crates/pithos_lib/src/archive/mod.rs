@@ -23,6 +23,7 @@ mod writer;
 
 pub(crate) use access::{AccessProvenance, ResolvedAccess};
 pub use append::{AppendDurability, AppendObservation, AppendOptions};
+pub use opener::{ArchiveOpener, ReadRequest};
 pub(crate) use path_validation::{
     validate_directory_entries, validate_new_candidate, validate_symlink_target,
 };

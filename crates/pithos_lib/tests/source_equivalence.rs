@@ -164,10 +164,7 @@ fn fragmented_source_is_equivalent_and_source_errors_keep_context() {
         Ok(_) => panic!("truncated source must fail"),
         Err(error) => error,
     };
-    assert!(matches!(
-        error,
-        PithosError::Source(SourceError::UnexpectedEof { offset: 0, .. })
-    ));
+    assert!(matches!(error, PithosError::InvalidDirectoryRange { .. }));
 }
 
 #[test]

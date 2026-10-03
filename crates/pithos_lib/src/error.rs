@@ -221,4 +221,10 @@ pub enum PithosError {
     MissingManifestSource,
     #[error("append plan entry count does not match manifest")]
     AppendPlanLengthMismatch,
+    #[error("read response does not answer the outstanding request")]
+    UnexpectedReadResponse,
+    #[error("read response length mismatch: expected {expected}, got {actual}")]
+    ReadResponseLength { expected: u64, actual: u64 },
+    #[error("archive open has requests left")]
+    OpenIncomplete,
 }
