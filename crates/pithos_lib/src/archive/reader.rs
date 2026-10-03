@@ -13,7 +13,7 @@ use crate::format::directory::Directory;
 use crate::format::encryption::RecipientData;
 use crate::format::file_entry::{BlockDataEntry, BlockDataState};
 use crate::format::header::FormatVersion;
-use crate::format::limits::DeserializationLimits;
+use crate::format::limits::{DeserializationError, DeserializationLimits};
 use crate::source::ArchiveSource;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
@@ -723,17 +723,37 @@ pub(super) fn resolve_block_lists(
                 }
                 let key_ids = pieces.iter().map(|piece| FileId(piece.key_id)).collect();
                 let pieces = std::mem::take(pieces);
-                // Each sealed piece is dropped after decryption and each plaintext after
-                // decoding, so only the final list and one piece buffer are held.
+                // The room for every piece is reserved once, so the keys never move to a new
+                // buffer. Each sealed piece and each plaintext is dropped after decoding.
+                let capacity = pieces.iter().try_fold(0u64, |total, piece| {
+                    total.checked_add(crate::format::file_entry::sealed_block_list_capacity(
+                        piece.sealed.len(),
+                    ) as u64)
+                });
+                let capacity = match capacity {
+                    Some(capacity) if capacity <= *remaining_block_references => capacity,
+                    actual => {
+                        return Err(DeserializationError::LimitExceeded {
+                            field: "block references",
+                            limit: *remaining_block_references,
+                            actual: actual.unwrap_or(u64::MAX),
+                        }
+                        .into());
+                    }
+                };
                 let mut entries = Zeroizing::new(Vec::new());
+                crate::format::primitives::reserve_secret(
+                    &mut entries,
+                    capacity as usize,
+                    "block references",
+                )?;
                 for piece in pieces {
                     let key = access
                         .key(FileId(piece.key_id))
                         .expect("every piece key was checked above");
                     let mut decoded_limits = deserialization_limits(limits);
                     decoded_limits.max_block_references = *remaining_block_references;
-                    let plaintext = crypto::open_file_block_list(key, &piece.sealed)?;
-                    drop(piece);
+                    let plaintext = crypto::open_file_block_list(key, piece.sealed)?;
                     crate::format::file_entry::append_decrypted_block_list(
                         &plaintext,
                         &decoded_limits,
@@ -752,7 +772,7 @@ pub(super) fn resolve_block_lists(
                 };
                 let mut decoded_limits = deserialization_limits(limits);
                 decoded_limits.max_block_references = *remaining_block_references;
-                let plaintext = crypto::open_file_block_list(file_key, bytes)?;
+                let plaintext = crypto::open_file_block_list(file_key, std::mem::take(bytes))?;
                 let entries = crate::format::file_entry::decode_decrypted_block_list_with_budget(
                     &plaintext,
                     &decoded_limits,

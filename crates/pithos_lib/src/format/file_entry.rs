@@ -2,9 +2,10 @@ use crate::crypto::{self, FileKey};
 use crate::error::PithosError;
 use crate::format::error::SerializationError;
 use crate::format::limits::{DeserializationError, DeserializationLimits};
-use crate::format::primitives::{bounded_len, decode_string, reserve, write_len_prefix};
+use crate::format::primitives::{
+    bounded_len, decode_string, reserve, reserve_secret, write_len_prefix,
+};
 use integer_encoding::{VarIntReader, VarIntWriter};
-use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io::{Read, Write};
 use zeroize::Zeroizing;
@@ -72,7 +73,7 @@ impl BlockDataState {
                 ));
             }
             BlockDataState::Decrypted(entries) => {
-                let mut data_bytes = Zeroizing::new(Vec::with_capacity(1 + entries.len() * 64));
+                let mut data_bytes = Zeroizing::new(Vec::with_capacity(10 + entries.len() * 64));
                 encode_decrypted_block_list(entries, &mut *data_bytes)?;
                 let encrypted_data =
                     crypto::seal_file_block_list_with_nonce(key, &data_bytes, nonce)?;
@@ -88,16 +89,19 @@ impl BlockDataState {
 pub(crate) fn validate_unique_block_references(
     entries: &[BlockDataEntry],
 ) -> Result<(), PithosError> {
-    let mut order = (0..entries.len()).collect::<Vec<_>>();
-    order.sort_unstable_by(|left, right| entries[*left].0.cmp(&entries[*right].0));
-    let conflict = order.windows(2).any(|pair| {
-        let (left, right) = (&entries[pair[0]], &entries[pair[1]]);
-        left.0 == right.0 && left.1 != right.1
-    });
-    if conflict {
+    if has_conflicting_keys(entries) {
         return Err(PithosError::DuplicateBlockReference);
     }
     Ok(())
+}
+
+fn has_conflicting_keys(entries: &[BlockDataEntry]) -> bool {
+    let mut order = (0..entries.len()).collect::<Vec<_>>();
+    order.sort_unstable_by(|left, right| entries[*left].0.cmp(&entries[*right].0));
+    order.windows(2).any(|pair| {
+        let (left, right) = (&entries[pair[0]], &entries[pair[1]]);
+        left.0 == right.0 && left.1 != right.1
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,50 +357,71 @@ fn decode_decrypted_block_list_reader_with_budget<R: Read>(
     )?;
     *remaining_block_references -= count as u64;
     let mut entries = Zeroizing::new(Vec::new());
-    reserve(&mut entries, count, "block references")?;
-    let mut keys = HashMap::with_capacity(count);
-    for _ in 0..count {
-        let mut hash = [0; 32];
-        reader.read_exact(&mut hash)?;
-        let mut key = [0; 32];
-        reader.read_exact(&mut key)?;
-        if keys
-            .insert(hash, key)
-            .is_some_and(|existing| existing != key)
-        {
-            return Err(DeserializationError::DuplicateBlockReference);
-        }
-        entries.push((hash, key));
+    read_block_entries(reader, count, &mut entries)?;
+    if has_conflicting_keys(&entries) {
+        return Err(DeserializationError::DuplicateBlockReference);
     }
     Ok(entries)
 }
 
-/// Appends one decrypted block list to `entries`. The caller checks the combined list for
-/// conflicting keys.
-pub(crate) fn append_decrypted_block_list(
-    bytes: &[u8],
+/// The nonce and tag around a sealed block list.
+const SEALED_LIST_OVERHEAD: usize = 28;
+
+/// The number of entries a sealed list of `sealed_len` bytes holds. Each entry takes 64 bytes
+/// after a count of one to ten bytes, so this is exact for every well-formed list.
+pub(crate) fn sealed_block_list_capacity(sealed_len: usize) -> usize {
+    sealed_len.saturating_sub(SEALED_LIST_OVERHEAD + 1) / BLOCK_ENTRY_LEN
+}
+
+const BLOCK_ENTRY_LEN: usize = 64;
+
+/// Reads the entry count of a decrypted list and checks it against the bytes that follow
+/// before anything is allocated.
+fn read_list_count(
+    reader: &mut std::io::Cursor<&[u8]>,
     limits: &DeserializationLimits,
     remaining_block_references: &mut u64,
-    entries: &mut Vec<BlockDataEntry>,
-) -> Result<(), DeserializationError> {
-    let mut reader = std::io::Cursor::new(bytes);
+) -> Result<usize, DeserializationError> {
     let count = bounded_len(
         reader.read_varint::<u64>()?,
         limits.max_block_references.min(*remaining_block_references),
         "block references",
     )?;
-    *remaining_block_references -= count as u64;
-    reserve(entries, count, "block references")?;
-    for _ in 0..count {
-        let mut entry = ([0; 32], [0; 32]);
-        reader.read_exact(&mut entry.0)?;
-        reader.read_exact(&mut entry.1)?;
-        entries.push(entry);
-    }
-    if reader.position() != bytes.len() as u64 {
+    let available = reader.get_ref().len() as u64 - reader.position();
+    if (count as u64).checked_mul(BLOCK_ENTRY_LEN as u64) != Some(available) {
         return Err(DeserializationError::InvalidLength);
     }
+    *remaining_block_references -= count as u64;
+    Ok(count)
+}
+
+/// Reads `count` entries straight into reserved slots, so keys leave no temporary copies.
+fn read_block_entries<R: Read>(
+    reader: &mut R,
+    count: usize,
+    entries: &mut Zeroizing<Vec<BlockDataEntry>>,
+) -> Result<(), DeserializationError> {
+    reserve_secret(entries, count, "block references")?;
+    for _ in 0..count {
+        entries.push(([0; 32], [0; 32]));
+        let entry = entries.last_mut().expect("just pushed block entry");
+        reader.read_exact(&mut entry.0)?;
+        reader.read_exact(&mut entry.1)?;
+    }
     Ok(())
+}
+
+/// Appends one decrypted block list to `entries`. The caller reserves the room for every
+/// piece first and checks the combined list for conflicting keys.
+pub(crate) fn append_decrypted_block_list(
+    bytes: &[u8],
+    limits: &DeserializationLimits,
+    remaining_block_references: &mut u64,
+    entries: &mut Zeroizing<Vec<BlockDataEntry>>,
+) -> Result<(), DeserializationError> {
+    let mut reader = std::io::Cursor::new(bytes);
+    let count = read_list_count(&mut reader, limits, remaining_block_references)?;
+    read_block_entries(&mut reader, count, entries)
 }
 
 pub(crate) fn decode_decrypted_block_list_with_budget(
@@ -404,14 +429,10 @@ pub(crate) fn decode_decrypted_block_list_with_budget(
     limits: &DeserializationLimits,
     remaining_block_references: &mut u64,
 ) -> Result<Zeroizing<Vec<BlockDataEntry>>, DeserializationError> {
-    let mut reader = std::io::Cursor::new(bytes);
-    let entries = decode_decrypted_block_list_reader_with_budget(
-        &mut reader,
-        limits,
-        remaining_block_references,
-    )?;
-    if reader.position() != bytes.len() as u64 {
-        return Err(DeserializationError::InvalidLength);
+    let mut entries = Zeroizing::new(Vec::new());
+    append_decrypted_block_list(bytes, limits, remaining_block_references, &mut entries)?;
+    if has_conflicting_keys(&entries) {
+        return Err(DeserializationError::DuplicateBlockReference);
     }
     Ok(entries)
 }
@@ -488,6 +509,61 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    fn sealed_list(count: usize) -> Vec<u8> {
+        let entries = (0..count)
+            .map(|index| ([index as u8; 32], [1; 32]))
+            .collect::<Vec<_>>();
+        let mut plaintext = Vec::new();
+        encode_decrypted_block_list(&entries, &mut plaintext).unwrap();
+        crypto::seal_file_block_list_with_nonce(&FileKey::from_bytes([2; 32]), &plaintext, [3; 12])
+            .unwrap()
+    }
+
+    #[test]
+    fn piece_lists_fill_one_reservation_without_moving() {
+        for count in [0, 1, 127, 128, 300] {
+            assert_eq!(sealed_block_list_capacity(sealed_list(count).len()), count);
+        }
+        let limits = DeserializationLimits::default();
+        let mut budget = limits.max_block_references;
+        let lists = [sealed_list(127), sealed_list(130)];
+        let capacity = lists
+            .iter()
+            .map(|sealed| sealed_block_list_capacity(sealed.len()))
+            .sum();
+        let mut entries = Zeroizing::new(Vec::new());
+        reserve_secret(&mut entries, capacity, "block references").unwrap();
+        let buffer = entries.as_ptr();
+        for sealed in &lists {
+            let plaintext =
+                crypto::open_file_block_list(&FileKey::from_bytes([2; 32]), sealed.clone())
+                    .unwrap();
+            append_decrypted_block_list(&plaintext, &limits, &mut budget, &mut entries).unwrap();
+        }
+        assert_eq!(entries.len(), 257);
+        assert_eq!(entries.as_ptr(), buffer);
+    }
+
+    #[test]
+    fn list_counts_must_match_the_remaining_bytes_before_allocation() {
+        let limits = DeserializationLimits::default();
+        let mut budget = limits.max_block_references;
+        let mut claimed = Vec::new();
+        claimed.write_varint(1_000_000u64).unwrap();
+        claimed.extend_from_slice(&[0; 64]);
+        assert!(matches!(
+            decode_decrypted_block_list_with_budget(&claimed, &limits, &mut budget),
+            Err(DeserializationError::InvalidLength)
+        ));
+        assert_eq!(budget, limits.max_block_references);
+        let mut entries = Zeroizing::new(Vec::new());
+        assert!(matches!(
+            append_decrypted_block_list(&claimed, &limits, &mut budget, &mut entries),
+            Err(DeserializationError::InvalidLength)
+        ));
+        assert_eq!(entries.capacity(), 0);
     }
 
     #[test]

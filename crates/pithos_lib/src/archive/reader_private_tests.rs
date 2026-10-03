@@ -1101,7 +1101,7 @@ fn decrypted_encrypted_block_list_accepts_a_non_minimal_count() {
                 let BlockDataState::Encrypted(encrypted) = &mut file.block_data else {
                     panic!("writer block list was not encrypted");
                 };
-                let plaintext = crypto::open_file_block_list(&file_key, encrypted).unwrap();
+                let plaintext = crypto::open_file_block_list(&file_key, encrypted.clone()).unwrap();
                 assert_eq!(plaintext[0], 1);
                 let mut non_minimal = vec![0x81, 0x00];
                 non_minimal.extend_from_slice(&plaintext[1..]);
@@ -1578,7 +1578,7 @@ fn split_into_pieces(path: &Path, key_ids: &[u64], granted: &[u64]) {
         let BlockDataState::Encrypted(sealed) = &entry.block_data else {
             panic!("fixture block list was not encrypted");
         };
-        let plaintext = crypto::open_file_block_list(&file_key, sealed).unwrap();
+        let plaintext = crypto::open_file_block_list(&file_key, sealed.clone()).unwrap();
         let entries = crate::format::file_entry::decode_decrypted_block_list_with_budget(
             &plaintext,
             &DeserializationLimits::default(),

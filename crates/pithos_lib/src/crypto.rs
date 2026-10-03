@@ -8,7 +8,7 @@ use crate::format::header::FormatVersion;
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, KeyInit, Nonce,
-    aead::{self, Aead, AeadCore, Generate, Payload, consts::U12},
+    aead::{self, Aead, AeadCore, AeadInOut, Generate, Payload, consts::U12},
 };
 use digest::{ExtendableOutput, Update, XofReader};
 use hkdf::Hkdf;
@@ -373,11 +373,31 @@ pub(crate) fn seal_file_block_list_with_nonce(
     seal_empty_aad(key.expose_for_protocol(), plaintext, nonce)
 }
 
+/// Opens a sealed block list inside its own buffer, so the plaintext needs no second buffer.
 pub(crate) fn open_file_block_list(
     key: &FileKey,
-    payload: &[u8],
+    payload: Vec<u8>,
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-    open_empty_aad(key.expose_for_protocol(), payload)
+    if payload.len() < 15 {
+        return Err(CryptoError::EncryptedPayloadTooShort);
+    }
+    let len = payload
+        .len()
+        .checked_sub(28)
+        .ok_or(CryptoError::AuthenticationFailed)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key.expose_for_protocol())
+        .map_err(|_| CryptoError::CipherInitialization)?;
+    let mut buffer = Zeroizing::new(payload);
+    let (nonce, sealed) = buffer.split_at_mut(12);
+    let (message, tag) = sealed.split_at_mut(len);
+    let nonce: [u8; 12] = (&*nonce).try_into().expect("12-byte nonce");
+    let tag = aead::Tag::<ChaCha20Poly1305>::try_from(&*tag).expect("16-byte tag");
+    cipher
+        .decrypt_inout_detached(&Nonce::from(nonce), b"", message.into(), &tag)
+        .map_err(|_| CryptoError::AuthenticationFailed)?;
+    buffer.copy_within(12..12 + len, 0);
+    buffer.truncate(len);
+    Ok(buffer)
 }
 
 pub(crate) fn wrap_recipient_list_with_nonce(

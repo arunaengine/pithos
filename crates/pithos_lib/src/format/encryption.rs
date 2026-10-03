@@ -2,7 +2,7 @@ use crate::crypto::{self, SharedSecret};
 use crate::error::PithosError;
 use crate::format::error::SerializationError;
 use crate::format::limits::{DeserializationError, DeserializationLimits};
-use crate::format::primitives::{bounded_len, reserve, write_len_prefix};
+use crate::format::primitives::{bounded_len, reserve, reserve_secret, write_len_prefix};
 use indexmap::IndexMap;
 use integer_encoding::{VarIntReader, VarIntWriter};
 use std::collections::HashMap;
@@ -81,7 +81,7 @@ impl RecipientData {
                 ));
             }
             RecipientData::Decrypted(entries) => {
-                let mut data_bytes = Zeroizing::new(Vec::with_capacity(1 + entries.len() * 40));
+                let mut data_bytes = Zeroizing::new(Vec::with_capacity(10 + entries.len() * 42));
                 encode_decrypted_recipient_list(entries, &mut *data_bytes)?;
                 let encrypted_data =
                     crypto::wrap_recipient_list_with_nonce(&shared_key, &data_bytes, nonce)?;
@@ -196,15 +196,25 @@ pub(crate) fn decode_decrypted_recipient_list_reader<R: Read>(
         limits.max_collection_entries,
         "recipient keys",
     )?;
+    read_recipient_entries(reader, count)
+}
+
+/// Reads `count` entries straight into reserved slots, so keys leave no temporary copies.
+fn read_recipient_entries<R: Read>(
+    reader: &mut R,
+    count: usize,
+) -> Result<RecipientKeyList, DeserializationError> {
     let mut entries = Zeroizing::new(Vec::new());
-    reserve(&mut entries, count, "recipient keys")?;
-    let mut keys = HashMap::with_capacity(count);
-    for _ in 0..count {
+    reserve_secret(&mut entries, count, "recipient keys")?;
+    // The map holds positions rather than keys, so it keeps no secret copies.
+    let mut positions = HashMap::with_capacity(count);
+    for position in 0..count {
         let id = reader.read_varint::<u64>()?;
         entries.push((id, [0; 32]));
-        reader.read_exact(&mut entries.last_mut().expect("just pushed file key").1)?;
-        let key = entries.last().expect("just pushed file key").1;
-        if keys.insert(id, key).is_some_and(|existing| existing != key) {
+        reader.read_exact(&mut entries[position].1)?;
+        if let Some(previous) = positions.insert(id, position)
+            && entries[previous].1 != entries[position].1
+        {
             return Err(DeserializationError::DuplicateRecipientFileId);
         }
     }
@@ -216,7 +226,17 @@ pub(crate) fn decode_decrypted_recipient_list(
     limits: &DeserializationLimits,
 ) -> Result<RecipientKeyList, DeserializationError> {
     let mut reader = std::io::Cursor::new(bytes);
-    let entries = decode_decrypted_recipient_list_reader(&mut reader, limits)?;
+    let count = bounded_len(
+        reader.read_varint::<u64>()?,
+        limits.max_collection_entries,
+        "recipient keys",
+    )?;
+    // Each entry takes at least 33 bytes, so a larger count fails before any allocation.
+    let available = bytes.len() as u64 - reader.position();
+    if (count as u64).saturating_mul(33) > available {
+        return Err(DeserializationError::InvalidLength);
+    }
+    let entries = read_recipient_entries(&mut reader, count)?;
     if reader.position() != bytes.len() as u64 {
         return Err(DeserializationError::InvalidLength);
     }
@@ -248,6 +268,15 @@ mod tests {
         assert!(matches!(
             decode_decrypted_recipient_list(&conflicting, &limits),
             Err(DeserializationError::DuplicateRecipientFileId)
+        ));
+
+        // A count that the remaining bytes cannot hold fails before any allocation.
+        let mut claimed = Vec::new();
+        claimed.write_varint(1_000u64).unwrap();
+        claimed.extend_from_slice(&[7; 33]);
+        assert!(matches!(
+            decode_decrypted_recipient_list(&claimed, &limits),
+            Err(DeserializationError::InvalidLength)
         ));
     }
 }

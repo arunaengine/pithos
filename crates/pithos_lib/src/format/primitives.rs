@@ -2,6 +2,7 @@ use crate::format::error::SerializationError;
 use crate::format::limits::{DeserializationError, DeserializationLimits};
 use integer_encoding::{VarIntReader, VarIntWriter};
 use std::io::{Read, Write};
+use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) fn write_len_prefix<W: Write>(
     writer: &mut W,
@@ -51,6 +52,30 @@ pub(crate) fn reserve<T>(
         })
 }
 
+/// Reserves room for `additional` secret items. A plain reallocation would free the old buffer
+/// without wiping it, so a full buffer moves into a new one and the old one is wiped.
+pub(crate) fn reserve_secret<T: Copy + Zeroize>(
+    output: &mut Zeroizing<Vec<T>>,
+    additional: usize,
+    field: &'static str,
+) -> Result<(), DeserializationError> {
+    let failed = || DeserializationError::AllocationFailed {
+        field,
+        size: additional as u64,
+    };
+    let needed = output.len().checked_add(additional).ok_or_else(failed)?;
+    if needed <= output.capacity() {
+        return Ok(());
+    }
+    let mut grown = Zeroizing::new(Vec::new());
+    grown
+        .try_reserve_exact(needed.max(output.capacity().saturating_mul(2)))
+        .map_err(|_| failed())?;
+    grown.extend_from_slice(output);
+    *output = grown;
+    Ok(())
+}
+
 pub(crate) fn decode_string<R: Read>(
     reader: &mut R,
     limits: &DeserializationLimits,
@@ -70,6 +95,22 @@ pub(crate) fn decode_string<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_reservation_keeps_room_and_moves_a_full_buffer_once() {
+        let mut secrets = Zeroizing::new(vec![[7u8; 32]]);
+        reserve_secret(&mut secrets, 3, "secrets").unwrap();
+        assert_eq!(secrets.as_slice(), &[[7; 32]]);
+        assert!(secrets.capacity() >= 4);
+        let buffer = secrets.as_ptr();
+        reserve_secret(&mut secrets, 3, "secrets").unwrap();
+        secrets.extend_from_slice(&[[8; 32]; 3]);
+        assert_eq!(secrets.as_ptr(), buffer);
+        assert!(matches!(
+            reserve_secret(&mut secrets, usize::MAX, "secrets"),
+            Err(DeserializationError::AllocationFailed { .. })
+        ));
+    }
 
     #[test]
     fn typed_uleb128_accepts_bounded_non_minimal_values() {
