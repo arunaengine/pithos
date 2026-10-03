@@ -11,9 +11,7 @@ use crate::block;
 use crate::crypto::{self, FileKey, PublicKey};
 use crate::error::PithosError;
 use crate::format::block::{BlockIndexEntry, BlockLocation, ProcessingFlags};
-use crate::format::directory::{
-    Directory, DirectoryEntries, encode_directory, update_directory_crc, update_directory_len,
-};
+use crate::format::directory::{Directory, DirectoryEntries, encode_complete_directory};
 use crate::format::encryption::{
     EncryptionSection, RecipientData, RecipientSection, encode_decrypted_recipient_list,
 };
@@ -537,10 +535,7 @@ pub fn compose(
     files.insert(0, path.as_str(), entry)?;
     let mut directory = Directory::new(None, files, encryption);
     directory.blocks = blocks;
-    update_directory_len(&mut directory)?;
-    update_directory_crc(&mut directory)?;
-    let mut bytes = Vec::new();
-    encode_directory(&directory, &mut bytes)?;
+    let bytes = encode_complete_directory(&directory)?;
     Ok(Composition {
         piece_offsets,
         archive_len: checked_add(offset, bytes.len() as u64)?,

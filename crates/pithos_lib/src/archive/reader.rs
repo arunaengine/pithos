@@ -71,6 +71,7 @@ impl DecodedDirectoryCounts {
 pub(crate) const DEFAULT_MAX_DECODED_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Limits enforced before directory data is retained or expensive metadata work begins.
+/// The defaults admit one 5 TiB file stored in 4 MiB blocks.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenLimits {
     pub max_directory_bytes: u64,
@@ -89,15 +90,15 @@ pub struct OpenLimits {
 impl Default for OpenLimits {
     fn default() -> Self {
         Self {
-            max_directory_bytes: 64 * 1024 * 1024,
-            max_total_directory_bytes: 256 * 1024 * 1024,
+            max_directory_bytes: 256 * 1024 * 1024,
+            max_total_directory_bytes: 512 * 1024 * 1024,
             max_parent_directories: 1024,
             max_entries: 1_000_000,
-            max_descriptors: 1_000_000,
+            max_descriptors: 2_097_152,
             max_references: 1_000_000,
             max_relationships: 1_000_000,
-            max_accessible_block_references: 1_000_000,
-            max_opaque_metadata_bytes: 64 * 1024 * 1024,
+            max_accessible_block_references: 2_097_152,
+            max_opaque_metadata_bytes: 128 * 1024 * 1024,
             max_stored_block_bytes: 64 * 1024 * 1024,
             max_decoded_block_bytes: DEFAULT_MAX_DECODED_BLOCK_BYTES,
         }

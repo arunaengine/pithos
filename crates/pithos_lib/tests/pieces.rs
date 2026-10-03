@@ -304,3 +304,47 @@ fn a_composed_file_exports_to_crypt4gh_with_a_fresh_data_key() {
     let header_len = 16 + u32::from_le_bytes(exported[16..20].try_into().unwrap()) as usize;
     assert_eq!(exported.len(), header_len + 12 + 1500 + 16);
 }
+
+/// One 5 TiB file at 4 MiB blocks has 1,310,720 blocks. Tiny blocks give the same directory
+/// shape, and the default open limits must admit it.
+#[test]
+#[ignore = "slow in debug builds (about 5 minutes, 8 seconds with --release); run with --ignored"]
+fn a_composition_with_the_block_count_of_5_tib_opens_with_default_limits() {
+    const BLOCKS: u32 = 1_310_720;
+    const PIECES: u32 = 10;
+    let per_piece = BLOCKS / PIECES;
+    let parts = (0..PIECES)
+        .map(|piece| {
+            let processing = ProcessingOptions::new(true, 0).unwrap();
+            let mut encoder = PieceEncoder::new(
+                u64::from(piece) + 1,
+                vec![public_key("recipient1")],
+                processing,
+            )
+            .unwrap();
+            let mut stored = Vec::new();
+            for block in piece * per_piece..(piece + 1) * per_piece {
+                stored.extend(encoder.push(&block.to_be_bytes()).unwrap());
+            }
+            (stored, encoder.finish().unwrap())
+        })
+        .collect::<Vec<_>>();
+    let archive = open(assemble(&parts), recipient());
+    let entry = archive.entry("object").unwrap().unwrap();
+    assert!(matches!(
+        entry.kind,
+        EntryKind::File {
+            size,
+            available: true
+        } if size == u64::from(BLOCKS) * 4
+    ));
+    let mut tail = Vec::new();
+    let end = u64::from(BLOCKS) * 4;
+    archive
+        .copy_range_to("object", end - 8..end, &mut tail)
+        .unwrap();
+    assert_eq!(
+        tail,
+        [(BLOCKS - 2).to_be_bytes(), (BLOCKS - 1).to_be_bytes()].concat()
+    );
+}

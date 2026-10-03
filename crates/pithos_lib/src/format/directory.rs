@@ -564,6 +564,21 @@ pub(crate) fn decode_complete_directory_with_validation_and_budget(
     Ok(directory)
 }
 
+/// Encodes a directory once and writes its real length and CRC into the encoded footer.
+pub(crate) fn encode_complete_directory(
+    directory: &Directory,
+) -> Result<Vec<u8>, SerializationError> {
+    let mut bytes = Vec::new();
+    encode_directory(directory, &mut bytes)?;
+    let len = bytes.len();
+    let dir_len = u64::try_from(len)
+        .map_err(|_| SerializationError::Other("length does not fit in u64".to_string()))?;
+    bytes[len - 12..len - 4].copy_from_slice(&dir_len.to_be_bytes());
+    let crc32 = crc32fast::hash(&bytes[..len - 4]);
+    bytes[len - 4..].copy_from_slice(&crc32.to_be_bytes());
+    Ok(bytes)
+}
+
 pub(crate) fn update_directory_len(directory: &mut Directory) -> Result<(), SerializationError> {
     let mut bytes = Vec::new();
     encode_directory(directory, &mut bytes)?;
@@ -671,10 +686,12 @@ mod tests {
             dir_len: 0,
             crc32: 0,
         };
+        let complete = encode_complete_directory(&directory).unwrap();
         update_directory_len(&mut directory).unwrap();
         update_directory_crc(&mut directory).unwrap();
         let mut bytes = Vec::new();
         encode_directory(&directory, &mut bytes).unwrap();
+        assert_eq!(complete, bytes);
 
         assert!(matches!(
             decode_complete_directory(&bytes, &DeserializationLimits::default()),
