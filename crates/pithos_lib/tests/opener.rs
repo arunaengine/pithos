@@ -373,3 +373,66 @@ fn a_view_checks_its_own_block_limits_for_blocks_planned_by_another_view() {
         }
     }
 }
+
+#[test]
+fn repeated_adjacent_blocks_are_fetched_once() {
+    // Blocks A B B B C: the writer stores B once, right after A, and C after B.
+    let content = [[0u8; 16], [1; 16], [1; 16], [1; 16], [2; 16]].concat();
+    let sender = private_key("sender");
+    let options = WriteOptions::new(sender.duplicate(), vec![sender.public_key()])
+        .with_chunking(Chunking::Fixed(16));
+    let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("data").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(true, 0).unwrap(),
+            Some(content.len() as u64),
+            std::io::Cursor::new(content.clone()),
+        )
+        .unwrap();
+    let bytes = Arc::<[u8]>::from(writer.finish().unwrap());
+    let keys =
+        || OpenOptions::default().with_access_keys(AccessKeys::new().with_key(sender.duplicate()));
+
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let archive = Archive::open(
+        RecordingSource {
+            bytes: Arc::clone(&bytes),
+            reads: Arc::clone(&reads),
+        },
+        keys(),
+    )
+    .unwrap();
+    let mut output = Vec::new();
+    archive.copy_to("data", &mut output).unwrap();
+    assert_eq!(output, content);
+    assert_eq!(reads.lock().unwrap().len(), 3 + 3);
+    output.clear();
+    archive.copy_range_to("data", 20..60, &mut output).unwrap();
+    assert_eq!(output, &content[20..60]);
+    assert_eq!(reads.lock().unwrap().len(), 6 + 1);
+
+    let view = drive(&bytes, keys()).0.unwrap();
+    let batches = view
+        .plan_range("data", 0..80)
+        .unwrap()
+        .batches(1024)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let BlockRequest::Local { offset, len } = batches[0].request() else {
+        panic!("unexpected external block");
+    };
+    let framed = batches[0].blocks()[0].request();
+    let BlockRequest::Local { len: block_len, .. } = framed else {
+        panic!("unexpected external block");
+    };
+    assert_eq!(len, 3 * block_len);
+    let response = &bytes[offset as usize..(offset + len) as usize];
+    let mut decoded = Vec::new();
+    for (block, stored) in batches[0].split(response).unwrap() {
+        decoded.extend_from_slice(&view.decode_block(block, stored).unwrap()[block.output()]);
+    }
+    assert_eq!(decoded, content);
+}

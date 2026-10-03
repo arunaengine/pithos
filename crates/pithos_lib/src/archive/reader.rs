@@ -435,10 +435,22 @@ where
         plan: ReadPlan<'_>,
         sink: &mut W,
     ) -> Result<(), PithosError> {
+        // A block that repeats the block before it reuses its verified plaintext.
+        let mut last: Option<(PlannedBlock, Zeroizing<Vec<u8>>)> = None;
         for block in plan {
             let block = block?;
-            let plaintext = self.verified_block(&block)?;
-            sink.write_all(&plaintext[block.output()])?;
+            let output = block.output();
+            if !last
+                .as_ref()
+                .is_some_and(|(previous, _)| previous.same_block(&block))
+            {
+                // The previous block is freed before the next one is decoded.
+                drop(last.take());
+                let plaintext = self.verified_block(&block)?;
+                last = Some((block, plaintext));
+            }
+            let (_, plaintext) = last.as_ref().expect("the block was verified above");
+            sink.write_all(&plaintext[output])?;
         }
         Ok(())
     }

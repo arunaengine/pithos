@@ -65,6 +65,11 @@ impl PlannedBlock {
     pub(crate) fn framed_len(&self) -> u64 {
         self.descriptor.stored_size.saturating_add(4)
     }
+
+    /// Whether `other` decodes to the same plaintext: the same file, identity and descriptor.
+    pub(crate) fn same_block(&self, other: &Self) -> bool {
+        self.file == other.file && self.hash == other.hash && self.descriptor == other.descriptor
+    }
 }
 
 /// A lazy read plan: the blocks that intersect a range, in file order.
@@ -204,7 +209,9 @@ impl Iterator for ReadPlan<'_> {
 
 impl<'a> ReadPlan<'a> {
     /// Groups consecutive local blocks whose spans are contiguous in storage into one request
-    /// of at most `max_bytes`. A larger block and every external block form their own batch.
+    /// of at most `max_bytes`. A block that repeats the span of the block before it joins the
+    /// batch without adding bytes, so the span is fetched once. A larger block and every
+    /// external block form their own batch.
     pub fn batches(self, max_bytes: u64) -> BlockBatches<'a> {
         BlockBatches {
             plan: self,
@@ -225,9 +232,24 @@ impl BlockBatch {
     pub fn request(&self) -> BlockRequest {
         let mut request = self.blocks[0].request();
         if let BlockRequest::Local { len, .. } = &mut request {
-            *len = self.blocks.iter().map(PlannedBlock::framed_len).sum();
+            *len = self.stored_len();
         }
         request
+    }
+
+    /// The stored bytes of the batch. A block that repeats the span before it adds none.
+    fn stored_len(&self) -> u64 {
+        let mut previous = None;
+        self.blocks
+            .iter()
+            .filter(|block| {
+                let span = block.local_span();
+                let repeat = span.is_some() && span == previous;
+                previous = span;
+                !repeat
+            })
+            .map(PlannedBlock::framed_len)
+            .sum()
     }
 
     pub fn blocks(&self) -> &[PlannedBlock] {
@@ -235,11 +257,12 @@ impl BlockBatch {
     }
 
     /// Pairs each block with its stored bytes from a response to [`BlockBatch::request`].
+    /// A repeated block gets the same bytes as the block before it.
     pub fn split<'b>(
         &'b self,
         response: &'b [u8],
     ) -> Result<impl Iterator<Item = (&'b PlannedBlock, &'b [u8])>, PithosError> {
-        let expected = self.blocks.iter().map(PlannedBlock::framed_len).sum();
+        let expected = self.stored_len();
         if response.len() as u64 != expected {
             return Err(PithosError::BlockSizeMismatch {
                 expected,
@@ -247,9 +270,16 @@ impl BlockBatch {
             });
         }
         let mut rest = response;
+        let mut last = None;
         Ok(self.blocks.iter().map(move |block| {
+            if let Some((span, stored)) = last
+                && block.local_span() == Some(span)
+            {
+                return (block, stored);
+            }
             let (stored, tail) = rest.split_at(block.framed_len() as usize);
             rest = tail;
+            last = block.local_span().map(|span| (span, stored));
             (block, stored)
         }))
     }
@@ -275,11 +305,15 @@ impl Iterator for BlockBatches<'_> {
                 blocks: vec![first],
             }));
         };
-        let (mut end, mut total) = (offset + len, len);
+        let (mut last, mut end, mut total) = (offset, offset + len, len);
         let mut blocks = vec![first];
         for next in self.plan.by_ref() {
             match next.as_ref().map(PlannedBlock::local_span) {
+                Ok(Some((offset, len))) if offset == last && offset + len == end => {
+                    blocks.extend(next.ok());
+                }
                 Ok(Some((offset, len))) if offset == end && total + len <= self.max_bytes => {
+                    last = offset;
                     end += len;
                     total += len;
                     blocks.extend(next.ok());

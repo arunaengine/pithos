@@ -609,12 +609,12 @@ mod tests {
             .batches(u64::MAX)
             .map(|batch| batch.unwrap().request())
             .collect::<Vec<_>>();
+        // The last block repeats the span before it, so it joins that batch without a request.
         assert_eq!(
             batches,
             [
                 BlockRequest::Local { offset: 16, len: 5 },
                 BlockRequest::Local { offset: 6, len: 15 },
-                BlockRequest::Local { offset: 16, len: 5 },
             ]
         );
     }
