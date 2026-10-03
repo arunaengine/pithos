@@ -488,6 +488,19 @@ mod tests {
         build_effective_index(vec![value], start + 10, IndexLimits::default()).unwrap()
     }
 
+    #[test]
+    fn plans_start_at_the_offset_checkpoint_before_the_range() {
+        let index = local_file(1, &[0; 3_000]);
+        for (start, first_position) in [(0, 0), (1_023, 0), (1_024, 1_024), (2_999, 2_048)] {
+            let range = ReadRange::new(start..start + 1, 3_000).unwrap();
+            let plan = ReadPlan::new(&index, FileId(1), range, test_limits()).unwrap();
+            assert_eq!(plan.first_position, first_position);
+            let blocks = plan.collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].position, start as usize);
+        }
+    }
+
     fn local_offsets(blocks: &[PlannedBlock]) -> Vec<u64> {
         blocks
             .iter()

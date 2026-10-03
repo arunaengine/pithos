@@ -76,6 +76,8 @@ pub struct ReadPlan<'a> {
     index: &'a ArchiveIndex,
     file: FileId,
     references: std::iter::Enumerate<std::slice::Iter<'a, BlockHash>>,
+    /// The position of the first reference left in `references`.
+    pub(super) first_position: usize,
     cursor: u64,
     range: ReadRange,
     limits: block::Limits,
@@ -100,8 +102,10 @@ impl<'a> ReadPlan<'a> {
         let ContentState::Available(references) = &content.content else {
             return Err(PithosError::ContentUnavailable);
         };
+        // The plan starts at the last offset checkpoint before the range.
+        let (first_position, cursor) = references.start_near(range.start());
         let references = if range.start() < range.end() {
-            references.as_slice()
+            &references.as_slice()[first_position..]
         } else {
             &[]
         };
@@ -109,7 +113,8 @@ impl<'a> ReadPlan<'a> {
             index,
             file,
             references: references.iter().enumerate(),
-            cursor: 0,
+            first_position,
+            cursor,
             range,
             limits,
         })
@@ -183,8 +188,8 @@ impl Iterator for ReadPlan<'_> {
     type Item = Result<PlannedBlock, PithosError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some((position, &hash)) = self.references.next() {
-            match self.step(position, hash) {
+        while let Some((offset, &hash)) = self.references.next() {
+            match self.step(self.first_position + offset, hash) {
                 Ok(Some(block)) => return Some(Ok(block)),
                 Ok(None) => {}
                 Err(error) => {

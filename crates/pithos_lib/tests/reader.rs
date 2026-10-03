@@ -3,11 +3,12 @@ mod common;
 use common::util::{fixture, open, private_key, public_key};
 use pithos_lib::adapters::crypt4gh::{self, Crypt4GHError};
 use pithos_lib::archive::{
-    AccessKeys, ArchivePath, ArchiveWriter, EntryKind, EntryMetadata, ProcessingOptions,
-    WriteOptions,
+    AccessKeys, Archive, ArchivePath, ArchiveWriter, Chunking, EntryKind, EntryMetadata,
+    OpenOptions, ProcessingOptions, WriteOptions,
 };
 use pithos_lib::error::PithosError;
 use pithos_lib::fs::{ExtractionOptions, extract, extract_all, extract_all_with_options};
+use pithos_lib::source::MemorySource;
 
 #[test]
 fn public_reader_lists_copies_ranges_extracts_and_exports() {
@@ -189,4 +190,57 @@ fn extraction_is_no_clobber_no_follow_and_staged() {
             .is_err()
     );
     assert!(!outside.join("data").exists());
+}
+
+#[test]
+fn ranges_near_offset_checkpoints_and_at_the_tail_match_the_full_read() {
+    // 3,000 encrypted 16-byte blocks and a short last block span two checkpoints of 1,024.
+    let content = (0..3_000u64 * 16 + 5)
+        .map(|byte| (byte % 251) as u8)
+        .collect::<Vec<u8>>();
+    let sender = private_key("sender");
+    let options = WriteOptions::new(sender.duplicate(), vec![sender.public_key()])
+        .with_chunking(Chunking::Fixed(16));
+    let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("data").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(true, 0).unwrap(),
+            Some(content.len() as u64),
+            std::io::Cursor::new(content.clone()),
+        )
+        .unwrap();
+    let archive = Archive::open(
+        MemorySource::new(writer.finish().unwrap()),
+        OpenOptions::default().with_access_keys(AccessKeys::new().with_key(sender)),
+    )
+    .unwrap();
+    let mut full = Vec::new();
+    archive.copy_to("data", &mut full).unwrap();
+    assert!(full == content);
+
+    let edge = 1_024 * 16;
+    let len = content.len() as u64;
+    for range in [
+        edge - 1..edge,
+        edge..edge + 1,
+        edge - 3..edge + 3,
+        2 * edge - 16..2 * edge + 16,
+        2 * edge..len,
+        len - 5..len,
+        len - 21..len,
+        len - 1..len,
+        len..len,
+        edge..edge,
+    ] {
+        let mut output = Vec::new();
+        archive
+            .copy_range_to("data", range.clone(), &mut output)
+            .unwrap();
+        assert!(
+            output == content[range.start as usize..range.end as usize],
+            "range {range:?}"
+        );
+    }
 }

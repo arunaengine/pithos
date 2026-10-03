@@ -1,6 +1,6 @@
 use crate::archive::types::{
-    ArchivePath, BlockDescriptor, BlockHash, ContentState, Entry, FileId, RelationId, SegmentEntry,
-    Span, ValidatedSegment,
+    ArchivePath, BlockDescriptor, BlockHash, CHECKPOINT_STRIDE, ContentState, Entry, FileId,
+    RelationId, SegmentEntry, Span, ValidatedSegment,
 };
 use crate::archive::validation::{IndexLimits, SegmentCounts, validate_aggregate, validate_entry};
 use crate::error::PithosError;
@@ -222,7 +222,7 @@ impl ArchiveIndex {
         }
         drop(local_spans);
         validate_references_and_content(
-            &self.entries,
+            &mut self.entries,
             &self.by_id,
             &self.relationships,
             &self.descriptors,
@@ -320,8 +320,9 @@ fn validate_descriptor(
     Ok(())
 }
 
+/// Also records the offset checkpoints of every available content entry.
 fn validate_references_and_content(
-    entries: &[IndexedEntry],
+    entries: &mut [IndexedEntry],
     by_id: &BTreeMap<FileId, usize>,
     relationships: &BTreeMap<RelationId, Arc<str>>,
     descriptors: &[(BlockHash, BlockDescriptor)],
@@ -335,22 +336,37 @@ fn validate_references_and_content(
                 return Err(PithosError::MissingReferenceTarget(reference.target.0));
             }
         }
-        let Some(content) = indexed.entry.content() else {
+        let (Entry::File(content) | Entry::Metadata(content)) = &mut indexed.entry else {
             continue;
         };
-        let ContentState::Available(blocks) = &content.content else {
+        let ContentState::Available(blocks) = &mut content.content else {
             continue;
         };
-        let actual = blocks.iter().try_fold(0u64, |total, hash| {
-            let descriptor =
-                find_descriptor(descriptors, hash).ok_or(PithosError::MissingBlockDescriptor)?;
-            total.checked_add(descriptor.original_size).ok_or(
-                PithosError::AccessibleFileSizeMismatch {
-                    expected: content.size,
-                    actual: u64::MAX,
-                },
-            )
-        })?;
+        let count = blocks.as_slice().len().div_ceil(CHECKPOINT_STRIDE);
+        let mut checkpoints = Vec::new();
+        checkpoints
+            .try_reserve_exact(count)
+            .map_err(|_| PithosError::AllocationFailed {
+                field: "offset checkpoints",
+                size: count as u64,
+            })?;
+        let actual = blocks
+            .iter()
+            .enumerate()
+            .try_fold(0u64, |total, (position, hash)| {
+                if position % CHECKPOINT_STRIDE == 0 {
+                    checkpoints.push(total);
+                }
+                let descriptor = find_descriptor(descriptors, hash)
+                    .ok_or(PithosError::MissingBlockDescriptor)?;
+                total.checked_add(descriptor.original_size).ok_or(
+                    PithosError::AccessibleFileSizeMismatch {
+                        expected: content.size,
+                        actual: u64::MAX,
+                    },
+                )
+            })?;
+        blocks.set_checkpoints(checkpoints);
         if actual != content.size {
             return Err(PithosError::AccessibleFileSizeMismatch {
                 expected: content.size,

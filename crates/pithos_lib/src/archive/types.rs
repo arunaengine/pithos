@@ -252,20 +252,46 @@ pub(crate) struct EntryMetadata {
     pub(crate) references: Vec<Reference>,
 }
 
+/// The index keeps the logical offset of every this many block references.
+pub(crate) const CHECKPOINT_STRIDE: usize = 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BlockReferences(Vec<BlockHash>);
+pub(crate) struct BlockReferences {
+    blocks: Vec<BlockHash>,
+    /// The logical offset of reference `k * CHECKPOINT_STRIDE` at position `k`.
+    checkpoints: Vec<u64>,
+}
 
 impl BlockReferences {
     pub(crate) fn new(blocks: Vec<BlockHash>) -> Self {
-        Self(blocks)
+        Self {
+            blocks,
+            checkpoints: Vec::new(),
+        }
     }
 
     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = BlockHash> + '_ {
-        self.0.iter().copied()
+        self.blocks.iter().copied()
     }
 
     pub(crate) fn as_slice(&self) -> &[BlockHash] {
-        &self.0
+        &self.blocks
+    }
+
+    pub(crate) fn set_checkpoints(&mut self, checkpoints: Vec<u64>) {
+        self.checkpoints = checkpoints;
+    }
+
+    /// The position and logical offset of the last checkpoint at or before `offset`.
+    pub(crate) fn start_near(&self, offset: u64) -> (usize, u64) {
+        let index = self
+            .checkpoints
+            .partition_point(|checkpoint| *checkpoint <= offset)
+            .saturating_sub(1);
+        match self.checkpoints.get(index) {
+            Some(checkpoint) => (index * CHECKPOINT_STRIDE, *checkpoint),
+            None => (0, 0),
+        }
     }
 }
 
