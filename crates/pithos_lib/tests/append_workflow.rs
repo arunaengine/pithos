@@ -4,7 +4,7 @@ use common::append::{WITHHELD_ID, append, append_fixture, append_with_cdc, archi
 use common::util::{open, private_key, public_key};
 use pithos_lib::archive::{
     AccessKeys, AppendOptions, ArchivePath, ArchiveWriter, BlockKeyMode, CdcConfig, EntryMetadata,
-    ProcessingOptions, WriteOptions,
+    PayloadCipher, ProcessingOptions, WriteOptions,
 };
 use pithos_lib::error::PithosError;
 use pithos_lib::fs::{FsError, append_files};
@@ -41,18 +41,23 @@ fn appends_to_version_1_0_archives_reject_version_1_1_processing_before_writing(
     let unique = ProcessingOptions::default()
         .with_key_mode(BlockKeyMode::Unique)
         .unwrap();
-    assert!(matches!(
-        append_files(
-            &archive,
-            options().with_processing(unique),
-            std::slice::from_ref(&source)
-        ),
-        Err(FsError::Core {
-            source: PithosError::UnsupportedProcessingFlags(_),
-            ..
-        })
-    ));
-    assert_eq!(std::fs::read(&archive).unwrap(), original);
+    let aes = ProcessingOptions::default()
+        .with_cipher(PayloadCipher::Aes256Gcm)
+        .unwrap();
+    for processing in [unique, aes] {
+        assert!(matches!(
+            append_files(
+                &archive,
+                options().with_processing(processing),
+                std::slice::from_ref(&source)
+            ),
+            Err(FsError::Core {
+                source: PithosError::UnsupportedProcessingFlags(_),
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&archive).unwrap(), original);
+    }
 
     append_files(&archive, options(), &[source]).unwrap();
     let mut contents = Vec::new();

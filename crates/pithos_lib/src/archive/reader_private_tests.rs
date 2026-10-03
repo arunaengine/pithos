@@ -3,8 +3,8 @@ use super::reader::{
     ExternalBlockResolver, OpenLimits, OpenOptions,
 };
 use crate::archive::{
-    ArchivePath, ArchiveWriter, BlockKeyMode, CdcConfig, EntryMetadata, ProcessingOptions,
-    WriteOptions,
+    ArchivePath, ArchiveWriter, BlockKeyMode, CdcConfig, EntryMetadata, PayloadCipher,
+    ProcessingOptions, WriteOptions,
 };
 use crate::crypto::{self, FileKey, PrivateKey, PublicKey};
 use crate::error::PithosError;
@@ -1751,6 +1751,13 @@ fn unique_processing() -> ProcessingOptions {
         .unwrap()
 }
 
+fn aes_processing() -> ProcessingOptions {
+    ProcessingOptions::new(true, 0)
+        .unwrap()
+        .with_cipher(PayloadCipher::Aes256Gcm)
+        .unwrap()
+}
+
 #[test]
 fn unique_key_blocks_round_trip_and_store_every_repeat() {
     // Zero bytes split into two equal 1024-byte chunks.
@@ -1775,10 +1782,17 @@ fn unique_key_blocks_round_trip_and_store_every_repeat() {
 }
 
 #[test]
-fn unique_key_flags_are_rejected_in_version_1_0_archives() {
+fn version_1_1_flags_are_rejected_in_version_1_0_archives() {
     for (processing, expected) in [
         (ProcessingOptions::new(true, 0).unwrap(), None),
         (unique_processing(), Some(0x18)),
+        (aes_processing(), Some(0x28)),
+        (
+            unique_processing()
+                .with_cipher(PayloadCipher::Aes256Gcm)
+                .unwrap(),
+            Some(0x38),
+        ),
     ] {
         let (_temporary, path) = fixture_with_processing(b"version gated block", processing);
         let mut legacy = std::fs::read(&path).unwrap();
@@ -1795,21 +1809,23 @@ fn unique_key_flags_are_rejected_in_version_1_0_archives() {
 }
 
 #[test]
-fn unique_key_flags_require_encryption() {
-    let (_temporary, path) = fixture_with_processing(b"plain unique block", unique_processing());
-    rewrite_terminal_directory(&path, |directory| {
-        directory
-            .blocks
-            .first_mut()
-            .unwrap()
-            .1
-            .flags
-            .set_encryption(false);
-    });
-    assert!(matches!(
-        open_without_keys(&path),
-        Err(PithosError::ProcessingRequiresEncryption(0x10))
-    ));
+fn version_1_1_flags_require_encryption() {
+    for (processing, expected) in [(unique_processing(), 0x10), (aes_processing(), 0x20)] {
+        let (_temporary, path) = fixture_with_processing(b"plain block", processing);
+        rewrite_terminal_directory(&path, |directory| {
+            directory
+                .blocks
+                .first_mut()
+                .unwrap()
+                .1
+                .flags
+                .set_encryption(false);
+        });
+        assert!(matches!(
+            open_without_keys(&path),
+            Err(PithosError::ProcessingRequiresEncryption(actual)) if actual == expected
+        ));
+    }
 }
 
 #[test]
@@ -1837,4 +1853,80 @@ fn unique_key_blocks_verify_payload_and_identity_before_output() {
         Err(PithosError::BlockHashMismatch { .. })
     ));
     assert!(sink.0.is_empty());
+}
+
+#[test]
+fn aes_256_gcm_blocks_verify_payload_and_cipher_before_output() {
+    let content = b"AES-256-GCM payload long enough for every corruption position";
+    for byte in [0, 12, 40] {
+        let (_temporary, path) = fixture_with_processing(content, aes_processing());
+        corrupt_payload(&path, byte);
+        assert_copy_failure_without_sink(&path);
+    }
+    let (_temporary, path) = fixture_with_processing(content, aes_processing());
+    rewrite_terminal_directory(&path, |directory| {
+        directory
+            .blocks
+            .first_mut()
+            .unwrap()
+            .1
+            .flags
+            .set_aes_256_gcm(false);
+    });
+    let archive = open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+    let mut sink = RecordingSink(Vec::new());
+    assert!(matches!(
+        archive.copy_to("data", &mut sink),
+        Err(PithosError::Crypt(_))
+    ));
+    assert!(sink.0.is_empty());
+}
+
+#[test]
+fn ciphers_mix_per_descriptor_and_reused_blocks_keep_their_cipher() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("mixed.pith");
+    let options = WriteOptions::new(private("sender"), vec![public("recipient1")]);
+    let mut writer = ArchiveWriter::create(File::create(&path).unwrap(), options).unwrap();
+    // Each content is below the minimum chunk size, so every file is one block.
+    let shared = b"block first written with ChaCha20-Poly1305".as_slice();
+    let other = b"block written with AES-256-GCM".as_slice();
+    let files = [
+        ("chacha", shared, ProcessingOptions::new(true, 0).unwrap()),
+        ("aes-reused", shared, aes_processing()),
+        ("aes", other, aes_processing()),
+        (
+            "unique-aes",
+            shared,
+            aes_processing()
+                .with_key_mode(BlockKeyMode::Unique)
+                .unwrap(),
+        ),
+    ];
+    for (name, content, processing) in files {
+        writer
+            .add_file(
+                ArchivePath::new(name).unwrap(),
+                EntryMetadata::new(0, 0, 0o644),
+                processing,
+                None,
+                Cursor::new(content),
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+
+    // The AES request for the shared block reuses its ChaCha20-Poly1305 descriptor.
+    let flags = decode_terminal_directory(&path)
+        .blocks
+        .values()
+        .map(|block| block.flags.0)
+        .collect::<Vec<_>>();
+    assert_eq!(flags, [0x08, 0x28, 0x38]);
+    let archive = open_path(&path, AccessKeys::new().with_key(private("recipient1")));
+    for (name, expected, _) in files {
+        let mut output = Vec::new();
+        archive.copy_to(name, &mut output).unwrap();
+        assert_eq!(output, expected, "{name}");
+    }
 }

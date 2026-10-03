@@ -3,7 +3,7 @@ mod common;
 use common::util::{private_key, public_key};
 use pithos_lib::archive::{
     AccessKeys, AppendOptions, Archive, ArchivePath, BlockKeyMode, EntryKind, EntryMetadata,
-    OpenOptions, Piece, PieceEncoder, ProcessingOptions, compose,
+    OpenOptions, PayloadCipher, Piece, PieceEncoder, ProcessingOptions, compose,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
@@ -114,6 +114,33 @@ fn unique_key_pieces_store_every_block_and_compose_with_convergent_pieces() {
     let mut output = Vec::new();
     archive.copy_to("object", &mut output).unwrap();
     assert_eq!(output, repeated.repeat(3));
+}
+
+#[test]
+fn pieces_with_different_ciphers_and_key_modes_compose_into_one_file() {
+    let shared = content(9, BLOCK);
+    let chacha = ProcessingOptions::new(true, 0).unwrap();
+    let aes = chacha.with_cipher(PayloadCipher::Aes256Gcm).unwrap();
+    let unique_aes = aes.with_key_mode(BlockKeyMode::Unique).unwrap();
+    let parts = vec![
+        encode_with(1, &[shared.clone(), content(1, 500)].concat(), aes),
+        encode_with(2, &[content(2, BLOCK), shared.clone()].concat(), chacha),
+        encode_with(3, &[shared.clone(), shared.clone()].concat(), unique_aes),
+    ];
+    // The ChaCha20-Poly1305 piece reads its shared block from the AES-256-GCM piece.
+    let archive = open(assemble(&parts), recipient());
+    let mut output = Vec::new();
+    archive.copy_to("object", &mut output).unwrap();
+    let expected = [
+        shared.clone(),
+        content(1, 500),
+        content(2, BLOCK),
+        shared.clone(),
+        shared.clone(),
+        shared,
+    ]
+    .concat();
+    assert_eq!(output, expected);
 }
 
 #[test]
