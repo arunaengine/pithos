@@ -2,10 +2,9 @@ use crate::archive::types::{
     ArchivePath, BlockDescriptor, BlockHash, ContentState, Entry, FileId, RelationId, SegmentEntry,
     Span, ValidatedSegment,
 };
-use crate::archive::validation::{IndexLimits, validate_aggregate, validate_entry};
+use crate::archive::validation::{IndexLimits, SegmentCounts, validate_aggregate, validate_entry};
 use crate::error::PithosError;
 use crate::format::header::FileHeader;
-use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -23,9 +22,11 @@ pub(crate) struct ArchiveIndex {
     by_id: BTreeMap<FileId, usize>,
     by_path: HashMap<Arc<str>, usize>,
     hierarchy: BTreeMap<ArchivePath, usize>,
-    descriptors: IndexMap<BlockHash, BlockDescriptor>,
+    /// Sorted by hash, so lookups need no hash table next to the descriptors.
+    descriptors: Vec<(BlockHash, BlockDescriptor)>,
     relationships: BTreeMap<RelationId, Arc<str>>,
-    segment_spans: Vec<Span>,
+    segment_spans: BTreeSet<Span>,
+    counts: SegmentCounts,
     maximum_id: Option<FileId>,
 }
 
@@ -54,7 +55,7 @@ impl ArchiveIndex {
     }
 
     pub(crate) fn descriptor(&self, hash: BlockHash) -> Option<&BlockDescriptor> {
-        self.descriptors.get(&hash)
+        find_descriptor(&self.descriptors, hash)
     }
 
     pub(crate) fn relationships(&self) -> impl Iterator<Item = (RelationId, &str)> {
@@ -67,7 +68,6 @@ impl ArchiveIndex {
         self.relationships.get(&id).map(Arc::as_ref)
     }
 
-    #[cfg(test)]
     pub(crate) fn maximum_id(&self) -> Option<FileId> {
         self.maximum_id
     }
@@ -77,72 +77,62 @@ impl ArchiveIndex {
         self.maximum_id = self.maximum_id.max(maximum_piece_key);
     }
 
-    /// Transfers only the effective state needed to form an append snapshot.
-    pub(crate) fn into_append_snapshot_parts(
-        self,
-    ) -> (
-        Vec<IndexedEntry>,
-        IndexMap<BlockHash, BlockDescriptor>,
-        Option<FileId>,
-    ) {
-        (self.entries, self.descriptors, self.maximum_id)
+    /// Runs the normal merge of `child` as the next segment on a copy of this index.
+    pub(crate) fn validate_child(
+        &self,
+        child: ValidatedSegment,
+        limits: IndexLimits,
+    ) -> Result<(), PithosError> {
+        let mut counts = self.counts;
+        counts.add(&child);
+        counts.check(limits)?;
+        let archive_len = child.span.end();
+        let mut index = self.clone();
+        index.counts = counts;
+        index.absorb(child, archive_len)?;
+        index.finish()
     }
-}
 
-/// Builds a new effective index. Inputs are only borrowed and are unchanged on every error.
-pub(crate) fn build_effective_index(
-    segments: &[ValidatedSegment],
-    archive_len: u64,
-    limits: IndexLimits,
-) -> Result<ArchiveIndex, PithosError> {
-    validate_aggregate(segments, limits)?;
-    let mut entries: Vec<IndexedEntry> = Vec::new();
-    let mut by_id = BTreeMap::new();
-    let mut by_path: HashMap<Arc<str>, usize> = HashMap::new();
-    let mut hierarchy = BTreeMap::new();
-    let mut descriptors: IndexMap<BlockHash, BlockDescriptor> = IndexMap::new();
-    let mut relationships: BTreeMap<RelationId, Arc<str>> = BTreeMap::new();
-    let mut segment_spans = BTreeSet::new();
+    fn new(counts: SegmentCounts) -> Self {
+        Self {
+            entries: Vec::new(),
+            by_id: BTreeMap::new(),
+            by_path: HashMap::new(),
+            hierarchy: BTreeMap::new(),
+            descriptors: Vec::new(),
+            relationships: BTreeMap::new(),
+            segment_spans: BTreeSet::new(),
+            counts,
+            maximum_id: None,
+        }
+    }
 
-    for segment in segments {
-        validate_segment_chain(segment, &segment_spans)?;
-        let block_region = block_data_region(segment)?;
-        segment_spans.insert(segment.span);
-        for (id, name) in &segment.relationships {
-            match relationships.get(id) {
+    /// Checks one more segment against the earlier ones and moves its contents in.
+    fn absorb(&mut self, segment: ValidatedSegment, archive_len: u64) -> Result<(), PithosError> {
+        validate_segment_chain(&segment, &self.segment_spans)?;
+        let block_region = block_data_region(&segment)?;
+        self.segment_spans.insert(segment.span);
+        for (id, name) in segment.relationships {
+            match self.relationships.get(&id) {
                 Some(existing) if existing.as_ref() != name.as_ref() => {
                     return Err(PithosError::ConflictingRelationshipDefinition(id.0));
                 }
                 Some(_) => {}
                 None => {
-                    relationships.insert(*id, Arc::clone(name));
+                    self.relationships.insert(id, name);
                 }
             }
         }
-        for (hash, descriptor) in &segment.descriptors {
-            if let Some(existing) = descriptors.get(hash) {
-                // The current format defines compatibility by identity and plaintext size only.
-                if existing.original_size != descriptor.original_size {
-                    return Err(PithosError::BlockIndexConflict {
-                        hash: hash.0,
-                        existing_original_size: existing.original_size,
-                        new_original_size: descriptor.original_size,
-                    });
-                }
-            } else {
-                validate_descriptor(descriptor, archive_len, block_region)?;
-                descriptors.insert(*hash, descriptor.clone());
-            }
-        }
-        for SegmentEntry { id, path, entry } in &segment.entries {
-            validate_entry(path, entry)?;
-            if by_id.contains_key(id) {
+        self.absorb_descriptors(segment.descriptors, archive_len, block_region)?;
+        for SegmentEntry { id, path, entry } in segment.entries {
+            validate_entry(&path, &entry)?;
+            if self.by_id.contains_key(&id) {
                 return Err(PithosError::DuplicateFileId(format!(
                     "File id already occupied: {}",
                     id.0
                 )));
             }
-            if by_path.contains_key(path.as_str()) {
+            if self.by_path.contains_key(path.as_str()) {
                 return Err(PithosError::PathOccupied(format!(
                     "File path already occupied: {}",
                     path.as_str()
@@ -150,60 +140,123 @@ pub(crate) fn build_effective_index(
             }
             for (offset, _) in path.as_str().match_indices('/') {
                 let ancestor = &path.as_str()[..offset];
-                let Some(ancestor_index) = by_path.get(ancestor) else {
+                let Some(ancestor_index) = self.by_path.get(ancestor) else {
                     return Err(PithosError::InvalidArchivePath {
                         path: path.as_str().into(),
                         reason: format!("missing directory ancestor {ancestor}"),
                     });
                 };
-                if !entries[*ancestor_index].entry.is_directory() {
+                if !self.entries[*ancestor_index].entry.is_directory() {
                     return Err(PithosError::InvalidArchivePath {
                         path: path.as_str().into(),
                         reason: format!("file entry {ancestor} is an ancestor"),
                     });
                 }
             }
-            let index = entries.len();
-            entries.push(IndexedEntry {
-                id: *id,
-                path: path.clone(),
-                entry: entry.clone(),
-            });
-            by_id.insert(*id, index);
-            by_path.insert(Arc::from(path.as_str()), index);
-            hierarchy.insert(path.clone(), index);
+            let index = self.entries.len();
+            self.by_id.insert(id, index);
+            self.by_path.insert(Arc::from(path.as_str()), index);
+            self.hierarchy.insert(path.clone(), index);
+            self.entries.push(IndexedEntry { id, path, entry });
         }
+        Ok(())
     }
 
-    let segment_spans = segment_spans.into_iter().collect::<Vec<_>>();
-    let mut local_spans = descriptors
-        .values()
-        .filter_map(|descriptor| match descriptor.location {
-            crate::archive::types::BlockLocation::Local(span) => Some(span),
-            crate::archive::types::BlockLocation::External(_) => None,
-        })
-        .collect::<Vec<_>>();
-    local_spans.sort_unstable_by_key(|span| span.start());
-    if local_spans
-        .windows(2)
-        .any(|spans| spans[0].overlaps(spans[1]))
-    {
-        return Err(PithosError::InvalidDirectoryRange {
-            operation: "validate block overlap",
-        });
+    /// Keeps the earliest descriptor of each block. A later one must agree on the plaintext
+    /// size. The first segment's list is moved in without a copy.
+    fn absorb_descriptors(
+        &mut self,
+        mut descriptors: Vec<(BlockHash, BlockDescriptor)>,
+        archive_len: u64,
+        block_region: Span,
+    ) -> Result<(), PithosError> {
+        descriptors.sort_unstable_by_key(|(hash, _)| *hash);
+        for (hash, descriptor) in &descriptors {
+            match self.descriptor(*hash) {
+                // The current format defines compatibility by identity and plaintext size only.
+                Some(existing) if existing.original_size != descriptor.original_size => {
+                    return Err(PithosError::BlockIndexConflict {
+                        hash: hash.0,
+                        existing_original_size: existing.original_size,
+                        new_original_size: descriptor.original_size,
+                    });
+                }
+                Some(_) => {}
+                None => validate_descriptor(descriptor, archive_len, block_region)?,
+            }
+        }
+        if self.descriptors.is_empty() {
+            self.descriptors = descriptors;
+            return Ok(());
+        }
+        descriptors.retain(|(hash, _)| find_descriptor(&self.descriptors, *hash).is_none());
+        self.descriptors
+            .try_reserve_exact(descriptors.len())
+            .map_err(|_| PithosError::AllocationFailed {
+                field: "block descriptors",
+                size: descriptors.len() as u64,
+            })?;
+        self.descriptors.append(&mut descriptors);
+        self.descriptors.sort_unstable_by_key(|(hash, _)| *hash);
+        Ok(())
     }
-    validate_references_and_content(&entries, &by_id, &relationships, &descriptors)?;
-    let maximum_id = entries.iter().map(|entry| entry.id).max();
-    Ok(ArchiveIndex {
-        entries,
-        by_id,
-        by_path,
-        hierarchy,
-        descriptors,
-        relationships,
-        segment_spans,
-        maximum_id,
-    })
+
+    /// Runs the checks that need every segment.
+    fn finish(&mut self) -> Result<(), PithosError> {
+        let mut local_spans = self
+            .descriptors
+            .iter()
+            .filter_map(|(_, descriptor)| match descriptor.location {
+                crate::archive::types::BlockLocation::Local(span) => Some(span),
+                crate::archive::types::BlockLocation::External(_) => None,
+            })
+            .collect::<Vec<_>>();
+        local_spans.sort_unstable_by_key(|span| span.start());
+        if local_spans
+            .windows(2)
+            .any(|spans| spans[0].overlaps(spans[1]))
+        {
+            return Err(PithosError::InvalidDirectoryRange {
+                operation: "validate block overlap",
+            });
+        }
+        drop(local_spans);
+        validate_references_and_content(
+            &self.entries,
+            &self.by_id,
+            &self.relationships,
+            &self.descriptors,
+        )?;
+        self.maximum_id = self
+            .maximum_id
+            .max(self.entries.iter().map(|entry| entry.id).max());
+        Ok(())
+    }
+}
+
+fn find_descriptor(
+    descriptors: &[(BlockHash, BlockDescriptor)],
+    hash: BlockHash,
+) -> Option<&BlockDescriptor> {
+    descriptors
+        .binary_search_by_key(&hash, |(hash, _)| *hash)
+        .ok()
+        .map(|index| &descriptors[index].1)
+}
+
+/// Builds a new effective index, moving the contents of `segments` into it.
+pub(crate) fn build_effective_index(
+    segments: Vec<ValidatedSegment>,
+    archive_len: u64,
+    limits: IndexLimits,
+) -> Result<ArchiveIndex, PithosError> {
+    let counts = validate_aggregate(&segments, limits)?;
+    let mut index = ArchiveIndex::new(counts);
+    for segment in segments {
+        index.absorb(segment, archive_len)?;
+    }
+    index.finish()?;
+    Ok(index)
 }
 
 fn validate_segment_chain(
@@ -271,7 +324,7 @@ fn validate_references_and_content(
     entries: &[IndexedEntry],
     by_id: &BTreeMap<FileId, usize>,
     relationships: &BTreeMap<RelationId, Arc<str>>,
-    descriptors: &IndexMap<BlockHash, BlockDescriptor>,
+    descriptors: &[(BlockHash, BlockDescriptor)],
 ) -> Result<(), PithosError> {
     for indexed in entries {
         for reference in &indexed.entry.metadata().references {
@@ -289,9 +342,8 @@ fn validate_references_and_content(
             continue;
         };
         let actual = blocks.iter().try_fold(0u64, |total, hash| {
-            let descriptor = descriptors
-                .get(&hash)
-                .ok_or(PithosError::MissingBlockDescriptor)?;
+            let descriptor =
+                find_descriptor(descriptors, hash).ok_or(PithosError::MissingBlockDescriptor)?;
             total.checked_add(descriptor.original_size).ok_or(
                 PithosError::AccessibleFileSizeMismatch {
                     expected: content.size,

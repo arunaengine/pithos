@@ -325,10 +325,66 @@ fn invalid_target(path: &ArchivePath, target: &str, reason: &str) -> PithosError
     }
 }
 
+/// Counts summed over the segments of an index, checked against [`IndexLimits`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SegmentCounts {
+    segments: u64,
+    entries: u64,
+    descriptors: u64,
+    references: u64,
+    relationships: u64,
+}
+
+impl SegmentCounts {
+    /// Adds one segment. Sums saturate, so an overflow fails the limit check.
+    pub(crate) fn add(&mut self, segment: &ValidatedSegment) {
+        let count = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+        let references = segment.entries.iter().fold(0u64, |total, entry| {
+            total.saturating_add(count(entry.entry.metadata().references.len()))
+        });
+        self.segments = self.segments.saturating_add(1);
+        self.entries = self.entries.saturating_add(count(segment.entries.len()));
+        self.descriptors = self
+            .descriptors
+            .saturating_add(count(segment.descriptors.len()));
+        self.references = self.references.saturating_add(references);
+        self.relationships = self
+            .relationships
+            .saturating_add(count(segment.relationships.len()));
+    }
+
+    pub(crate) fn check(&self, limits: IndexLimits) -> Result<(), PithosError> {
+        for (field, actual, limit) in [
+            ("directory segments", self.segments, limits.max_segments),
+            ("entries", self.entries, limits.max_entries),
+            (
+                "block descriptors",
+                self.descriptors,
+                limits.max_descriptors,
+            ),
+            ("references", self.references, limits.max_references),
+            (
+                "relationship definitions",
+                self.relationships,
+                limits.max_relationships,
+            ),
+        ] {
+            if actual > limit {
+                return Err(PithosError::LimitExceeded {
+                    field,
+                    limit,
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn validate_aggregate(
     segments: &[ValidatedSegment],
     limits: IndexLimits,
-) -> Result<(), PithosError> {
+) -> Result<SegmentCounts, PithosError> {
     if segments.len() as u64 > limits.max_segments {
         return Err(PithosError::LimitExceeded {
             field: "directory segments",
@@ -336,50 +392,10 @@ pub(crate) fn validate_aggregate(
             actual: segments.len() as u64,
         });
     }
-    let (entries, descriptors, references, relationships) = segments.iter().try_fold(
-        (0u64, 0u64, 0u64, 0u64),
-        |(entries, descriptors, references, relationships), segment| {
-            let entry_count = u64::try_from(segment.entries.len()).unwrap_or(u64::MAX);
-            let descriptor_count = u64::try_from(segment.descriptors.len()).unwrap_or(u64::MAX);
-            let reference_count = segment
-                .entries
-                .iter()
-                .try_fold(0u64, |total, entry| {
-                    total.checked_add(
-                        u64::try_from(entry.entry.metadata().references.len()).unwrap_or(u64::MAX),
-                    )
-                })
-                .ok_or(PithosError::LimitExceeded {
-                    field: "references",
-                    limit: limits.max_references,
-                    actual: u64::MAX,
-                })?;
-            Ok::<_, PithosError>((
-                entries.saturating_add(entry_count),
-                descriptors.saturating_add(descriptor_count),
-                references.saturating_add(reference_count),
-                relationships
-                    .saturating_add(u64::try_from(segment.relationships.len()).unwrap_or(u64::MAX)),
-            ))
-        },
-    )?;
-    for (field, actual, limit) in [
-        ("entries", entries, limits.max_entries),
-        ("block descriptors", descriptors, limits.max_descriptors),
-        ("references", references, limits.max_references),
-        (
-            "relationship definitions",
-            relationships,
-            limits.max_relationships,
-        ),
-    ] {
-        if actual > limit {
-            return Err(PithosError::LimitExceeded {
-                field,
-                limit,
-                actual,
-            });
-        }
+    let mut counts = SegmentCounts::default();
+    for segment in segments {
+        counts.add(segment);
     }
-    Ok(())
+    counts.check(limits)?;
+    Ok(counts)
 }

@@ -1,5 +1,5 @@
 use crate::archive::access::ResolvedAccess;
-use crate::archive::index::{ArchiveIndex, build_effective_index};
+use crate::archive::index::ArchiveIndex;
 use crate::archive::types::{
     ArchivePath, BlockDescriptor, BlockHash, Entry, FileId, RecipientPair, Span, ValidatedSegment,
 };
@@ -14,19 +14,17 @@ use std::sync::Arc;
 
 /// The secret-contained state needed to safely plan a direct append or grant.
 ///
-/// This is intentionally derived only from a fully opened archive. It retains validated
-/// segments for pure prospective merge, but not the source, decoded directories, or reader facade.
+/// This is intentionally derived only from a fully opened archive. It retains the effective
+/// index for pure prospective merge, but not the source, decoded directories, or reader facade.
 pub(crate) struct AppendSnapshot {
     archive_len: u64,
     version: FormatVersion,
     terminal_directory: Span,
-    maximum_id: Option<FileId>,
-    descriptors: IndexMap<BlockHash, BlockDescriptor>,
+    index: ArchiveIndex,
     entries: BTreeMap<FileId, SnapshotEntry>,
     paths: HashMap<Arc<str>, FileId>,
     hierarchy: BTreeMap<ArchivePath, FileId>,
     relationships: BTreeMap<u64, Arc<str>>,
-    segments: Vec<ValidatedSegment>,
     index_limits: IndexLimits,
     access: ResolvedAccess,
     occupied_recipient_pairs: HashSet<RecipientPair>,
@@ -54,7 +52,7 @@ impl AppendSnapshot {
         version: FormatVersion,
         terminal_directory: Span,
         index: ArchiveIndex,
-        segments: Vec<ValidatedSegment>,
+        occupied_recipient_pairs: HashSet<RecipientPair>,
         index_limits: IndexLimits,
         access: ResolvedAccess,
     ) -> Self {
@@ -62,15 +60,10 @@ impl AppendSnapshot {
             .relationships()
             .map(|(id, name)| (id.0, Arc::from(name)))
             .collect();
-        let (index_entries, descriptors, maximum_id) = index.into_append_snapshot_parts();
-        let occupied_recipient_pairs = segments
-            .iter()
-            .flat_map(|segment| segment.recipient_pairs.iter().copied())
-            .collect();
         let mut entries = BTreeMap::new();
         let mut paths = HashMap::new();
         let mut hierarchy = BTreeMap::new();
-        for entry in index_entries {
+        for entry in index.entries() {
             let kind = snapshot_entry_kind(&entry.entry);
             let id = entry.id;
             let path_key = Arc::from(entry.path.as_str());
@@ -81,7 +74,7 @@ impl AppendSnapshot {
                     #[cfg(test)]
                     id,
                     #[cfg(test)]
-                    path: entry.path,
+                    path: entry.path.clone(),
                     kind,
                 },
             );
@@ -91,13 +84,11 @@ impl AppendSnapshot {
             archive_len,
             version,
             terminal_directory,
-            maximum_id,
-            descriptors,
+            index,
             entries,
             paths,
             hierarchy,
             relationships,
-            segments,
             index_limits,
             access,
             occupied_recipient_pairs,
@@ -117,11 +108,11 @@ impl AppendSnapshot {
     }
 
     pub(crate) fn maximum_id(&self) -> Option<FileId> {
-        self.maximum_id
+        self.index.maximum_id()
     }
 
     pub(crate) fn descriptor(&self, hash: BlockHash) -> Option<&BlockDescriptor> {
-        self.descriptors.get(&hash)
+        self.index.descriptor(hash)
     }
 
     pub(crate) fn entry(&self, id: FileId) -> Option<&SnapshotEntry> {
@@ -210,10 +201,7 @@ impl AppendSnapshot {
         &self,
         child: ValidatedSegment,
     ) -> Result<(), PithosError> {
-        let archive_len = child.span.end();
-        let mut segments = self.segments.clone();
-        segments.push(child);
-        build_effective_index(&segments, archive_len, self.index_limits).map(|_| ())
+        self.index.validate_child(child, self.index_limits)
     }
 
     pub(crate) fn sender_pair_is_occupied(

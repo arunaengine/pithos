@@ -194,7 +194,7 @@ mod tests {
             },
         ];
         let index =
-            build_effective_index(&[segment(entries)], 1_000, IndexLimits::default()).unwrap();
+            build_effective_index(vec![segment(entries)], 1_000, IndexLimits::default()).unwrap();
         assert_eq!(
             index.entries().map(|entry| entry.id.0).collect::<Vec<_>>(),
             [7, 3, 4]
@@ -235,7 +235,7 @@ mod tests {
         let older_before = older.clone();
         let newer_before = newer.clone();
         let index = build_effective_index(
-            &[older.clone(), newer.clone()],
+            vec![older.clone(), newer.clone()],
             1_000,
             IndexLimits::default(),
         )
@@ -249,7 +249,7 @@ mod tests {
         let conflicting_before = conflicting.clone();
         assert!(
             build_effective_index(
-                &[older.clone(), conflicting.clone()],
+                vec![older.clone(), conflicting.clone()],
                 1_000,
                 IndexLimits::default()
             )
@@ -283,7 +283,7 @@ mod tests {
             };
 
             let index =
-                build_effective_index(&[older.clone(), newer], 1_000, IndexLimits::default())
+                build_effective_index(vec![older.clone(), newer], 1_000, IndexLimits::default())
                     .unwrap();
             assert_eq!(index.descriptor(hash), Some(&older.descriptors[0].1));
         }
@@ -358,7 +358,7 @@ mod tests {
 
         for (case, segments) in cases {
             assert!(
-                build_effective_index(&segments, 100, IndexLimits::default()).is_err(),
+                build_effective_index(segments, 100, IndexLimits::default()).is_err(),
                 "accepted {case}"
             );
         }
@@ -378,7 +378,7 @@ mod tests {
             ),
         ];
 
-        assert!(build_effective_index(&[value], 40, IndexLimits::default()).is_err());
+        assert!(build_effective_index(vec![value], 40, IndexLimits::default()).is_err());
     }
 
     #[test]
@@ -391,7 +391,7 @@ mod tests {
             (BlockHash([2; 32]), local_descriptor(second)),
         ];
 
-        let index = build_effective_index(&[value], 40, IndexLimits::default()).unwrap();
+        let index = build_effective_index(vec![value], 40, IndexLimits::default()).unwrap();
         assert_eq!(
             index.descriptor(BlockHash([1; 32])).unwrap().location,
             BlockLocation::Local(first)
@@ -414,7 +414,8 @@ mod tests {
             }),
         };
         let index =
-            build_effective_index(&[segment(vec![entry])], 1_000, IndexLimits::default()).unwrap();
+            build_effective_index(vec![segment(vec![entry])], 1_000, IndexLimits::default())
+                .unwrap();
         assert!(matches!(
             index.entry(FileId(1)).unwrap().entry,
             Entry::File(_)
@@ -444,7 +445,7 @@ mod tests {
             }),
         }]);
         value.descriptors = vec![(first, descriptor(4)), (second, descriptor(6))];
-        let index = build_effective_index(&[value], 1_000, IndexLimits::default()).unwrap();
+        let index = build_effective_index(vec![value], 1_000, IndexLimits::default()).unwrap();
         let range = ReadRange::new(3..7, 10).unwrap();
         let plan = ReadPlan::new(&index, FileId(1), range, test_limits())
             .unwrap()
@@ -484,7 +485,7 @@ mod tests {
                 (hash(block), local_descriptor(span))
             })
             .collect();
-        build_effective_index(&[value], start + 10, IndexLimits::default()).unwrap()
+        build_effective_index(vec![value], start + 10, IndexLimits::default()).unwrap()
     }
 
     fn local_offsets(blocks: &[PlannedBlock]) -> Vec<u64> {
@@ -619,7 +620,7 @@ mod tests {
             }),
         }]);
         value.descriptors = vec![(first, descriptor(4)), (second, descriptor(6))];
-        let index = build_effective_index(&[value], 1_000, IndexLimits::default()).unwrap();
+        let index = build_effective_index(vec![value], 1_000, IndexLimits::default()).unwrap();
         let range = ReadRange::new(0..10, 10).unwrap();
         let plan = ReadPlan::new(&index, FileId(1), range, test_limits()).unwrap();
         let batches = plan
@@ -694,7 +695,8 @@ mod tests {
             },
         };
         assert!(
-            build_effective_index(&[segment(vec![link])], 1_000, IndexLimits::default()).is_err()
+            build_effective_index(vec![segment(vec![link])], 1_000, IndexLimits::default())
+                .is_err()
         );
     }
 
@@ -724,7 +726,7 @@ mod tests {
                 conflicting.reverse();
             }
             assert!(
-                build_effective_index(&[segment(conflicting)], 1_000, IndexLimits::default())
+                build_effective_index(vec![segment(conflicting)], 1_000, IndexLimits::default())
                     .is_err()
             );
         }
@@ -740,7 +742,9 @@ mod tests {
                 entry: file(),
             },
         ];
-        assert!(build_effective_index(&[segment(adjacent)], 1_000, IndexLimits::default()).is_ok());
+        assert!(
+            build_effective_index(vec![segment(adjacent)], 1_000, IndexLimits::default()).is_ok()
+        );
     }
 
     #[test]
@@ -767,13 +771,14 @@ mod tests {
             vec![directory(2, "parent/child"), directory(1, "parent")],
         ] {
             assert!(
-                build_effective_index(&[segment(entries)], 1_000, IndexLimits::default()).is_err()
+                build_effective_index(vec![segment(entries)], 1_000, IndexLimits::default())
+                    .is_err()
             );
         }
 
         assert!(
             build_effective_index(
-                &[segment(vec![
+                vec![segment(vec![
                     directory(1, "parent"),
                     file(2, "parent/child"),
                 ])],
@@ -785,13 +790,17 @@ mod tests {
 
         let base = segment_at(100, None, vec![directory(1, "parent")]);
         let child = segment_at(200, Some(base.span), vec![file(2, "parent/child")]);
-        assert!(build_effective_index(&[base, child], 1_000, IndexLimits::default()).is_ok());
+        assert!(build_effective_index(vec![base, child], 1_000, IndexLimits::default()).is_ok());
 
         let early_child = segment_at(100, None, vec![file(2, "parent/child")]);
         let late_parent = segment_at(200, Some(early_child.span), vec![directory(1, "parent")]);
         assert!(
-            build_effective_index(&[early_child, late_parent], 1_000, IndexLimits::default(),)
-                .is_err()
+            build_effective_index(
+                vec![early_child, late_parent],
+                1_000,
+                IndexLimits::default(),
+            )
+            .is_err()
         );
     }
 
@@ -814,12 +823,12 @@ mod tests {
             if reverse {
                 conflicting.reverse();
             }
-            prop_assert!(build_effective_index(&[segment(conflicting)], 1_000, IndexLimits::default()).is_err());
+            prop_assert!(build_effective_index(vec![segment(conflicting)], 1_000, IndexLimits::default()).is_err());
             let adjacent = vec![
                 SegmentEntry { id: FileId(1), path: ArchivePath::new(&prefix).unwrap(), entry: file() },
                 SegmentEntry { id: FileId(2), path: ArchivePath::new(format!("{prefix}!")).unwrap(), entry: file() },
             ];
-            prop_assert!(build_effective_index(&[segment(adjacent)], 1_000, IndexLimits::default()).is_ok());
+            prop_assert!(build_effective_index(vec![segment(adjacent)], 1_000, IndexLimits::default()).is_ok());
         }
     }
 }

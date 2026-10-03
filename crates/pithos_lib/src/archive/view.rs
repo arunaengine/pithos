@@ -5,13 +5,13 @@ use super::planning::{PlannedBlock, ReadPlan, check_block_limits};
 use super::reader::AccessKeys;
 use super::reader::{ArchiveEntry, ContentAvailability, OpenLimits, archive_entry};
 use super::snapshot::AppendSnapshot;
-use super::types::{ArchivePath, FileId, ReadRange, Span, ValidatedSegment};
+use super::types::{ArchivePath, FileId, ReadRange, RecipientPair, Span};
 use super::validation::IndexLimits;
 use crate::block;
 use crate::error::PithosError;
 use crate::format::block::{BlockIndexEntry, BlockLocation, ProcessingFlags};
 use crate::format::header::FormatVersion;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use zeroize::Zeroizing;
 
@@ -25,7 +25,7 @@ pub struct ArchiveView {
     pub(super) metadata_digest: [u8; 32],
     pub(super) terminal_directory: Span,
     pub(super) index: ArchiveIndex,
-    pub(super) segments: Vec<ValidatedSegment>,
+    pub(super) recipient_pairs: HashSet<RecipientPair>,
     pub(super) index_limits: IndexLimits,
     pub(super) access: ResolvedAccess,
     #[cfg(feature = "crypt4gh")]
@@ -129,7 +129,7 @@ impl ArchiveView {
             version,
             terminal_directory,
             index,
-            segments,
+            recipient_pairs,
             index_limits,
             access,
             ..
@@ -139,7 +139,7 @@ impl ArchiveView {
             version,
             terminal_directory,
             index,
-            segments,
+            recipient_pairs,
             index_limits,
             access,
         )

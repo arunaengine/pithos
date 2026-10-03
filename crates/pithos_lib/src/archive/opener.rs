@@ -408,6 +408,10 @@ fn complete_open(
         segments.push(segment_from_parts(&directory, descriptors, span, parent)?);
         move_block_keys(&mut directory, &mut access)?;
     }
+    let recipient_pairs = segments
+        .iter()
+        .flat_map(|segment| segment.recipient_pairs.iter().copied())
+        .collect();
     let index_limits = IndexLimits {
         max_entries: limits.max_entries,
         max_descriptors: limits.max_descriptors,
@@ -415,7 +419,7 @@ fn complete_open(
         max_relationships: limits.max_relationships,
         max_segments: limits.max_parent_directories.saturating_add(1),
     };
-    let mut index = build_effective_index(&segments, archive_len, index_limits)?;
+    let mut index = build_effective_index(segments, archive_len, index_limits)?;
     index.cover_piece_keys(maximum_piece_key.map(FileId));
     let content_availability = classify_content_availability(&index, settings.external_enabled)?;
     Ok(ArchiveView {
@@ -424,7 +428,7 @@ fn complete_open(
         metadata_digest,
         terminal_directory: terminal,
         index,
-        segments,
+        recipient_pairs,
         index_limits,
         access,
         #[cfg(feature = "crypt4gh")]
