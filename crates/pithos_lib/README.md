@@ -87,6 +87,27 @@ Opening validates archive structure and accessible metadata. Payload integrity i
 
 `fs::extract` is Linux-only. It walks destination components without following symlinks, stages regular-file output anonymously with Linux `O_TMPFILE`, and publishes without replacing an existing entry. The destination filesystem must support `O_TMPFILE` and `linkat(AT_EMPTY_PATH)`; extraction can therefore fail on a collision rather than overwrite a destination.
 
+## Async reading
+
+The optional `async` feature adds `source::AsyncArchiveSource`, `archive::AsyncArchive` and
+`archive::AsyncExternalBlockResolver`. It depends only on `futures-core` and needs no specific
+async runtime.
+
+- `AsyncArchive::open(source, options, known_len)` issues the header, footer and directory
+  requests one after the other. Their count does not depend on the number of blocks. Pass the
+  object length as `known_len` to skip the length request.
+- `read_range(path, range)` returns a `Stream` of verified plaintext chunks in file order.
+  `ReadLimits` bounds the outstanding requests and the bytes held for responses, decoding and
+  ordered delivery. Dropping the stream cancels its outstanding requests.
+- The source must serve one immutable object revision for the open and every later read, and
+  each response must have exactly the requested length.
+- Decoding directories and blocks is CPU work. `open` runs it inline, which suits only small
+  archives. Pass a `BlockingHook` to `open_with_hook` to move it to a blocking pool, for example
+  one that forwards to `tokio::task::spawn_blocking`.
+- External blocks follow the rules of the synchronous reader: they are read only when both a
+  resolver and an access policy are supplied, and the resolver checks the policy before its
+  initial access and before every redirect.
+
 ## RO-Crate ingestion
 
 Load a directory or ZIP RO-Crate, then convert its retained source through a configured writer:
