@@ -1266,9 +1266,10 @@ Hex offsets are zero-based file offsets. Each hex line contains at most 16 bytes
 `0000:` is an offset, not encoded data. Integers without a fixed-width suffix use
 shortest ULEB128 in these deterministic vectors, although Section 3.1 also
 permits bounded non-minimal forms. `u64be` and `u32be` are big-endian. The
-canonical archives are version 1.0 archives, which every reader accepts, so their
-header is always
-`50 49 54 48 01 00` (`PITH`, version `0x0100`); the other magic values are
+canonical archives other than CV-PIECES-HELLO-766 are version 1.0 archives, which
+every reader accepts, so their header is
+`50 49 54 48 01 00` (`PITH`, version `0x0100`). CV-PIECES-HELLO-766 is a version
+1.1 archive with header `50 49 54 48 01 01`; the other magic values are
 `42 4c 43 4b` (`BLCK`) and `50 49 54 48 4f 53 44 52` (`PITHOSDR`).
 
 CRC values use Section 4.3's CRC-32/ISO-HDLC definition. As a check on an
@@ -1582,11 +1583,21 @@ archive.
 
 ### B.5 Validation Index
 
+Entries marked *case* are conformance cases without fixed bytes. A test builds
+each one with a writer, or by patching the header, a flags byte, or a Directory
+byte and then refreshing the CRC.
+
 | Condition class | Authoritative section | Vector ID | Required result |
 | --- | --- | --- | --- |
 | Header, integer, tags, and flags | 3.1, 4.1, 4.2.3-4.2.4 | AV-ULEB-NONMINIMAL, RV-ULEB, RV-FLAGS, RV-UNKNOWN-TAG | Accept or reject archive as stated |
+| Version 1.1 processing flags | 1.3, 4.2.3, 6.2 | RV-FLAGS; *case:* bit 4 or 5 without bit 3, in either version; *case:* bit 4 or 5 with bit 3 in a version 1.0 archive; *case:* reserved bit 6 or 7; *case:* an append to a version 1.0 archive that requests bit 4 or 5 | Reject archive; the append fails before writing any bytes |
 | Directory framing, CRC, and chain | 4.3, 4.3.1, 4.3.2 | CV-BASE-EMPTY-146, CV-APPEND-EMPTY-28, RV-PARENT, RV-UNDERFLOW, RV-TRAILING, RV-CRC, RV-CROSS-SIZE | Valid archive or reject archive as stated |
+| Metadata digest | 4.3.4 | *case:* digest of one Directory and of a two-Directory chain; *case:* the same digest under both header versions; *case:* an outdated expected digest, with and without keys; *case:* one changed Directory byte with a refreshed CRC | Accept the matching digest; reject archive on a mismatch |
 | Entries and paths | 4.3.3, 4.4.1, 4.4.3 | CV-LOCAL-HELLO-279, RV-DUPLICATES, RV-PATH, RV-SYMLINK, RV-FILETYPE, RV-PERMISSIONS | Valid archive or reject archive as stated |
 | Block locations and extents | 4.2.2, 4.2.5, 4.2.6, 8.2 | CV-LOCAL-HELLO-279, RV-EXTENT, RV-SHORT-ENCRYPTED, RV-EXTERNAL | Valid archive, reject archive, content read fails before output, or content unavailable as stated |
+| Resource limits | 3.2 | *case:* a block whose `stored_size` or `original_size` is one byte above a configured limit, in a written and in a composed archive | Fail before any output; a limit equal to the size reads the block |
 | Content transforms and hashes | 5.2, 5.3, 5.4 | PV-ZSTD-HELLO, PV-ZSTD-TEXT, PV-RECIPIENT-WRAP-01, PV-RECIPIENT-WRAP-11, PV-UNIQUE-KEY-HELLO, PV-AES-GCM-HELLO | Decode/decrypt to stated output |
-| Version 1.1 pieces and grants | 1.3, 4.4.2, 5.3 | CV-PIECES-HELLO-766, PV-RECIPIENT-WRAP-11 | Valid archive; content readable only with the granted key |
+| Ciphers and key modes | 5.2, 5.3 | PV-UNIQUE-KEY-HELLO, PV-AES-GCM-HELLO; *case:* both ciphers in one archive and in one file, where a reused descriptor keeps its cipher across files and appends; *case:* unique keys with AES-256-GCM, with and without compression, where every repeated block is stored again | Read every file and range as written |
+| Version 1.1 pieces and grants | 1.3, 4.4.2, 5.3, 8.2 | CV-PIECES-HELLO-766, PV-RECIPIENT-WRAP-11; *case:* tag `02` in a version 1.0 archive; *case:* a reader granted only some of a file's piece keys | Valid archive; content readable only with every piece key; reject tag `02` in version 1.0; a partly granted file is unavailable |
+| Version 1.0 compatibility | 1.3, 5.3 | CV-BASE-EMPTY-146, CV-LOCAL-HELLO-279, PV-RECIPIENT-WRAP-01; *case:* an append and a reader grant on a version 1.0 archive keep header `0x0100` and the version 1.0 grant construction | Readable under the version 1.0 rules; the same grants open nothing under the version 1.1 rules, and the reverse |
+| Whole-file hash of joined parts (informative) | Appendix A | *case:* aligned parts, a short last part, empty parts, one part, and an empty file; *case:* a part that ends inside a 1024-byte chunk | The hash equals the BLAKE3 of the full read; no hash for the misaligned part |
