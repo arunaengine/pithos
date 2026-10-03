@@ -268,6 +268,7 @@ struct Group {
     response: u64,
     output: u64,
     working: u64,
+    last_span: Option<(u64, u64)>,
 }
 
 impl Group {
@@ -294,7 +295,12 @@ impl Group {
             .saturating_add(decrypted)
             .saturating_add(original)
             .saturating_add(partial);
-        self.response = self.response.saturating_add(framed);
+        // A block that repeats the span before it reuses the bytes already fetched.
+        let span = local_span(&block);
+        if span.is_none() || span != self.last_span {
+            self.response = self.response.saturating_add(framed);
+        }
+        self.last_span = span;
         self.output = self.output.saturating_add(output);
         self.working = self.working.max(working);
         self.blocks.push(block);
@@ -306,6 +312,13 @@ impl Group {
             *len = self.response;
         }
         request
+    }
+}
+
+fn local_span(block: &PlannedBlock) -> Option<(u64, u64)> {
+    match block.request() {
+        BlockRequest::Local { offset, len } => Some((offset, len)),
+        BlockRequest::External { .. } => None,
     }
 }
 
@@ -337,7 +350,17 @@ fn decode_group(
     blocks: &[PlannedBlock],
     stored: &[u8],
 ) -> Result<Vec<Vec<u8>>, PithosError> {
-    let expected = blocks.iter().map(PlannedBlock::framed_len).sum::<u64>();
+    let mut previous = None;
+    let expected = blocks
+        .iter()
+        .filter(|block| {
+            let span = local_span(block);
+            let repeat = span.is_some() && span == previous;
+            previous = span;
+            !repeat
+        })
+        .map(PlannedBlock::framed_len)
+        .sum::<u64>();
     if stored.len() as u64 != expected {
         return Err(PithosError::BlockSizeMismatch {
             expected,
@@ -346,9 +369,18 @@ fn decode_group(
     }
     let mut chunks = Vec::with_capacity(blocks.len());
     let mut rest = stored;
+    let mut last: Option<((u64, u64), &[u8])> = None;
     for block in blocks {
-        let (bytes, tail) = rest.split_at(block.framed_len() as usize);
-        rest = tail;
+        let span = local_span(block);
+        let bytes = match last {
+            Some((previous, bytes)) if span == Some(previous) => bytes,
+            _ => {
+                let (bytes, tail) = rest.split_at(block.framed_len() as usize);
+                rest = tail;
+                bytes
+            }
+        };
+        last = span.map(|span| (span, bytes));
         let mut plaintext = view.decode_block(block, bytes)?;
         let output = block.output();
         chunks.push(if output.start == 0 && output.end == plaintext.len() {
