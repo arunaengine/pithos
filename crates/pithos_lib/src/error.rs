@@ -91,6 +91,10 @@ pub enum PithosError {
     InvalidPieceRecord,
     #[error("the piece encoder holds written bytes that were not flushed")]
     UnflushedPieceBytes,
+    #[error("content offset {0} is not a multiple of 1024")]
+    InvalidContentOffset(u64),
+    #[error("piece content options must be set before any content is added")]
+    PieceContentStarted,
     #[error("archive metadata does not match the expected digest")]
     MetadataDigestMismatch,
     #[error("duplicate encoded recipient file id")]

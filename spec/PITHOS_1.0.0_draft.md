@@ -1197,6 +1197,16 @@ Directory. Because convergent block keys are equal for equal plaintext, a block
 that repeats in two parts needs only one effective descriptor. Unique-key blocks
 never repeat.
 
+**Whole-file hash of joined parts:** a writer that knows a part's absolute file
+offset (a multiple of 1024 bytes) may also keep the BLAKE3 chaining values of
+the aligned subtrees that cover that part. The joining step can merge them into
+the BLAKE3 hash of the whole file without any key. This works only when the
+recorded offsets match the actual part sizes. The result is only as trustworthy
+as the stored part records; a full read of the file confirms it. Chaining values
+are plaintext fingerprints, like convergent block hashes, so a writer that uses
+unique-key blocks should not keep them unless the owner allows it. This record
+is not part of the archive format.
+
 ## Appendix B. Conformance Examples and Vectors
 
 This appendix is informative. The cited sections remain authoritative. Complete

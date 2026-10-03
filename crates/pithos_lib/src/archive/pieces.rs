@@ -4,9 +4,12 @@
 //! piece key granted to the recipients. The resulting [`Piece`] holds no secret, so it can be
 //! stored and later joined by [`compose`] into a version 1.1 archive with one data file.
 
+use crate::archive::content_tree::{self, ContentTree, Subtree, TreeHasher};
 use crate::archive::path_validation::validate_entry;
 use crate::archive::types::{ArchivePath, Processing};
-use crate::archive::writer::{Chunking, EntryMetadata, ProcessingOptions, validate_block_size};
+use crate::archive::writer::{
+    BlockKeyMode, Chunking, EntryMetadata, ProcessingOptions, validate_block_size,
+};
 use crate::block;
 use crate::crypto::{self, FileKey, PublicKey};
 use crate::error::PithosError;
@@ -29,7 +32,8 @@ use x25519_dalek::{PublicKey as DalekPublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 const PIECE_MAGIC: &[u8; 8] = b"PITHPIEC";
-const PIECE_RECORD_VERSION: u8 = 1;
+/// Version 2 adds the optional content tree; version 1 records still decode.
+const PIECE_RECORD_VERSION: u8 = 2;
 const BLOCK_MARKER_LEN: u64 = 4;
 
 /// Location and size of one encoded block inside its piece.
@@ -54,6 +58,7 @@ pub struct Piece {
     pub(crate) sealed_list: Vec<u8>,
     pub(crate) sender: [u8; 32],
     pub(crate) grants: Vec<([u8; 32], Vec<u8>)>,
+    pub(crate) content: Option<ContentTree>,
 }
 
 /// Encodes the blocks of one piece. The caller appends every returned byte string, in order,
@@ -61,6 +66,11 @@ pub struct Piece {
 ///
 /// [`PieceEncoder::write`] and [`PieceEncoder::flush`] split the content into fixed-size blocks,
 /// which is the recommended use. [`PieceEncoder::push`] instead encodes caller-chosen blocks.
+///
+/// The encoder also records BLAKE3 subtree chaining values of the piece plaintext, so that
+/// [`Composition::content_hash`] can report the whole-file BLAKE3. They are plaintext
+/// fingerprints like convergent block hashes, so with [`BlockKeyMode::Unique`] they are off
+/// unless [`PieceEncoder::with_content_hash`] turns them on.
 pub struct PieceEncoder {
     key_id: u64,
     recipients: Vec<[u8; 32]>,
@@ -72,6 +82,8 @@ pub struct PieceEncoder {
     original_size: u64,
     block_size: usize,
     pending: Zeroizing<Vec<u8>>,
+    content_offset: u64,
+    tree: Option<TreeHasher>,
 }
 
 impl PieceEncoder {
@@ -111,7 +123,38 @@ impl PieceEncoder {
             original_size: 0,
             block_size: Chunking::DEFAULT_BLOCK_SIZE,
             pending: Zeroizing::new(Vec::new()),
+            content_offset: 0,
+            tree: (processing.key_mode() != BlockKeyMode::Unique).then(|| TreeHasher::new(0)),
         })
+    }
+
+    /// Sets the absolute file offset of this piece's first plaintext byte. The default is 0.
+    /// The offset must be a multiple of 1024, the BLAKE3 chunk length, and must be set before
+    /// any content is added.
+    pub fn with_content_offset(mut self, offset: u64) -> Result<Self, PithosError> {
+        self.ensure_no_content()?;
+        if !offset.is_multiple_of(blake3::CHUNK_LEN as u64) {
+            return Err(PithosError::InvalidContentOffset(offset));
+        }
+        self.content_offset = offset;
+        if self.tree.is_some() {
+            self.tree = Some(TreeHasher::new(offset));
+        }
+        Ok(self)
+    }
+
+    /// Turns the recorded subtree chaining values on or off before any content is added.
+    pub fn with_content_hash(mut self, record: bool) -> Result<Self, PithosError> {
+        self.ensure_no_content()?;
+        self.tree = record.then(|| TreeHasher::new(self.content_offset));
+        Ok(self)
+    }
+
+    fn ensure_no_content(&self) -> Result<(), PithosError> {
+        if self.original_size != 0 || !self.pending.is_empty() {
+            return Err(PithosError::PieceContentStarted);
+        }
+        Ok(())
     }
 
     /// Sets the block size used by [`PieceEncoder::write`]. The default is 4 MiB.
@@ -176,6 +219,10 @@ impl PieceEncoder {
         let encoded = block::encode(plaintext, self.flags, crypto::random_nonce())?;
         let original_size = plaintext.len() as u64;
         self.original_size = checked_add(self.original_size, original_size)?;
+        if let Some(tree) = &mut self.tree {
+            checked_add(self.content_offset, self.original_size)?;
+            tree.update(plaintext);
+        }
         self.entries
             .push((encoded.hash, *encoded.key.expose_for_protocol()));
         if !self.seen.insert(encoded.hash) {
@@ -239,6 +286,7 @@ impl PieceEncoder {
             sealed_list,
             sender: sender_public,
             grants,
+            content: self.tree.map(TreeHasher::finish),
         })
     }
 }
@@ -288,15 +336,36 @@ impl Piece {
             write_uleb(&mut bytes, wrapped.len() as u64);
             bytes.extend_from_slice(wrapped);
         }
+        let Some(tree) = &self.content else {
+            bytes.push(0);
+            return bytes;
+        };
+        bytes.push(1);
+        write_uleb(&mut bytes, tree.offset);
+        write_uleb(&mut bytes, tree.subtrees.len() as u64);
+        for subtree in &tree.subtrees {
+            write_uleb(&mut bytes, subtree.offset);
+            write_uleb(&mut bytes, subtree.len);
+            bytes.extend_from_slice(&subtree.value);
+        }
+        match tree.root {
+            Some(root) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&root);
+            }
+            None => bytes.push(0),
+        }
         bytes
     }
 
     /// Decodes a record from [`Piece::to_bytes`] and checks that its blocks are contiguous.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PithosError> {
         let mut reader = Cursor::new(bytes);
-        if read_vec(&mut reader, PIECE_MAGIC.len())? != PIECE_MAGIC
-            || read_vec(&mut reader, 1)? != [PIECE_RECORD_VERSION]
-        {
+        if read_vec(&mut reader, PIECE_MAGIC.len())? != PIECE_MAGIC {
+            return Err(PithosError::InvalidPieceRecord);
+        }
+        let version = read_vec(&mut reader, 1)?[0];
+        if !(1..=PIECE_RECORD_VERSION).contains(&version) {
             return Err(PithosError::InvalidPieceRecord);
         }
         let key_id = read_uleb(&mut reader)?;
@@ -331,6 +400,10 @@ impl Piece {
             let len = read_count(&mut reader, 1)?;
             grants.push((recipient, read_vec(&mut reader, len)?));
         }
+        let content = match version {
+            1 => None,
+            _ => read_content_tree(&mut reader, original_size)?,
+        };
         if offset != stored_len
             || reader.position() != bytes.len() as u64
             || key_id == 0
@@ -346,8 +419,44 @@ impl Piece {
             sealed_list,
             sender,
             grants,
+            content,
         })
     }
+}
+
+fn read_content_tree(
+    reader: &mut Cursor<&[u8]>,
+    original_size: u64,
+) -> Result<Option<ContentTree>, PithosError> {
+    match read_vec(reader, 1)?[0] {
+        0 => return Ok(None),
+        1 => {}
+        _ => return Err(PithosError::InvalidPieceRecord),
+    }
+    let offset = read_uleb(reader)?;
+    let count = read_count(reader, 2 + 32)?;
+    let mut subtrees = Vec::with_capacity(count);
+    for _ in 0..count {
+        subtrees.push(Subtree {
+            offset: read_uleb(reader)?,
+            len: read_uleb(reader)?,
+            value: read_array(reader)?,
+        });
+    }
+    let root = match read_vec(reader, 1)?[0] {
+        0 => None,
+        1 => Some(read_array(reader)?),
+        _ => return Err(PithosError::InvalidPieceRecord),
+    };
+    let tree = ContentTree {
+        offset,
+        subtrees,
+        root,
+    };
+    if !tree.is_valid(original_size) {
+        return Err(PithosError::InvalidPieceRecord);
+    }
+    Ok(Some(tree))
 }
 
 fn write_uleb(bytes: &mut Vec<u8>, value: u64) {
@@ -405,6 +514,7 @@ pub struct Composition {
     piece_offsets: Vec<u64>,
     directory: Vec<u8>,
     archive_len: u64,
+    content_hash: Option<[u8; 32]>,
 }
 
 impl Composition {
@@ -426,6 +536,16 @@ impl Composition {
 
     pub fn archive_len(&self) -> u64 {
         self.archive_len
+    }
+
+    /// The BLAKE3 hash of the whole composed file, or `None` when the pieces do not allow it.
+    ///
+    /// It is known when every piece recorded subtree chaining values, the recorded offsets
+    /// are the running sums of the piece sizes from 0, and each piece's values cover it
+    /// exactly. The value is only as trustworthy as the stored piece records, which hold no
+    /// proof of the plaintext. A full read of the composed file confirms it.
+    pub fn content_hash(&self) -> Option<[u8; 32]> {
+        self.content_hash
     }
 
     /// The digest [`crate::archive::Archive::metadata_digest`] reports for this archive.
@@ -537,6 +657,11 @@ pub fn compose(
     directory.blocks = blocks;
     let bytes = encode_complete_directory(&directory)?;
     Ok(Composition {
+        content_hash: content_tree::file_hash(
+            pieces
+                .iter()
+                .map(|piece| (piece.content.as_ref(), piece.original_size)),
+        ),
         piece_offsets,
         archive_len: checked_add(offset, bytes.len() as u64)?,
         directory: bytes,
@@ -566,6 +691,42 @@ mod tests {
             piece.blocks[0].flags = ProcessingFlags(flags);
             assert!(matches!(
                 Piece::from_bytes(&piece.to_bytes()),
+                Err(PithosError::InvalidPieceRecord)
+            ));
+        }
+    }
+
+    #[test]
+    fn version_1_records_decode_without_a_content_tree_and_bad_trees_are_rejected() {
+        let recipient = crate::crypto::PrivateKey::generate().public_key();
+        let processing = ProcessingOptions::new(true, 0).unwrap();
+        let encoder = PieceEncoder::new(1, vec![recipient], processing).unwrap();
+        let mut encoder = encoder.with_content_hash(false).unwrap();
+        encoder.push(b"version one block").unwrap();
+        let piece = encoder.finish().unwrap();
+        let mut version_1 = piece.to_bytes();
+        assert_eq!(version_1.pop(), Some(0));
+        version_1[PIECE_MAGIC.len()] = 1;
+        assert_eq!(Piece::from_bytes(&version_1).unwrap(), piece);
+
+        let encoder = PieceEncoder::new(1, vec![recipient], processing).unwrap();
+        let mut encoder = encoder.with_content_offset(2048).unwrap();
+        encoder.push(&[3; 3000]).unwrap();
+        let piece = encoder.finish().unwrap();
+        assert_eq!(Piece::from_bytes(&piece.to_bytes()).unwrap(), piece);
+        let changes: [fn(&mut ContentTree); 4] = [
+            |tree| tree.offset += 1024,
+            |tree| tree.subtrees[0].len += 1,
+            |tree| tree.root = Some([0; 32]),
+            |tree| {
+                tree.subtrees.pop();
+            },
+        ];
+        for change in changes {
+            let mut invalid = piece.clone();
+            change(invalid.content.as_mut().unwrap());
+            assert!(matches!(
+                Piece::from_bytes(&invalid.to_bytes()),
                 Err(PithosError::InvalidPieceRecord)
             ));
         }

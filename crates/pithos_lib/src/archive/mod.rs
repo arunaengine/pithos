@@ -6,6 +6,7 @@
 
 mod access;
 mod append;
+mod content_tree;
 mod index;
 mod path_validation;
 mod pieces;
