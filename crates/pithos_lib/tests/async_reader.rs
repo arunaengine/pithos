@@ -3,8 +3,10 @@ mod common;
 use common::keys::private_key;
 use futures_core::Stream;
 use pithos_lib::archive::{
-    AccessKeys, Archive, ArchivePath, ArchiveWriter, AsyncArchive, BlockingHook, Chunking,
-    EntryMetadata, OpenOptions, ProcessingOptions, ReadLimits, WriteOptions,
+    AccessKeys, Archive, ArchiveFeature, ArchivePath, ArchiveWriter, AsyncArchive,
+    AsyncExternalBlockResolver, BlockingHook, Chunking, EntryKind, EntryMetadata,
+    ExternalBlockAccessPolicy, ExternalLocation, OpenLimits, OpenOptions, ProcessingOptions,
+    ReadLimits, WriteOptions,
 };
 use pithos_lib::error::PithosError;
 use pithos_lib::source::{AsyncArchiveSource, MemorySource, SourceError};
@@ -467,4 +469,169 @@ fn a_tokio_blocking_pool_reads_like_the_sync_archive() {
         output
     });
     assert_eq!(output, expected);
+}
+
+const SPEC: &str = include_str!("../../../spec/PITHOS_1.0.0_draft.md");
+const INITIAL_TARGET: &str = "https://storage.test/initial";
+const REDIRECT_TARGET: &str = "https://storage.test/redirect";
+
+/// CV-LOCAL-HELLO-279 with its block moved to the opaque external location "x".
+fn external_hello() -> Vec<u8> {
+    let start = SPEC.find("#### CV-LOCAL-HELLO-279").unwrap();
+    let block = SPEC[start..].split("```text\n").nth(1).unwrap();
+    let mut bytes = block
+        .split("```")
+        .next()
+        .unwrap()
+        .lines()
+        .flat_map(|line| line.split_once(": ").unwrap().1.split_whitespace())
+        .map(|hex| u8::from_str_radix(hex, 16).unwrap())
+        .collect::<Vec<u8>>();
+    bytes.splice(143..=143, [1, 1, b'x']);
+    let footer = bytes.len() - 12;
+    let directory_len = (bytes.len() - 15) as u64;
+    bytes[footer..footer + 8].copy_from_slice(&directory_len.to_be_bytes());
+    let checksum = crc32fast::hash(&bytes[15..bytes.len() - 4]);
+    let crc = bytes.len() - 4;
+    bytes[crc..].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
+struct RecordingPolicy {
+    checks: Mutex<Vec<String>>,
+    denied: Option<&'static str>,
+}
+
+impl ExternalBlockAccessPolicy for RecordingPolicy {
+    fn allows(&self, target: &str) -> bool {
+        self.checks.lock().unwrap().push(target.to_owned());
+        self.denied != Some(target)
+    }
+}
+
+/// Follows one redirect and answers with a fixed response.
+struct RedirectingResolver {
+    response: Vec<u8>,
+    calls: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+impl AsyncExternalBlockResolver for RedirectingResolver {
+    async fn resolve(
+        &self,
+        policy: &dyn ExternalBlockAccessPolicy,
+        location: &ExternalLocation,
+        expected_len: u64,
+        max_response_size: u64,
+    ) -> Result<Vec<u8>, PithosError> {
+        assert_eq!(location.as_str(), "x");
+        for target in [INITIAL_TARGET, REDIRECT_TARGET] {
+            if !policy.allows(target) {
+                return Err(PithosError::ExternalBlockAccessDenied);
+            }
+        }
+        self.calls
+            .lock()
+            .unwrap()
+            .push((expected_len, max_response_size));
+        Ok(self.response.clone())
+    }
+}
+
+/// The result of one external read, the policy checks and the resolver calls.
+struct ExternalRead {
+    result: Result<Vec<u8>, PithosError>,
+    checks: Vec<String>,
+    calls: Vec<(u64, u64)>,
+}
+
+fn external_read(
+    response: &[u8],
+    denied: Option<&'static str>,
+    range: std::ops::Range<u64>,
+) -> ExternalRead {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let policy = Arc::new(RecordingPolicy {
+        checks: Mutex::new(Vec::new()),
+        denied,
+    });
+    let resolver = RedirectingResolver {
+        response: response.to_vec(),
+        calls: Arc::clone(&calls),
+    };
+    let options = OpenOptions::default()
+        .with_external_resolver(resolver)
+        .with_external_access_policy(policy.clone());
+    let (source, probe, _) = TestSource::new(&external_hello());
+    let archive = block_on(AsyncArchive::open(source, options, None)).unwrap();
+    let (output, error) = drain(archive.read_range("hello", range).unwrap(), &probe);
+    assert!(error.is_none() || output.is_empty());
+    let result = error.map_or(Ok(output), Err);
+    let checks = policy.checks.lock().unwrap().clone();
+    let calls = calls.lock().unwrap().clone();
+    ExternalRead {
+        result,
+        checks,
+        calls,
+    }
+}
+
+#[test]
+fn external_blocks_need_a_resolver_and_a_policy() {
+    let bytes = external_hello();
+    let (source, _, _) = TestSource::new(&bytes);
+    let disabled = block_on(AsyncArchive::open(source, OpenOptions::default(), None)).unwrap();
+    assert!(matches!(
+        disabled.entry("hello").unwrap().unwrap().kind,
+        EntryKind::File {
+            available: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        disabled.read_range("hello", 0..5),
+        Err(PithosError::UnsupportedFeature(
+            ArchiveFeature::ExternalStorage
+        ))
+    ));
+
+    let (source, _, _) = TestSource::new(&bytes);
+    let resolver = RedirectingResolver {
+        response: b"BLCKhello".to_vec(),
+        calls: Arc::default(),
+    };
+    let options = OpenOptions::default().with_external_resolver(resolver);
+    let without_policy = block_on(AsyncArchive::open(source, options, None)).unwrap();
+    assert!(without_policy.read_range("hello", 0..5).is_err());
+}
+
+#[test]
+fn external_blocks_are_read_through_the_async_resolver() {
+    let max_response_size = OpenLimits::default().max_stored_block_bytes + 4;
+    let ExternalRead {
+        result,
+        checks,
+        calls,
+    } = external_read(b"BLCKhello", None, 1..4);
+    assert_eq!(result.unwrap(), b"ell");
+    assert_eq!(checks, [INITIAL_TARGET, REDIRECT_TARGET]);
+    assert_eq!(calls, [(9, max_response_size)]);
+
+    let ExternalRead {
+        result,
+        checks,
+        calls,
+    } = external_read(b"BLCKhello", Some(REDIRECT_TARGET), 0..5);
+    assert!(matches!(
+        result,
+        Err(PithosError::ExternalBlockAccessDenied)
+    ));
+    assert_eq!(checks, [INITIAL_TARGET, REDIRECT_TARGET]);
+    assert!(calls.is_empty());
+
+    for response in [&b"BLCKhello!"[..], b"BLCKhell"] {
+        let ExternalRead { result, .. } = external_read(response, None, 0..5);
+        assert!(matches!(result, Err(PithosError::ExternalBlockFraming(_))));
+    }
+    let ExternalRead { result, .. } = external_read(b"BLCKjello", None, 0..5);
+    assert!(matches!(result, Err(PithosError::BlockHashMismatch { .. })));
 }
