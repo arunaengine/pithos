@@ -190,6 +190,9 @@ impl ArchiveIndex {
             return Ok(());
         }
         descriptors.retain(|(hash, _)| find_descriptor(&self.descriptors, *hash).is_none());
+        if descriptors.is_empty() {
+            return Ok(());
+        }
         self.descriptors
             .try_reserve_exact(descriptors.len())
             .map_err(|_| PithosError::AllocationFailed {
