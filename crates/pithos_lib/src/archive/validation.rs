@@ -143,7 +143,7 @@ fn entry_from_file_entry(path: &str, file_entry: &FileEntry) -> Result<Entry, Pi
                 blocks.iter().map(|(hash, _)| BlockHash(*hash)).collect(),
             ))
         }
-        BlockDataState::Encrypted(_) => ContentState::Unavailable,
+        BlockDataState::Encrypted(_) | BlockDataState::Pieces(_) => ContentState::Unavailable,
     };
     match file_entry.file_type {
         FileType::Data => Ok(Entry::File(ContentEntry {

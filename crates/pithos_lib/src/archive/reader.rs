@@ -57,7 +57,7 @@ impl DecodedDirectoryCounts {
             .iter()
             .map(|(_, _, file)| match &file.block_data {
                 BlockDataState::Decrypted(entries) => entries.len() as u64,
-                BlockDataState::Encrypted(_) => 0,
+                BlockDataState::Encrypted(_) | BlockDataState::Pieces(_) => 0,
             })
             .sum::<u64>();
         self.relationships += directory.relations.len() as u64;
@@ -347,6 +347,7 @@ where
             raw.push((directory, span));
         }
         raw.reverse();
+        let maximum_piece_key = validate_piece_keys(version, &raw)?;
 
         let mut first_grants = HashMap::new();
         for (directory, _) in &raw {
@@ -400,7 +401,8 @@ where
             max_relationships: options.limits.max_relationships,
             max_segments: options.limits.max_parent_directories.saturating_add(1),
         };
-        let index = build_effective_index(&segments, archive_len, index_limits)?;
+        let mut index = build_effective_index(&segments, archive_len, index_limits)?;
+        index.cover_piece_keys(maximum_piece_key.map(FileId));
         let content_availability = classify_content_availability(
             &index,
             options.external_resolver_supplied,
@@ -924,6 +926,39 @@ fn resolve_block_lists(
             BlockDataState::Decrypted(entries) => {
                 record_block_keys(access, file_id, entries);
             }
+            BlockDataState::Pieces(pieces) => {
+                if pieces
+                    .iter()
+                    .any(|piece| access.key(FileId(piece.key_id)).is_none())
+                {
+                    return Ok(());
+                }
+                let mut entries = Zeroizing::new(Vec::new());
+                for piece in pieces {
+                    let key = access
+                        .key(FileId(piece.key_id))
+                        .expect("every piece key was checked above");
+                    let mut decoded_limits = deserialization_limits(limits);
+                    decoded_limits.max_block_references = *remaining_block_references;
+                    let plaintext = crypto::open_file_block_list(key, &piece.sealed)?;
+                    let piece_entries =
+                        crate::format::file_entry::decode_decrypted_block_list_with_budget(
+                            &plaintext,
+                            &decoded_limits,
+                            remaining_block_references,
+                        )?;
+                    entries.try_reserve(piece_entries.len()).map_err(|_| {
+                        PithosError::AllocationFailed {
+                            field: "block list pieces",
+                            size: piece_entries.len() as u64,
+                        }
+                    })?;
+                    entries.extend_from_slice(&piece_entries);
+                }
+                crate::format::file_entry::validate_unique_block_references(&entries)?;
+                record_block_keys(access, file_id, &entries);
+                file.block_data = BlockDataState::Decrypted(entries);
+            }
             BlockDataState::Encrypted(bytes) => {
                 let Some(file_key) = access.key(file_id) else {
                     return Ok(());
@@ -942,6 +977,35 @@ fn resolve_block_lists(
         }
         Ok(())
     })
+}
+
+/// Checks the version 1.1 piece rules across the selected chain. Returns the largest piece
+/// key id, which new file ids must stay above.
+fn validate_piece_keys(
+    version: FormatVersion,
+    raw: &[(Directory, Span)],
+) -> Result<Option<u64>, PithosError> {
+    let mut file_ids = HashSet::new();
+    let mut piece_keys = HashSet::new();
+    for (directory, _) in raw {
+        for (id, _, file) in directory.files.iter() {
+            file_ids.insert(id);
+            if let BlockDataState::Pieces(pieces) = &file.block_data {
+                if version == FormatVersion::V1_0 {
+                    return Err(PithosError::UnsupportedBlockListPieces);
+                }
+                for piece in pieces {
+                    if !piece_keys.insert(piece.key_id) {
+                        return Err(PithosError::PieceKeyIdConflict(piece.key_id));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(conflict) = piece_keys.iter().find(|key_id| file_ids.contains(*key_id)) {
+        return Err(PithosError::PieceKeyIdConflict(*conflict));
+    }
+    Ok(piece_keys.into_iter().max())
 }
 
 fn record_block_keys(access: &mut ResolvedAccess, file_id: FileId, entries: &[BlockDataEntry]) {

@@ -1534,3 +1534,166 @@ fn unsupported_external_content_preflights_the_whole_file_and_adapters() {
 }
 use crate::adapters::crypt4gh;
 use crate::fs::extract;
+
+/// Splits the fixture's block list into pieces with the given key ids and grants the
+/// `granted` piece keys to recipient1 under the version 1.1 grant rules.
+fn split_into_pieces(path: &Path, key_ids: &[u64], granted: &[u64]) {
+    let file_key = recover_first_file_key(path);
+    rewrite_terminal_directory(path, |directory| {
+        let entry = directory.files.iter().next().unwrap().2.clone();
+        let BlockDataState::Encrypted(sealed) = &entry.block_data else {
+            panic!("fixture block list was not encrypted");
+        };
+        let plaintext = crypto::open_file_block_list(&file_key, sealed).unwrap();
+        let entries = crate::format::file_entry::decode_decrypted_block_list_with_budget(
+            &plaintext,
+            &DeserializationLimits::default(),
+            &mut u64::MAX.clone(),
+        )
+        .unwrap();
+        let chunk = entries.len().div_ceil(key_ids.len()).max(1);
+        let mut pieces = Vec::new();
+        let mut grants = Vec::new();
+        for (index, key_id) in key_ids.iter().enumerate() {
+            let start = (index * chunk).min(entries.len());
+            let end = ((index + 1) * chunk).min(entries.len());
+            let key = [index as u8 + 1; 32];
+            let mut list = Vec::new();
+            crate::format::file_entry::encode_decrypted_block_list(&entries[start..end], &mut list)
+                .unwrap();
+            let sealed = crypto::seal_file_block_list_with_nonce(
+                &FileKey::from_protocol(&key),
+                &list,
+                [index as u8; 12],
+            )
+            .unwrap();
+            pieces.push(crate::format::file_entry::BlockListPiece {
+                key_id: *key_id,
+                sealed,
+            });
+            if granted.contains(key_id) {
+                grants.push((*key_id, key));
+            }
+        }
+        directory
+            .files
+            .try_for_each_mut(|_, file| {
+                file.block_data = BlockDataState::Pieces(pieces.clone());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+
+        let sender = StaticSecret::from([9; 32]);
+        let sender_public = DalekPublicKey::from(&sender).to_bytes();
+        let recipient = public("recipient1").into_dalek_public_key().to_bytes();
+        let nonce = [6; 12];
+        let key = crypto::grant_wrapping_key(
+            crate::format::header::FormatVersion::V1_1,
+            crypto::derive_shared(sender.as_bytes(), &recipient).unwrap(),
+            &sender_public,
+            &recipient,
+            &nonce,
+        );
+        let mut records = Vec::new();
+        crate::format::encryption::encode_decrypted_recipient_list(&grants, &mut records).unwrap();
+        directory.encryption.insert(
+            sender_public,
+            EncryptionSection {
+                recipients: IndexMap::from_iter([(
+                    recipient,
+                    RecipientSection {
+                        recipient_data: RecipientData::Encrypted(
+                            crypto::wrap_recipient_list_with_nonce(&key, &records, nonce).unwrap(),
+                        ),
+                    },
+                )]),
+            },
+        );
+    });
+}
+
+fn pieces_fixture() -> (tempfile::TempDir, PathBuf, String) {
+    let content = "piece content ".repeat(300);
+    let (temporary, path) = fixture_with_options(
+        &content,
+        0,
+        true,
+        Some(CdcConfig::new(64, 256, 1024).unwrap()),
+    );
+    (temporary, path, content)
+}
+
+fn open_pieces(path: &Path) -> Result<Archive<MemorySource>, PithosError> {
+    Archive::open(
+        MemorySource::new(Arc::<[u8]>::from(std::fs::read(path).unwrap())),
+        OpenOptions::default().with_access_keys(AccessKeys::new().with_key(private("recipient1"))),
+    )
+}
+
+#[test]
+fn block_list_pieces_concatenate_in_stored_order() {
+    let (_temporary, path, content) = pieces_fixture();
+    split_into_pieces(&path, &[5, 6, 9], &[5, 6, 9]);
+    let mut output = Vec::new();
+    let archive = open_pieces(&path).unwrap();
+    archive.copy_to("data", &mut output).unwrap();
+    assert_eq!(output, content.as_bytes());
+    // New file ids must stay above every piece key id.
+    assert_eq!(
+        archive.into_append_snapshot().maximum_id(),
+        Some(crate::archive::FileId(9))
+    );
+}
+
+#[test]
+fn a_missing_piece_key_leaves_the_content_unavailable() {
+    let (_temporary, path, _) = pieces_fixture();
+    split_into_pieces(&path, &[5, 6], &[5]);
+    let archive = open_pieces(&path).unwrap();
+    assert!(matches!(
+        archive.entry("data").unwrap().unwrap().kind,
+        EntryKind::File {
+            available: false,
+            ..
+        }
+    ));
+    assert!(archive.copy_to("data", &mut Vec::new()).is_err());
+}
+
+#[test]
+fn piece_rules_reject_version_1_0_archives_and_shared_key_ids() {
+    let (_temporary, path, _) = pieces_fixture();
+    split_into_pieces(&path, &[5, 6], &[5, 6]);
+    let mut legacy = std::fs::read(&path).unwrap();
+    legacy[5] = 0x00;
+    assert!(matches!(
+        Archive::open(MemorySource::new(legacy), OpenOptions::default()),
+        Err(PithosError::UnsupportedBlockListPieces)
+    ));
+
+    let (_temporary, path, _) = pieces_fixture();
+    split_into_pieces(&path, &[0, 6], &[0, 6]);
+    assert!(matches!(
+        open_pieces(&path),
+        Err(PithosError::PieceKeyIdConflict(0))
+    ));
+}
+
+#[test]
+fn a_tampered_piece_fails_before_any_content_is_indexed() {
+    let (_temporary, path, _) = pieces_fixture();
+    split_into_pieces(&path, &[5, 6], &[5, 6]);
+    rewrite_terminal_directory(&path, |directory| {
+        directory
+            .files
+            .try_for_each_mut(|_, file| {
+                if let BlockDataState::Pieces(pieces) = &mut file.block_data {
+                    let last = pieces[1].sealed.len() - 1;
+                    pieces[1].sealed[last] ^= 1;
+                }
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+    });
+    assert!(matches!(open_pieces(&path), Err(PithosError::Crypt(_))));
+}

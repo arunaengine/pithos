@@ -78,6 +78,11 @@ impl ArchiveIndex {
         self.maximum_id
     }
 
+    /// Piece key ids share the file id space, so new file ids must stay above them.
+    pub(crate) fn cover_piece_keys(&mut self, maximum_piece_key: Option<FileId>) {
+        self.maximum_id = self.maximum_id.max(maximum_piece_key);
+    }
+
     /// Transfers only the effective state needed to form an append snapshot.
     pub(crate) fn into_append_snapshot_parts(
         self,

@@ -29,6 +29,15 @@ pub type BlockDataEntry = ([u8; 32], [u8; 32]);
 pub(crate) enum BlockDataState {
     Encrypted(Vec<u8>),
     Decrypted(Zeroizing<Vec<BlockDataEntry>>),
+    /// Version 1.1: a block list sealed in independent pieces, concatenated in stored order.
+    Pieces(Vec<BlockListPiece>),
+}
+
+/// One sealed part of a file's block list, opened with the key granted for `key_id`.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct BlockListPiece {
+    pub(crate) key_id: u64,
+    pub(crate) sealed: Vec<u8>,
 }
 
 impl std::fmt::Debug for BlockDataState {
@@ -42,6 +51,10 @@ impl std::fmt::Debug for BlockDataState {
                 .debug_tuple("Decrypted")
                 .field(&format_args!("{} block keys [REDACTED]", entries.len()))
                 .finish(),
+            Self::Pieces(pieces) => formatter
+                .debug_tuple("Pieces")
+                .field(&format_args!("{} pieces", pieces.len()))
+                .finish(),
         }
     }
 }
@@ -53,7 +66,7 @@ impl BlockDataState {
         nonce: [u8; 12],
     ) -> Result<(), PithosError> {
         match &self {
-            BlockDataState::Encrypted(_) => {
+            BlockDataState::Encrypted(_) | BlockDataState::Pieces(_) => {
                 return Err(PithosError::InvalidBlockDataState(
                     "Block already encrypted.".to_string(),
                 ));
@@ -103,6 +116,7 @@ impl Display for FileEntry {
         match &self.block_data {
             BlockDataState::Encrypted(_) => f.write_str("Blocks:      Encrypted\n")?,
             BlockDataState::Decrypted(_) => f.write_str("Blocks:      Decrypted\n")?,
+            BlockDataState::Pieces(_) => f.write_str("Blocks:      Encrypted pieces\n")?,
         }
         f.write_str(&format!("{:<12} {}\n", "Created:", self.created))?;
         f.write_str(&format!("{:<12} {}\n", "Modified:", self.modified))?;
@@ -172,6 +186,15 @@ fn encode_block_data<W: Write>(
             writer.write_all(&[1])?;
             encode_decrypted_block_list(entries, writer)?;
         }
+        BlockDataState::Pieces(pieces) => {
+            writer.write_all(&[2])?;
+            write_len_prefix(writer, pieces.len())?;
+            for piece in pieces {
+                writer.write_varint(piece.key_id)?;
+                write_len_prefix(writer, piece.sealed.len())?;
+                writer.write_all(&piece.sealed)?;
+            }
+        }
     }
     Ok(())
 }
@@ -203,8 +226,39 @@ fn decode_block_data<R: Read>(
                 remaining_block_references,
             )?,
         )),
+        2 => decode_pieces(reader, limits).map(BlockDataState::Pieces),
         value => Err(DeserializationError::InvalidEnumValue(value)),
     }
+}
+
+fn decode_pieces<R: Read>(
+    reader: &mut R,
+    limits: &DeserializationLimits,
+) -> Result<Vec<BlockListPiece>, DeserializationError> {
+    let count = bounded_len(
+        reader.read_varint::<u64>()?,
+        limits.max_collection_entries,
+        "block list pieces",
+    )?;
+    let mut pieces: Vec<BlockListPiece> = Vec::new();
+    reserve(&mut pieces, count, "block list pieces")?;
+    for _ in 0..count {
+        let key_id = reader.read_varint::<u64>()?;
+        if pieces.last().is_some_and(|last| last.key_id >= key_id) {
+            return Err(DeserializationError::UnorderedPieceKeys);
+        }
+        let len = bounded_len(
+            reader.read_varint::<u64>()?,
+            limits.max_opaque_bytes,
+            "sealed block list piece",
+        )?;
+        let mut sealed = Vec::new();
+        reserve(&mut sealed, len, "sealed block list piece")?;
+        sealed.resize(len, 0);
+        reader.read_exact(&mut sealed)?;
+        pieces.push(BlockListPiece { key_id, sealed });
+    }
+    Ok(pieces)
 }
 
 pub(crate) fn encode_file_entry<W: Write>(
@@ -335,6 +389,44 @@ pub(crate) fn decode_decrypted_block_list_with_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_list_pieces_round_trip_and_require_increasing_key_ids() {
+        let limits = DeserializationLimits::default();
+        let pieces = BlockDataState::Pieces(vec![
+            BlockListPiece {
+                key_id: 1,
+                sealed: vec![7; 28],
+            },
+            BlockListPiece {
+                key_id: 300,
+                sealed: vec![8; 30],
+            },
+        ]);
+        let mut encoded = Vec::new();
+        encode_block_data(&pieces, &mut encoded).unwrap();
+        assert_eq!(&encoded[..3], &[2, 2, 1]);
+        let mut budget = limits.max_block_references;
+        assert_eq!(
+            decode_block_data(&mut encoded.as_slice(), &limits, &mut budget).unwrap(),
+            pieces
+        );
+
+        for key_ids in [[3, 3], [4, 3]] {
+            let mut unordered = vec![2, 2];
+            for key_id in key_ids {
+                unordered.extend_from_slice(&[key_id, 1, 0]);
+            }
+            assert!(matches!(
+                decode_block_data(&mut unordered.as_slice(), &limits, &mut budget),
+                Err(DeserializationError::UnorderedPieceKeys)
+            ));
+        }
+        assert!(matches!(
+            decode_block_data(&mut [3u8, 0].as_slice(), &limits, &mut budget),
+            Err(DeserializationError::InvalidEnumValue(3))
+        ));
+    }
 
     #[test]
     fn authenticated_lists_require_exact_consumption_and_unique_keys() {

@@ -66,6 +66,9 @@ Version 1.1 differs from version 1.0 only in these points:
 1. The header version is `0x0101` (Section 4.1).
 2. A recipient grant's wrapping key is derived with HKDF-SHA256 instead of using
    the raw X25519 shared secret (Section 5.3).
+3. A file's block list may be sealed in independent pieces, each with its own
+   key (BlockDataState tag `02`, Section 4.4.2). Piece key IDs share the file ID
+   space (Section 4.3.2).
 
 Readers MUST support both versions. Writers MUST create new archives as version
 1.1. An append MUST follow the version of the archive it extends, so appending
@@ -399,7 +402,8 @@ no deletion, replacement, or tombstone.
 
 File IDs and paths MUST be unique across the selected chain. Writers assign file ID 0
 to the first file and assign each later file ID as the current maximum ID plus
-1. Readers MUST accept unused file-ID gaps. A rename adds a file record with a
+1, where the maximum also covers every piece key ID (Section 4.4.2). Readers MUST
+accept unused file-ID gaps. A rename adds a file record with a
 new file ID and path; the old record remains in the effective archive.
 
 A repeated block hash in one Directory is invalid. Across Directories in the
@@ -515,12 +519,14 @@ through `ff`.
 
 #### 4.4.2 Block Data State
 
-BlockDataState stores either encrypted file block data or a decrypted block list.
+BlockDataState stores encrypted file block data, a decrypted block list, or, in
+version 1.1, a block list sealed in pieces.
 
 ```rust
 pub enum BlockDataState {
     Encrypted(Vec<u8>),             // nonce || ciphertext || tag
     Decrypted(Vec<([u8; 32], [u8; 32])>), // Block hash and block key
+    Pieces(Vec<(u64, Vec<u8>)>),    // Piece key ID and nonce || ciphertext || tag
 }
 ```
 
@@ -530,10 +536,22 @@ pub enum BlockDataState {
 | --- | --- | --- |
 | `00` | `Encrypted` | Vector of bytes |
 | `01` | `Decrypted` | Vector of tuples, each `block_hash[32] || block_key[32]` |
+| `02` | `Pieces` | Vector of items, each ULEB128 `key_id` followed by a vector of bytes |
 
 Readers MUST reject unknown tags. A decrypted block list is a ULEB128 count
 followed by that many `block_hash[32] || block_key[32]` pairs. Block-list
 identity, reuse, and validation are defined in Section 5.2.
+
+Tag `02` is valid only in version 1.1 archives; readers MUST reject it in a
+version 1.0 archive. Each piece decrypts, with the piece key granted for its
+`key_id` (Section 5.3), to a decrypted block list in the encoding above. The
+file's block list is the concatenation of the piece lists in stored order. The
+vector MAY be empty, which is an empty block list. Within one file, `key_id`
+values MUST be strictly increasing. A piece key ID MUST NOT equal any file ID in
+the effective archive and MUST NOT appear in more than one piece of the
+effective archive. Readers MUST reject an archive that violates these rules.
+Pieces let a writer seal parts of one file independently and join them later
+without opening any of them.
 
 #### 4.4.3 File Entry
 
@@ -585,8 +603,8 @@ of the FileEntry body.
 | `file_type` | `block_data` | `file_size` | `symlink_target` |
 | --- | --- | --- | --- |
 | `Directory` | MUST be `Decrypted` with an empty list | MUST be `0` | MUST be absent (`00`) |
-| `Data` | Either state is permitted | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
-| `Metadata` | Either state is permitted | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
+| `Data` | Any state permitted by the archive version | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
+| `Metadata` | Any state permitted by the archive version | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
 | `Symlink` | MUST be `Decrypted` with an empty list | MUST be `0` | MUST be present (`01`) |
 
 Readers MUST reject a combination that violates this table. For encrypted block
@@ -736,7 +754,9 @@ pub enum RecipientData {
 Readers MUST reject unknown tags. A decrypted recipient-data list is a ULEB128
 count followed by that many ULEB128 `file_id` and `file_key[32]` pairs. A
 repeated file ID is valid only when it has the same file key; readers MUST
-reject a conflicting duplicate file ID and file key.
+reject a conflicting duplicate file ID and file key. In version 1.1 the
+`file_id` field may also hold a piece key ID; its `file_key` is then that
+piece's key.
 
 ## 5. Content Processing
 
@@ -751,7 +771,9 @@ The block hash is the full 32-byte default unkeyed BLAKE3 digest of the exact
 plaintext chunk before compression or encryption. It is a block's only
 identity. The Directory `blocks` vector is keyed by block hash, and each file's
 block list is an ordered sequence of `(block_hash, block_key)` pairs. That order
-reconstructs the file.
+reconstructs the file. For a file sealed in pieces, the sequence is the
+concatenation of its piece lists, and every rule in this section applies to that
+whole sequence.
 
 Every block hash referenced by a file MUST resolve to exactly one effective
 descriptor after the selected chain is merged. A repeated hash in one file is
@@ -801,6 +823,8 @@ label or length prefix is included. A block payload with encryption enabled is
 encrypted with its block key.
 
 A file key is 32 random bytes. It encrypts the decrypted block list for a file.
+In version 1.1, a piece key is 32 random bytes and encrypts the decrypted block
+list of one piece in the same way.
 For each recipient record, the shared secret is the raw 32-byte X25519 shared
 secret between the sender private key and recipient public key. The wrapping key
 encrypts the decrypted recipient list with ChaCha20-Poly1305:
@@ -897,6 +921,11 @@ can only collide within one grant. Appends to version 1.0 archives keep the
 version 1.0 construction. The plaintext-derived Directory block hash exposes
 block equality, and equal plaintext also derives the same convergent block key.
 
+Pieces are joined in the order the Directory stores them. Their strictly
+increasing key IDs and the `file_size` check detect some reordering and missing
+pieces, but without authenticated metadata a modified Directory can still drop or
+reorder whole pieces together with `file_size`.
+
 Readers must verify each block as required by Section 5.2 before releasing its
 output. Networked external resolution can expose a caller to unsafe targets and
 resource exhaustion; Section 4.2.6 defines the required resolver safeguards.
@@ -923,7 +952,7 @@ negotiation record.
 | --- | --- |
 | Block compression | ProcessingFlags compression bits are `1` through `7` |
 | Block encryption | ProcessingFlags encryption bit is `1` |
-| Encrypted block lists | BlockDataState tag is `00` (`Encrypted`) |
+| Encrypted block lists | BlockDataState tag is `00` (`Encrypted`) or, in version 1.1, `02` (`Pieces`) |
 | Encrypted recipient lists | RecipientData tag is `00` (`Encrypted`) |
 | External storage | BlockLocation tag is `01` (`External`) |
 
@@ -953,8 +982,9 @@ uncompressed or unencrypted bytes.
 | Combined: compression and encryption, at either location | Listed | Readable only when every indicated capability is supported; otherwise unavailable |
 
 For the table, an encrypted BlockDataState requires encrypted-block-list
-capability, and an encrypted RecipientData required to obtain its file key
-requires encrypted-recipient-list capability. A content read that needs either
+capability, and an encrypted RecipientData required to obtain its file key or
+piece keys requires encrypted-recipient-list capability. Content sealed in
+pieces is unavailable until the key of every piece is available. A content read that needs either
 unsupported list form is unavailable even when its block flags themselves are
 otherwise supported.
 

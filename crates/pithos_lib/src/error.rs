@@ -83,6 +83,10 @@ pub enum PithosError {
     DuplicateRecipientKey,
     #[error("duplicate encoded block reference")]
     DuplicateBlockReference,
+    #[error("block list pieces require format version 1.1")]
+    UnsupportedBlockListPieces,
+    #[error("block list piece key id {0} is already used by a file or another piece")]
+    PieceKeyIdConflict(u64),
     #[error("duplicate encoded recipient file id")]
     DuplicateRecipientFileId,
     #[error("reserved processing bits are set: {0:#04x}")]

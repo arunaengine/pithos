@@ -24,6 +24,8 @@ pub enum DeserializationError {
     DuplicateBlockReference,
     #[error("duplicate encoded recipient file id")]
     DuplicateRecipientFileId,
+    #[error("block list piece key ids are not strictly increasing")]
+    UnorderedPieceKeys,
     #[error("{field} exceeds limit {limit}: {actual}")]
     LimitExceeded {
         field: &'static str,
