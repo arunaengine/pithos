@@ -4,7 +4,7 @@
 
 ## Installation
 
-Add the crate to an application using Rust 1.88 or newer:
+Add the crate to an application using Rust 1.89 or newer:
 
 ```toml
 [dependencies]

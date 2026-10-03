@@ -69,7 +69,7 @@ On the baseline revision, save each Criterion baseline:
 
 ```bash
 for bench in archive_path block_pipeline archive_io append adapters; do
-    cargo +1.88.0 bench --locked -p pithos_lib --bench "$bench" -- --save-baseline before
+    cargo +1.89.0 bench --locked -p pithos_lib --bench "$bench" -- --save-baseline before
 done
 ```
 
@@ -77,7 +77,7 @@ Then switch to the candidate revision and compare against it:
 
 ```bash
 for bench in archive_path block_pipeline archive_io append adapters; do
-    cargo +1.88.0 bench --locked -p pithos_lib --bench "$bench" -- --baseline before
+    cargo +1.89.0 bench --locked -p pithos_lib --bench "$bench" -- --baseline before
 done
 ```
 
