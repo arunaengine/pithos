@@ -138,9 +138,10 @@ fn patch_flags(bytes: &mut [u8], hash: [u8; 32], flags: u8) {
     refresh_crc(bytes);
 }
 
-/// Encrypted grant ranges of the terminal directory, found by walking its encoded form
-/// (Section 4.3).
+/// Descriptor flags and encrypted grant ranges of the terminal directory, found by walking
+/// its encoded form (Section 4.3).
 struct Layout {
+    flags: Vec<u8>,
     grants: Vec<std::ops::Range<usize>>,
 }
 
@@ -183,11 +184,13 @@ fn layout(bytes: &[u8]) -> Layout {
         }
         skip_option(&mut at);
     }
+    let mut flags = Vec::new();
     for _ in 0..read_uleb(bytes, &mut at) {
         at += 32;
         for _ in 0..3 {
             read_uleb(bytes, &mut at);
         }
+        flags.push(bytes[at]);
         at += 1;
         skip_option(&mut at);
     }
@@ -213,7 +216,7 @@ fn layout(bytes: &[u8]) -> Layout {
         }
     }
     assert_eq!(at + 12, bytes.len(), "the walk must end at the footer");
-    Layout { grants }
+    Layout { flags, grants }
 }
 
 fn refresh_crc(bytes: &mut [u8]) {
@@ -346,12 +349,31 @@ fn unique_keys_with_aes_store_every_block_and_read_back() {
     assert!(one.len() >= convergent.len() + 2 * STORED_BLOCK);
     assert!(two.len() >= one.len() + 4 * STORED_BLOCK + short_block);
 
+    // Compressible blocks keep compression level 3 next to the unique-key and AES bits.
+    let text = |seed: u8, len: usize| {
+        let phrase = b"pithos stores compressible text. ";
+        (0..len)
+            .map(|index| phrase[index % phrase.len()] ^ seed)
+            .collect::<Vec<_>>()
+    };
+    let compressible = [
+        text(1, BLOCK),
+        text(1, BLOCK),
+        text(2, BLOCK),
+        text(1, BLOCK),
+        text(3, 100),
+    ]
+    .concat();
     let compressed = unique(aes(encrypted(3)));
-    let three = write_archive(&[("first", compressed, &file), ("second", processing, &file)]);
-    for bytes in [two, three] {
+    let three = write_archive(&[
+        ("first", compressed, &compressible),
+        ("second", compressed, &compressible),
+    ]);
+    assert_eq!(layout(&three).flags, [0x3b; 10]);
+    for (bytes, file) in [(two, &file), (three, &compressible)] {
         let archive = open(bytes, keys(&["recipient1"]));
         for path in ["first", "second"] {
-            assert_eq!(read(&archive, path), file);
+            assert_eq!(read(&archive, path), *file);
             let mut range = Vec::new();
             archive.copy_range_to(path, 1000..3100, &mut range).unwrap();
             assert_eq!(range, file[1000..3100]);
