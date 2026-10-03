@@ -9,7 +9,7 @@
 
 This document specifies the Pithos file format using the key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
 
-Pithos is an append-only archive format designed for efficient storage and sharing of scientific data. It combines content-defined deduplication, convergent encryption, and flexible metadata support optimized for object storage systems.
+Pithos is an append-only archive format designed for efficient storage and sharing of scientific data. It combines block-level deduplication, convergent encryption, and flexible metadata support optimized for object storage systems.
 
 **Illustrative data model.** Rust declarations in this document illustrate the
 data model only; implementations may use different declarations. Normative
@@ -83,7 +83,7 @@ to a version 1.0 archive uses the version 1.0 rules.
 ## 2. Core Design Principles
 
 1. **Append-only architecture**: New data and metadata MUST be appended, never modifying existing content
-2. **Content-addressed storage**: All blocks MUST be identified by Blake3 hashes enabling deduplication
+2. **Content-addressed storage**: All blocks MUST be identified by BLAKE3 block hashes; convergent blocks enable deduplication
 3. **Encrypted recipient grants**: Encrypted recipient data protects its file-key
    grants from parties that cannot decrypt it
 4. **Flexible metadata**: Metadata MUST be stored as regular files with special type markers
@@ -421,8 +421,8 @@ Normal reading MUST reject trailing bytes, truncation, underflow, a false marker
 Each Directory contains the entries introduced by its segment. To construct the
 effective archive, readers merge the selected chain from the base Directory to
 the terminal Directory. An append adds file entries, block
-descriptors, relationship definitions, and recipient grants. Version 1.0 has
-no deletion, replacement, or tombstone.
+descriptors, relationship definitions, and recipient grants. Neither version
+has deletion, replacement, or tombstone.
 
 File IDs and paths MUST be unique across the selected chain. Writers assign file ID 0
 to the first file and assign each later file ID as the current maximum ID plus
@@ -621,7 +621,7 @@ The directory file sequence is a vector. Each record is encoded as follows:
 | FileEntry body field | Bytes stored in the file |
 | --- | --- |
 | `file_type` | FileType encoded form above |
-| `block_data` | Tag `00` and byte vector, or tag `01` and vector of `block_hash[32] || block_key[32]` tuples |
+| `block_data` | Tag `00` and byte vector; tag `01` and vector of `block_hash[32] || block_key[32]` tuples; or, in version 1.1, tag `02` and vector of ULEB128 `key_id` plus byte-vector items (Section 4.4.2) |
 | `created` | ULEB128 `u64` |
 | `modified` | ULEB128 `u64` |
 | `file_size` | ULEB128 `u64` |
@@ -638,14 +638,15 @@ of the FileEntry body.
 | `file_type` | `block_data` | `file_size` | `symlink_target` |
 | --- | --- | --- | --- |
 | `Directory` | MUST be `Decrypted` with an empty list | MUST be `0` | MUST be absent (`00`) |
-| `Data` | Any state permitted by the archive version | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
-| `Metadata` | Any state permitted by the archive version | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
+| `Data` | `Encrypted` or `Decrypted`; in version 1.1 also `Pieces` | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
+| `Metadata` | `Encrypted` or `Decrypted`; in version 1.1 also `Pieces` | MUST equal the sum of referenced effective descriptors' `original_size` values when the block list is available | MUST be absent (`00`) |
 | `Symlink` | MUST be `Decrypted` with an empty list | MUST be `0` | MUST be present (`01`) |
 
 Readers MUST reject a combination that violates this table. For encrypted block
 lists, the content-size validation for `Data` and `Metadata` occurs once the
 block list is available; until then, the content is unavailable as specified in
-Section 8.2.
+Section 8.2. A block list sealed in pieces is available once every piece is
+decrypted.
 
 `permissions` stores the low 12 bits of a POSIX mode, in the range
 `0o0000..=0o7777`; file-type bits are not stored. Readers MUST reject a value
@@ -858,13 +859,16 @@ until its required transforms, size, and hash have all been verified.
 | Repetition in one file | `a: [(H, K), (H, K)]` | Valid. `a` reconstructs as the plaintext for `H` followed by itself. |
 | Conflicting key | `a: [(H, K), (H, L)]` | Invalid. The file is rejected. |
 | Later-segment size conflict | Base Directory has `H` with `original_size: 4`; an appended Directory has `H` with `original_size: 5` | Invalid. The appended Directory is rejected; no effective descriptor is selected from it. |
+| Repetition across pieces | `a` sealed in pieces `[(H, K)]` and `[(H, K)]` | Valid. The whole sequence is `[(H, K), (H, K)]`. |
+| Conflicting key across pieces | `a` sealed in pieces `[(H, K)]` and `[(H, L)]` | Invalid. The rule applies to the whole sequence; the file is rejected. |
+| Unique keys and equal plaintext | `a: [(H, K), (J, L)]`; both blocks set bit 4, have equal plaintext, and have random keys `K` and `L` | Valid. `H` and `J` differ because each is keyed by its own block key; each has its own descriptor. |
 
 ### 5.3 Convergent Encryption
 
 Encryption is optional. An implementation that supports encryption MUST use
 X25519, SHAKE256, and ChaCha20-Poly1305 as specified here. Version 1.1 adds
-BLAKE3 key derivation and, for blocks that set ProcessingFlags bit 5,
-AES-256-GCM.
+HKDF-SHA256 for recipient grants, BLAKE3 key derivation and, for blocks that set
+ProcessingFlags bit 5, AES-256-GCM.
 
 All encryption keys are 32 bytes. ChaCha20-Poly1305 and AES-256-GCM each use a
 12-byte nonce and produce a 16-byte authentication tag. Every encrypted value is stored as
@@ -960,7 +964,7 @@ A writer that stores the plaintext payload rather than compressed data MUST
 encode compression value `0`.
 
 Conforming encoders need not produce byte-identical Zstandard output. Appendix B
-will provide decode-direction vectors containing stored compressed bytes,
+provides decode-direction vectors containing stored compressed bytes,
 `original_size`, the expected plaintext, and its expected 32-byte BLAKE3 hash.
 Those vectors MUST decode to the expected plaintext with different supported
 Zstandard versions.
@@ -981,12 +985,28 @@ the number of blocks.
 
 ### 6.2 Writing Operations
 
-1. Write file header
+1. Write the file header: version 1.1 for a new archive. An append writes no
+   header and keeps the version of the archive it extends (Section 1.3).
 2. Process files in correct directory order
 3. Split content into blocks (fixed-size or content-defined)
-4. Deduplicate blocks by hash (unique-key blocks never repeat a hash)
-5. Write a directory, including its encryption sections when present
-6. Validate complete structure
+4. Choose the ProcessingFlags of each new block. In version 1.1 an encrypted
+   block MAY also set bit 4 (unique key) or bit 5 (AES-256-GCM), or both. An
+   append to a version 1.0 archive MUST NOT set either bit and SHOULD reject
+   such a request before writing any bytes.
+5. Deduplicate convergent blocks by hash. A reused descriptor keeps its own
+   flags, including its cipher. Unique-key blocks are never deduplicated.
+6. Store each file's block list decrypted, encrypted under a file key, or, in
+   version 1.1, sealed in pieces under piece keys (Section 4.4.2).
+7. Write a directory, including its encryption sections when present. A
+   recipient needs a grant for the file key or for every piece key of each file
+   it may read (Section 4.5.3).
+8. Validate complete structure
+
+A version 1.1 writer MAY also join independently written pieces without their
+keys: it writes the header, the stored blocks of every piece in order, and one
+Directory. That Directory has one file record whose `Pieces` state lists the
+sealed piece lists in order, one descriptor for each distinct block hash, and
+the unchanged piece grants (Appendix A).
 
 ### 6.3 Directory Tree Operations
 
@@ -1001,7 +1021,7 @@ When archiving directory trees:
 Directory CRC-32 detects accidental corruption of the serialized Directory bytes
 it covers; it is not authentication. An application that keeps the metadata
 digest (Section 4.3.4) in trusted storage gains metadata integrity for its own
-later reads; the digest does not authenticate archive origin to anyone else. Pithos 1.0 provides no archive-wide origin
+later reads; the digest does not authenticate archive origin to anyone else. Neither version provides archive-wide origin
 authentication or metadata integrity: an unauthenticated Directory can replace
 both a block hash and its referenced content. AEAD authenticates each encrypted
 value's ciphertext, but its empty AAD does not bind that value to its surrounding
@@ -1105,19 +1125,19 @@ uncompressed or unencrypted bytes.
 | Unique-key local: local, encryption `1`, bit 4 `1` | Listed | Readable only with block-encryption and unique-block-key capability and any encrypted-list capability needed to obtain its block key; otherwise unavailable |
 | AES-256-GCM local: local, encryption `1`, bit 5 `1` | Listed | Readable only with block-encryption and AES-256-GCM capability and any encrypted-list capability needed to obtain its block key; otherwise unavailable |
 | External: BlockLocation `External` | Listed | Readable only with external-storage capability and every capability required by its flags and data states; otherwise unavailable |
-| Combined: compression and encryption, at either location | Listed | Readable only when every indicated capability is supported; otherwise unavailable |
+| Combined: any combination of compression, encryption, unique key, and AES-256-GCM, at either location | Listed | Readable only when every indicated capability is supported; otherwise unavailable |
 
-For the table, an encrypted BlockDataState requires encrypted-block-list
-capability, and an encrypted RecipientData required to obtain its file key or
-piece keys requires encrypted-recipient-list capability. Content sealed in
-pieces is unavailable until the key of every piece is available. A content read that needs either
-unsupported list form is unavailable even when its block flags themselves are
-otherwise supported.
+For the table, an encrypted BlockDataState, which includes a `Pieces` state,
+requires encrypted-block-list capability, and an encrypted RecipientData
+required to obtain its file key or piece keys requires encrypted-recipient-list
+capability. Content sealed in pieces is unavailable until the key of every piece
+is available. A content read that needs either unsupported list form is
+unavailable even when its block flags themselves are otherwise supported.
 
 Readers MUST reject an unsupported header version and any unknown tag rather
 than list the archive, because the structure of such input is not known.
 
-Pithos 1.0 intentionally permits decrypted block and recipient list variants
+Both versions intentionally permit decrypted block and recipient list variants
 and an empty Directory `encryption` vector.
 
 ### 8.3 Platform-Specific Considerations
@@ -1143,10 +1163,16 @@ Non-POSIX platforms MAY retain them as metadata without an ACL mapping.
 ## 9. Future Extensions
 
 The format reserves space for future extensions:
+- Header versions other than `0x0100` and `0x0101`
 - FileType values 4-255
 - ProcessingFlags bits 6-7
+- Relationship IDs 10 through 999, for future standard relationships
 - Custom relationship types starting at 1000
 - BlockDataState tags `03` through `ff`
+- BlockLocation and RecipientData tags `02` through `ff`
+
+Custom relationship types are valid as defined in Section 4.4.4. Readers of this
+version MUST reject every other value listed here (Sections 3.1 and 8.2).
 
 A paged block index for very large files is a planned extension. It would let a
 reader fetch only the descriptors and block keys a byte range needs. Version 1.1
@@ -1168,7 +1194,15 @@ Extensions MUST maintain backwards compatibility for reading.
 - Version 1.0: `0x0100`
 - Version 1.1: `0x0101`
 
-### 10.3 Default Values
+### 10.3 Key-Derivation Context Strings
+
+Version 1.1 uses these ASCII strings, without a terminator:
+
+- `pithos 1.1 block identity`: block identity subkey (Section 5.2)
+- `pithos 1.1 aes-256-gcm payload`: AES-256-GCM payload key (Section 5.3)
+- `pithos 1.1 recipient grant`: HKDF info prefix of a grant key (Section 5.3)
+
+### 10.4 Default Values
 
 - Current timestamp: Unix seconds since epoch
 - Default file permissions: `0o644`
