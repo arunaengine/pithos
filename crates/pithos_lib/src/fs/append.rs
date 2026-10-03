@@ -450,6 +450,8 @@ struct AppendSink {
     failure: Option<AppendFailurePoint>,
     #[cfg(test)]
     after_block_marker: bool,
+    #[cfg(test)]
+    directory_started: bool,
 }
 
 impl AppendSink {
@@ -465,6 +467,8 @@ impl AppendSink {
             failure,
             #[cfg(test)]
             after_block_marker: false,
+            #[cfg(test)]
+            directory_started: false,
         }
     }
 
@@ -485,6 +489,23 @@ impl AppendSink {
 
 impl Write for AppendSink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        let bytes = if self.failure == Some(AppendFailurePoint::DuringDirectory) {
+            if self.directory_started {
+                return Err(io::Error::other(
+                    "injected append failure after 8 directory bytes",
+                ));
+            }
+            // Accept only the directory marker, so the next write fails inside the directory.
+            self.directory_started = bytes.starts_with(b"PITHOSDR");
+            if self.directory_started {
+                &bytes[..8]
+            } else {
+                bytes
+            }
+        } else {
+            bytes
+        };
         let accepted = self.file.write(bytes)?;
         if accepted > 0 {
             self.mutated.store(true, Ordering::Relaxed);
@@ -492,7 +513,6 @@ impl Write for AppendSink {
         #[cfg(test)]
         if accepted == bytes.len() {
             let is_marker = bytes == b"BLCK";
-            let is_directory = bytes.starts_with(b"PITHOSDR");
             let after_payload = self.after_block_marker && !is_marker;
             self.after_block_marker = is_marker;
             let fail = match self.failure {
@@ -503,7 +523,6 @@ impl Write for AppendSink {
                     | AppendFailurePoint::RollbackFlush
                     | AppendFailurePoint::MetadataQuery,
                 ) if after_payload => true,
-                Some(AppendFailurePoint::DuringDirectory) if is_directory => true,
                 _ => false,
             };
             if fail {
@@ -758,6 +777,9 @@ mod tests {
                 ),
                 "unexpected error at {point:?}: {error:?}"
             );
+            if point == AppendFailurePoint::DuringDirectory {
+                assert!(format!("{error:?}").contains("after 8 directory bytes"));
+            }
             assert_eq!(
                 std::fs::read(&fixture.archive).unwrap(),
                 original,
