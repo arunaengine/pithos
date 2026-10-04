@@ -150,4 +150,6 @@ The upstream parser accepts RO-Crate 1.1 and 1.2 metadata without upstream valid
 
 ## Platform behavior
 
+`pithos_lib` builds only on Linux, even with `default-features = false`. The Linux filesystem modules in `fs` and the Unix file source in `source` are always compiled.
+
 Filesystem ingestion, extraction, append, and grants are Linux-only in 0.8. Append uses a cooperating-writer advisory lock and can request `AppendDurability::SyncAll`; it attempts to truncate a failed child directory, but it cannot promise rollback after an unrecoverable host or power failure.

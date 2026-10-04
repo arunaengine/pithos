@@ -41,7 +41,7 @@ For the complete command workflow, including extracting entries, see the [CLI gu
 - Local filesystem operations that avoid symlink traversal and refuse to overwrite existing extracted files.
 - RO-Crate directory and ZIP conversion, plus Crypt4GH export for readable entries.
 
-The filesystem operations are Linux-only and require destination filesystem support for `O_TMPFILE` and `linkat(AT_EMPTY_PATH)`. Core archive reading and writing do not require Linux filesystem access.
+The filesystem operations are Linux-only and require destination filesystem support for `O_TMPFILE` and `linkat(AT_EMPTY_PATH)`. Core archive reading and writing do not require Linux filesystem access at run time. The crates still build only on Linux, even with default features off. The Linux filesystem modules and the Unix file source are always compiled.
 
 ## Crates
 
