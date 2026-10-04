@@ -5,8 +5,8 @@ use futures_core::Stream;
 use pithos_lib::archive::{
     AccessKeys, Archive, ArchiveFeature, ArchivePath, ArchiveWriter, AsyncArchive,
     AsyncExternalBlockResolver, BlockRequest, BlockingHook, Chunking, EntryKind, EntryMetadata,
-    ExternalBlockAccessPolicy, ExternalLocation, NoExternalBlocks, OpenLimits, OpenOptions,
-    ProcessingOptions, ReadLimits, WriteOptions,
+    ExternalBlockAccessPolicy, ExternalLocation, MAX_BATCH_BLOCKS, NoExternalBlocks, OpenLimits,
+    OpenOptions, ProcessingOptions, ReadLimits, WriteOptions,
 };
 use pithos_lib::error::PithosError;
 use pithos_lib::source::{AsyncArchiveSource, MemorySource, SourceError};
@@ -1019,4 +1019,50 @@ fn repeated_adjacent_blocks_are_read_in_file_order() {
             assert_eq!(covered, len);
         }
     }
+}
+
+#[test]
+fn encrypted_repeated_blocks_retain_only_their_output() {
+    // One stored 16-byte block repeated past the batch cap.
+    let count = MAX_BATCH_BLOCKS + 100;
+    let content = [7u8; 16].repeat(count);
+    let key = private_key("sender");
+    let options = WriteOptions::new(key.duplicate(), vec![key.public_key()])
+        .with_chunking(Chunking::Fixed(16));
+    let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("data").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(true, 0).unwrap(),
+            Some(content.len() as u64),
+            std::io::Cursor::new(content.clone()),
+        )
+        .unwrap();
+    let bytes = writer.finish().unwrap();
+    let limits = ReadLimits {
+        max_in_flight: 4,
+        max_buffered_bytes: 20_000,
+        max_request_bytes: 1024,
+    };
+    let (archive, probe, mode) = open_as(&bytes, sender(), limits);
+    *mode.lock().unwrap() = Mode::YieldOnce;
+    let mut stream = archive.read_range("data", 0..content.len() as u64).unwrap();
+    let mut output = Vec::new();
+    let mut peak = 0;
+    while let Poll::Ready(Some(chunk)) = next(&mut stream) {
+        let chunk = chunk.unwrap();
+        assert_eq!(chunk.capacity(), chunk.len());
+        peak = peak.max(stream.buffered_bytes());
+        output.extend_from_slice(&chunk);
+    }
+    assert!(matches!(next(&mut stream), Poll::Ready(None)));
+    assert_eq!(output, content);
+    assert!(
+        peak > 16 * 1024 && peak <= limits.max_buffered_bytes,
+        "{peak}"
+    );
+    // Both batches were outstanding at once, and each fetched the stored block once.
+    assert_eq!(probe.reads.lock().unwrap()[3..].len(), 2);
+    assert_eq!(probe.max_outstanding.load(Ordering::SeqCst), 2);
 }

@@ -8,7 +8,10 @@ use crate::format::header::FormatVersion;
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, KeyInit, Nonce,
-    aead::{self, Aead, AeadCore, AeadInOut, Generate, Payload, consts::U12},
+    aead::{
+        self, Aead, AeadCore, AeadInOut, Generate, Payload,
+        consts::{U12, U16},
+    },
 };
 use digest::{ExtendableOutput, Update, XofReader};
 use hkdf::Hkdf;
@@ -460,28 +463,33 @@ fn seal_with<C: KeyInit + Aead + AeadCore<NonceSize = U12>>(
     Ok(payload)
 }
 
-fn open_with<C: KeyInit + Aead + AeadCore<NonceSize = U12>>(
+/// Decrypts into a buffer of exactly the plaintext size, so it keeps no capacity for the tag.
+fn open_with<C: KeyInit + AeadInOut + AeadCore<NonceSize = U12, TagSize = U16>>(
     key: &[u8; 32],
     payload: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if payload.len() < 15 {
         return Err(CryptoError::EncryptedPayloadTooShort);
     }
-    let (nonce, ciphertext) = payload.split_at(12);
+    let len = payload
+        .len()
+        .checked_sub(28)
+        .ok_or(CryptoError::AuthenticationFailed)?;
+    let (nonce, sealed) = payload.split_at(12);
+    let (message, tag) = sealed.split_at(len);
     let cipher = C::new_from_slice(key).map_err(|_| CryptoError::CipherInitialization)?;
-    let nonce: [u8; 12] = nonce
-        .try_into()
-        .map_err(|_| CryptoError::EncryptedPayloadTooShort)?;
+    let nonce: [u8; 12] = nonce.try_into().expect("12-byte nonce");
+    let tag = aead::Tag::<C>::try_from(tag).expect("16-byte tag");
+    let mut plaintext = Zeroizing::new(message.to_vec());
     cipher
-        .decrypt(
+        .decrypt_inout_detached(
             &aead::Nonce::<C>::from(nonce),
-            Payload {
-                msg: ciphertext,
-                aad: b"",
-            },
+            b"",
+            plaintext.as_mut_slice().into(),
+            &tag,
         )
-        .map(Zeroizing::new)
-        .map_err(|_| CryptoError::AuthenticationFailed)
+        .map_err(|_| CryptoError::AuthenticationFailed)?;
+    Ok(plaintext)
 }
 
 #[cfg(test)]

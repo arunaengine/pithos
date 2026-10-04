@@ -17,7 +17,8 @@ use zeroize::Zeroizing;
 /// Each request reserves its response, the planned output of its blocks, and the largest
 /// working set of decoding one of them: the payload copy, the decrypted bytes of an encrypted
 /// compressed block, the decoded block and a copy of a partial output. After decoding, the
-/// request keeps only its planned output, which is released as the chunks are delivered.
+/// request keeps only its planned output in buffers of exactly that size, which are released
+/// as the chunks are delivered.
 ///
 /// Adjacent blocks share a request only while the whole reservation fits `max_buffered_bytes`.
 /// A request that does not fit next to the work already buffered waits. The only request that
@@ -171,8 +172,8 @@ where
                     },
                     State::Decoding(decode) => match decode.as_mut().poll(cx) {
                         Poll::Ready(Ok(chunks)) => {
-                            let kept = chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>();
-                            self.buffered -= slot.reserved - kept;
+                            let kept = chunks.iter().map(retained).sum::<u64>();
+                            self.buffered = self.buffered - slot.reserved + kept;
                             slot.reserved = kept;
                             State::Ready(chunks.into())
                         }
@@ -205,8 +206,8 @@ where
         let item = match &mut slot.state {
             State::Ready(chunks) => match chunks.pop_front() {
                 Some(chunk) => {
-                    slot.reserved -= chunk.len() as u64;
-                    self.buffered -= chunk.len() as u64;
+                    slot.reserved -= retained(&chunk);
+                    self.buffered -= retained(&chunk);
                     Ok(chunk)
                 }
                 None => {
@@ -344,6 +345,11 @@ fn split(batch: &BlockBatch, max_bytes: u64) -> VecDeque<Group> {
     groups
 }
 
+/// The bytes a delivered chunk holds: its capacity, not only its length.
+fn retained(chunk: &Vec<u8>) -> u64 {
+    chunk.capacity() as u64
+}
+
 /// Decodes every block of a request and keeps only the planned output of each.
 fn decode_group(
     view: &ArchiveView,
@@ -383,7 +389,9 @@ fn decode_group(
         last = span.map(|span| (span, bytes));
         let mut plaintext = view.decode_block(block, bytes)?;
         let output = block.output();
-        chunks.push(if output.start == 0 && output.end == plaintext.len() {
+        let whole = output.start == 0 && output.end == plaintext.len();
+        // A buffer with spare capacity is copied, so a chunk keeps only its planned bytes.
+        chunks.push(if whole && plaintext.capacity() == plaintext.len() {
             std::mem::take(&mut *plaintext)
         } else {
             plaintext[output].to_vec()
