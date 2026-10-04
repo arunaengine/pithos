@@ -11,3 +11,5 @@ pub(crate) mod file_entry;
 pub(crate) mod header;
 pub(crate) mod limits;
 pub(crate) mod primitives;
+#[cfg(test)]
+mod zeroing_tests;
