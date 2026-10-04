@@ -20,7 +20,6 @@ use crate::format::file_entry::{
 };
 use crate::format::header::{FileHeader, FormatVersion, encode_header};
 use crate::format::limits::DeserializationError;
-use fastcdc::v2020::{FastCDC, Normalization};
 use indexmap::IndexMap;
 use integer_encoding::{VarIntReader, VarIntWriter};
 use std::collections::HashSet;
@@ -224,10 +223,7 @@ impl PieceEncoder {
     /// Encodes the first FastCDC block of the buffered bytes and removes it from the buffer.
     /// Like `StreamCDC`, it cuts only with a full buffer or at the end of the content.
     fn cut_block(&mut self, cdc: CdcConfig) -> Result<Vec<u8>, PithosError> {
-        let (min, avg, max) = (cdc.min_size(), cdc.avg_size(), cdc.max_size());
-        let len = self.pending.len();
-        let (_, end) =
-            FastCDC::with_level(&self.pending, min, avg, max, Normalization::Level1).cut(0, len);
+        let end = cdc.first_cut(&self.pending);
         let block = std::mem::take(&mut self.pending);
         let stored = self.encode(&block[..end]);
         self.pending = block;
@@ -786,7 +782,7 @@ mod tests {
             cdc.min_size(),
             cdc.avg_size(),
             cdc.max_size(),
-            Normalization::Level1,
+            fastcdc::v2020::Normalization::Level1,
         );
         let expected = stream
             .map(|chunk| chunk.unwrap().length as u64)

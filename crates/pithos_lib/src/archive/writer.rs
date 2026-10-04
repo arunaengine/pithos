@@ -19,7 +19,7 @@ use crate::format::error::SerializationError;
 use crate::format::file_entry::{BlockDataState, FileEntry, FileType, Reference};
 use crate::format::header::FormatVersion;
 use crate::format::{directory, header};
-use fastcdc::v2020::{Normalization, StreamCDC};
+use fastcdc::v2020::{FastCDC, Normalization};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -72,6 +72,14 @@ impl CdcConfig {
     pub fn max_size(self) -> usize {
         self.max_size
     }
+
+    /// The length of the first FastCDC block of `data`, with level-one normalization.
+    pub(crate) fn first_cut(self, data: &[u8]) -> usize {
+        let (min, avg, max) = (self.min_size, self.avg_size, self.max_size);
+        FastCDC::with_level(data, min, avg, max, Normalization::Level1)
+            .cut(0, data.len())
+            .1
+    }
 }
 
 impl Default for CdcConfig {
@@ -123,8 +131,10 @@ enum Chunker<R: Read> {
         block: Zeroizing<Vec<u8>>,
     },
     ContentDefined {
-        stream: StreamCDC<R>,
-        block: Zeroizing<Vec<u8>>,
+        content: R,
+        cdc: CdcConfig,
+        buffer: Zeroizing<Vec<u8>>,
+        cut: usize,
     },
 }
 
@@ -137,14 +147,10 @@ impl<R: Read> Chunker<R> {
                 block: Zeroizing::new(Vec::new()),
             },
             Chunking::ContentDefined(cdc) => Self::ContentDefined {
-                stream: StreamCDC::with_level(
-                    content,
-                    cdc.min_size,
-                    cdc.avg_size,
-                    cdc.max_size,
-                    Normalization::Level1,
-                ),
-                block: Zeroizing::new(Vec::new()),
+                content,
+                cdc,
+                buffer: Zeroizing::new(Vec::new()),
+                cut: 0,
             },
         }
     }
@@ -163,13 +169,23 @@ impl<R: Read> Chunker<R> {
                 content.by_ref().take(*size as u64).read_to_end(block)?;
                 Ok((!block.is_empty()).then_some(block.as_slice()))
             }
-            Self::ContentDefined { stream, block } => match stream.next() {
-                Some(chunk) => {
-                    *block = Zeroizing::new(chunk?.data);
-                    Ok(Some(block.as_slice()))
+            Self::ContentDefined {
+                content,
+                cdc,
+                buffer,
+                cut,
+            } => {
+                // Like `StreamCDC`, this cuts only with a full buffer or at the end of the content.
+                buffer.drain(..std::mem::take(cut));
+                let missing = cdc.max_size - buffer.len();
+                buffer.reserve_exact(missing);
+                content.by_ref().take(missing as u64).read_to_end(buffer)?;
+                if buffer.is_empty() {
+                    return Ok(None);
                 }
-                None => Ok(None),
-            },
+                *cut = cdc.first_cut(buffer);
+                Ok(Some(&buffer[..*cut]))
+            }
         }
     }
 }
@@ -2486,25 +2502,28 @@ mod tests {
         }
     }
 
+    /// The plaintext hash and size of every block written for `content`, in order.
+    fn written_blocks(chunking: Chunking, content: impl Read) -> Vec<([u8; 32], u64)> {
+        let options = options().with_chunking(chunking);
+        let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+        writer
+            .add_file(
+                ArchivePath::new("data").unwrap(),
+                EntryMetadata::new(0, 0, 0o644),
+                ProcessingOptions::new(true, 0).unwrap(),
+                None,
+                content,
+            )
+            .unwrap();
+        let blocks = writer.directory.blocks.iter();
+        blocks
+            .map(|(hash, block)| (*hash, block.original_size))
+            .collect()
+    }
+
     #[test]
     fn fixed_blocks_ignore_read_sizes_and_end_with_one_short_block() {
-        fn blocks(content: impl Read) -> Vec<([u8; 32], u64)> {
-            let options = options().with_chunking(Chunking::Fixed(1000));
-            let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
-            writer
-                .add_file(
-                    ArchivePath::new("data").unwrap(),
-                    EntryMetadata::new(0, 0, 0o644),
-                    ProcessingOptions::new(true, 0).unwrap(),
-                    None,
-                    content,
-                )
-                .unwrap();
-            let blocks = writer.directory.blocks.iter();
-            blocks
-                .map(|(hash, block)| (*hash, block.original_size))
-                .collect()
-        }
+        let fixed = Chunking::Fixed(1000);
         let content = (0..2500u32)
             .map(|index| (index * 7) as u8)
             .collect::<Vec<_>>();
@@ -2513,9 +2532,41 @@ mod tests {
                 .chunks(1000)
                 .map(|chunk| (*blake3::hash(chunk).as_bytes(), chunk.len() as u64))
                 .collect::<Vec<_>>();
-            assert_eq!(blocks(Cursor::new(content)), expected);
-            assert_eq!(blocks(ByteReader(content)), expected);
+            assert_eq!(written_blocks(fixed, Cursor::new(content)), expected);
+            assert_eq!(written_blocks(fixed, ByteReader(content)), expected);
         }
+    }
+
+    #[test]
+    fn content_defined_blocks_match_stream_cdc() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let content = (0..20_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        let cdc = CdcConfig::new(64, 256, 1024).unwrap();
+        let (min, avg, max) = (cdc.min_size, cdc.avg_size, cdc.max_size);
+        let stream = fastcdc::v2020::StreamCDC::with_level(
+            Cursor::new(&content),
+            min,
+            avg,
+            max,
+            Normalization::Level1,
+        );
+        let expected = stream
+            .map(|chunk| {
+                let chunk = chunk.unwrap();
+                (*blake3::hash(&chunk.data).as_bytes(), chunk.length as u64)
+            })
+            .collect::<Vec<_>>();
+        assert!(expected.len() > 20);
+        let chunking = Chunking::ContentDefined(cdc);
+        assert_eq!(written_blocks(chunking, Cursor::new(&content)), expected);
+        assert_eq!(written_blocks(chunking, ByteReader(&content)), expected);
     }
 
     #[test]
