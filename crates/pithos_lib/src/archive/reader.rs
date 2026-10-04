@@ -24,6 +24,14 @@ pub(crate) enum ContentOperationError<E> {
     Core(PithosError),
     Callback(E),
 }
+
+#[cfg(feature = "crypt4gh")]
+impl<E> From<PithosError> for ContentOperationError<E> {
+    fn from(error: PithosError) -> Self {
+        Self::Core(error)
+    }
+}
+
 use std::ops::Range;
 use x25519_dalek::PublicKey as DalekPublicKey;
 use zeroize::Zeroizing;
@@ -406,7 +414,7 @@ where
     pub(crate) fn for_each_verified_file_block<CallbackError>(
         &self,
         id: FileId,
-        mut operation: impl FnMut(Zeroizing<Vec<u8>>) -> Result<(), CallbackError>,
+        mut operation: impl FnMut(&[u8]) -> Result<(), CallbackError>,
     ) -> Result<(), ContentOperationError<CallbackError>> {
         self.require_content_available(id)
             .map_err(ContentOperationError::Core)?;
@@ -417,13 +425,9 @@ where
         let plan = ReadRange::new(0..size, size)
             .and_then(|range| self.view.plan(id, range))
             .map_err(ContentOperationError::Core)?;
-        for block in plan {
-            let plaintext = block
-                .and_then(|block| self.verified_block(&block))
-                .map_err(ContentOperationError::Core)?;
-            operation(plaintext).map_err(ContentOperationError::Callback)?;
-        }
-        Ok(())
+        self.for_each_output(plan, |plaintext| {
+            operation(plaintext).map_err(ContentOperationError::Callback)
+        })
     }
 
     pub(crate) fn require_content_available(&self, id: FileId) -> Result<(), PithosError> {
@@ -435,6 +439,15 @@ where
         plan: ReadPlan<'_>,
         sink: &mut W,
     ) -> Result<(), PithosError> {
+        self.for_each_output(plan, |bytes| Ok(sink.write_all(bytes)?))
+    }
+
+    /// Passes the planned part of each verified block to `operation`, in file order.
+    fn for_each_output<Failure: From<PithosError>>(
+        &self,
+        plan: ReadPlan<'_>,
+        mut operation: impl FnMut(&[u8]) -> Result<(), Failure>,
+    ) -> Result<(), Failure> {
         // A block that repeats the block before it reuses its verified plaintext.
         let mut last: Option<(PlannedBlock, Zeroizing<Vec<u8>>)> = None;
         for block in plan {
@@ -450,7 +463,7 @@ where
                 last = Some((block, plaintext));
             }
             let (_, plaintext) = last.as_ref().expect("the block was verified above");
-            sink.write_all(&plaintext[output])?;
+            operation(&plaintext[output])?;
         }
         Ok(())
     }

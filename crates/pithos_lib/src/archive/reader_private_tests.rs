@@ -1565,6 +1565,46 @@ fn unsupported_external_content_preflights_the_whole_file_and_adapters() {
         assert!(exported.is_empty());
     }
 }
+
+#[cfg(feature = "crypt4gh")]
+#[test]
+fn crypt4gh_blocks_read_a_repeated_adjacent_block_once() {
+    let blocks = [[0u8; 16], [1; 16], [1; 16], [1; 16], [2; 16]];
+    let sender = private("sender");
+    let options = WriteOptions::new(sender.duplicate(), vec![sender.public_key()])
+        .with_chunking(Chunking::Fixed(16));
+    let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+    writer
+        .add_file(
+            ArchivePath::new("data").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(true, 0).unwrap(),
+            Some(80),
+            Cursor::new(blocks.concat()),
+        )
+        .unwrap();
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let archive = Archive::open(
+        RecordingSource {
+            bytes: Arc::from(writer.finish().unwrap()),
+            reads: Arc::clone(&reads),
+        },
+        OpenOptions::default().with_access_keys(AccessKeys::new().with_key(sender)),
+    )
+    .unwrap();
+    let opened = reads.lock().unwrap().len();
+    let (id, _) = archive.view().content_id("data").unwrap();
+    let mut output = Vec::new();
+    let result = archive.for_each_verified_file_block(id, |plaintext| {
+        output.push(plaintext.to_vec());
+        Ok::<_, ()>(())
+    });
+    assert!(result.is_ok());
+    assert_eq!(output, blocks);
+    // A, B and C are each read once.
+    assert_eq!(reads.lock().unwrap().len(), opened + 3);
+}
+
 #[cfg(feature = "crypt4gh")]
 use crate::adapters::crypt4gh;
 use crate::fs::extract;
