@@ -11,6 +11,7 @@ use crate::source::{AsyncArchiveSource, SourceError};
 use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// Resolves an opaque external block location to exactly one framed `BLCK` value without
 /// blocking.
@@ -126,10 +127,10 @@ where
         let (settings, external, external_access_policy) = options.into_parts();
         let mut opener = ArchiveOpener::with_settings(archive_len, settings)?;
         while let Some(request) = opener.request() {
-            let response = read_exact(&source, request.offset(), request.len()).await?;
+            let mut response = read_exact(&source, request.offset(), request.len()).await?;
             let (returned, result) = hook
                 .spawn_blocking(move || {
-                    let result = opener.feed(request, response);
+                    let result = opener.feed(request, std::mem::take(&mut *response));
                     (opener, result)
                 })
                 .await;
@@ -212,7 +213,10 @@ where
     }
 
     /// Fetches the stored bytes of one batch request.
-    pub(super) async fn fetch(&self, request: BlockRequest) -> Result<Vec<u8>, PithosError> {
+    pub(super) async fn fetch(
+        &self,
+        request: BlockRequest,
+    ) -> Result<Zeroizing<Vec<u8>>, PithosError> {
         match request {
             BlockRequest::Local { offset, len } => Ok(read_exact(&self.source, offset, len).await?),
             BlockRequest::External { location, len } => {
@@ -230,7 +234,8 @@ where
                 let response = self
                     .external
                     .resolve(policy, &location, len, max_response_size)
-                    .await?;
+                    .await
+                    .map(Zeroizing::new)?;
                 if response.len() as u64 != len {
                     return Err(PithosError::ExternalBlockFraming(
                         "response does not match expected size".into(),
@@ -247,8 +252,9 @@ async fn read_exact<S: AsyncArchiveSource>(
     source: &S,
     offset: u64,
     len: u64,
-) -> Result<Vec<u8>, SourceError> {
-    let response = source.read_at(offset, len).await?;
+) -> Result<Zeroizing<Vec<u8>>, SourceError> {
+    // A rejected response may hold plaintext, so it is wiped like an accepted one.
+    let response = Zeroizing::new(source.read_at(offset, len).await?);
     if response.len() as u64 != len {
         return Err(SourceError::ResponseLength {
             offset,

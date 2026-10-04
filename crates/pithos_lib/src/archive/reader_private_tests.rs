@@ -2089,17 +2089,23 @@ mod async_wiping {
     use futures_core::Stream;
     use std::future::Future;
     use std::pin::{Pin, pin};
+    use std::sync::atomic::AtomicBool;
     use std::task::{Context, Poll, Waker};
 
-    struct Bytes(Vec<u8>);
+    /// Serves `bytes`, but one byte short once `short` is set.
+    struct Bytes {
+        bytes: Vec<u8>,
+        short: Arc<AtomicBool>,
+    }
 
     impl AsyncArchiveSource for Bytes {
         async fn len(&self) -> Result<u64, SourceError> {
-            Ok(self.0.len() as u64)
+            Ok(self.bytes.len() as u64)
         }
 
         async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, SourceError> {
-            Ok(self.0[offset as usize..(offset + len) as usize].to_vec())
+            let end = offset + len - u64::from(self.short.load(Ordering::Relaxed));
+            Ok(self.bytes[offset as usize..end as usize].to_vec())
         }
     }
 
@@ -2130,11 +2136,15 @@ mod async_wiping {
         writer.finish().unwrap()
     }
 
+    fn open(bytes: Vec<u8>, short: &Arc<AtomicBool>) -> AsyncArchive<Bytes> {
+        let short = Arc::clone(short);
+        let source = Bytes { bytes, short };
+        ready(AsyncArchive::open(source, OpenOptions::default(), None)).unwrap()
+    }
+
     /// Takes the first item of a stream over all blocks, then drops the stream.
     /// Returns the item length and the number of freed buffers that still held the secret.
-    fn first_then_drop(bytes: Vec<u8>) -> (Result<usize, PithosError>, usize) {
-        let source = Bytes(bytes);
-        let archive = ready(AsyncArchive::open(source, OpenOptions::default(), None)).unwrap();
+    fn first_then_drop(archive: &AsyncArchive<Bytes>) -> (Result<usize, PithosError>, usize) {
         let (first, _, leaked) = watch(64, &[], || {
             let mut stream = archive.read_range("data", 0..256).unwrap();
             let mut cx = Context::from_waker(Waker::noop());
@@ -2149,7 +2159,7 @@ mod async_wiping {
 
     #[test]
     fn dropped_stream_wipes_chunks() {
-        let (first, leaked) = first_then_drop(secret_blocks());
+        let (first, leaked) = first_then_drop(&open(secret_blocks(), &Arc::default()));
         assert_eq!(first.unwrap(), 64);
         assert_eq!(leaked, 0);
     }
@@ -2159,8 +2169,21 @@ mod async_wiping {
         let mut bytes = secret_blocks();
         let second = bytes.windows(32).position(|window| window == [0xB1; 32]);
         bytes[second.unwrap()] ^= 1;
-        let (first, leaked) = first_then_drop(bytes);
+        let (first, leaked) = first_then_drop(&open(bytes, &Arc::default()));
         assert!(matches!(first, Err(PithosError::BlockHashMismatch { .. })));
+        assert_eq!(leaked, 0);
+    }
+
+    #[test]
+    fn short_response_is_wiped() {
+        let short = Arc::new(AtomicBool::new(false));
+        let archive = open(secret_blocks(), &short);
+        short.store(true, Ordering::Relaxed);
+        let (first, leaked) = first_then_drop(&archive);
+        assert!(matches!(
+            first,
+            Err(PithosError::Source(SourceError::ResponseLength { .. }))
+        ));
         assert_eq!(leaked, 0);
     }
 }

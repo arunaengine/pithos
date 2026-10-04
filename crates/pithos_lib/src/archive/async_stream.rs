@@ -46,7 +46,7 @@ impl Default for ReadLimits {
 type Pending<'a, T> = Pin<Box<dyn Future<Output = Result<T, PithosError>> + Send + 'a>>;
 
 enum State<'a> {
-    Fetching(Pending<'a, Vec<u8>>, Vec<PlannedBlock>),
+    Fetching(Pending<'a, Zeroizing<Vec<u8>>>, Vec<PlannedBlock>),
     Decoding(Pending<'a, Vec<Zeroizing<Vec<u8>>>>),
     Ready(VecDeque<Zeroizing<Vec<u8>>>),
     Failed(PithosError),
@@ -134,7 +134,7 @@ impl Iterator for SharedBatches {
 
 /// How a stream reaches its archive: borrowed, or shared by an owned stream.
 trait Reader<'a> {
-    fn fetch(&self, request: BlockRequest) -> Pending<'a, Vec<u8>>;
+    fn fetch(&self, request: BlockRequest) -> Pending<'a, Zeroizing<Vec<u8>>>;
 
     fn decode(
         &self,
@@ -149,7 +149,7 @@ where
     E: AsyncExternalBlockResolver,
     B: BlockingHook,
 {
-    fn fetch(&self, request: BlockRequest) -> Pending<'a, Vec<u8>> {
+    fn fetch(&self, request: BlockRequest) -> Pending<'a, Zeroizing<Vec<u8>>> {
         Box::pin(AsyncArchive::fetch(*self, request))
     }
 
@@ -174,7 +174,7 @@ where
     E: AsyncExternalBlockResolver + 'static,
     B: BlockingHook + 'static,
 {
-    fn fetch(&self, request: BlockRequest) -> Pending<'static, Vec<u8>> {
+    fn fetch(&self, request: BlockRequest) -> Pending<'static, Zeroizing<Vec<u8>>> {
         let archive = Arc::clone(self);
         Box::pin(async move { AsyncArchive::fetch(&archive, request).await })
     }
@@ -283,9 +283,7 @@ where
                             unreachable!("the slot was fetching");
                         };
                         match result {
-                            Ok(stored) => {
-                                State::Decoding(self.reader.decode(blocks, Zeroizing::new(stored)))
-                            }
+                            Ok(stored) => State::Decoding(self.reader.decode(blocks, stored)),
                             Err(error) => State::Failed(error),
                         }
                     }
