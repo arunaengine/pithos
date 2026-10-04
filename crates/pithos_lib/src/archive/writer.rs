@@ -135,6 +135,7 @@ enum Chunker<R: Read> {
         cdc: CdcConfig,
         buffer: Zeroizing<Vec<u8>>,
         cut: usize,
+        ended: bool,
     },
 }
 
@@ -151,6 +152,7 @@ impl<R: Read> Chunker<R> {
                 cdc,
                 buffer: Zeroizing::new(Vec::new()),
                 cut: 0,
+                ended: false,
             },
         }
     }
@@ -174,12 +176,17 @@ impl<R: Read> Chunker<R> {
                 cdc,
                 buffer,
                 cut,
+                ended,
             } => {
                 // Like `StreamCDC`, this cuts only with a full buffer or at the end of the content.
                 buffer.drain(..std::mem::take(cut));
-                let missing = cdc.max_size - buffer.len();
-                buffer.reserve_exact(missing);
-                content.by_ref().take(missing as u64).read_to_end(buffer)?;
+                if !*ended {
+                    let missing = cdc.max_size - buffer.len();
+                    buffer.reserve_exact(missing);
+                    content.by_ref().take(missing as u64).read_to_end(buffer)?;
+                    // A short fill means a read returned 0. Like `StreamCDC`, it is the end.
+                    *ended = buffer.len() < cdc.max_size;
+                }
                 if buffer.is_empty() {
                     return Ok(None);
                 }
@@ -2537,36 +2544,74 @@ mod tests {
         }
     }
 
-    #[test]
-    fn content_defined_blocks_match_stream_cdc() {
+    /// Pseudo-random bytes, so no two content-defined blocks are equal.
+    fn noise(len: usize) -> Vec<u8> {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let content = (0..20_000)
+        (0..len)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
                 state as u8
             })
-            .collect::<Vec<_>>();
-        let cdc = CdcConfig::new(64, 256, 1024).unwrap();
+            .collect()
+    }
+
+    /// The plaintext hash and size of every `StreamCDC` block of `content`, in order.
+    fn stream_blocks(cdc: CdcConfig, content: impl Read) -> Vec<([u8; 32], u64)> {
         let (min, avg, max) = (cdc.min_size, cdc.avg_size, cdc.max_size);
-        let stream = fastcdc::v2020::StreamCDC::with_level(
-            Cursor::new(&content),
-            min,
-            avg,
-            max,
-            Normalization::Level1,
-        );
-        let expected = stream
+        let stream =
+            fastcdc::v2020::StreamCDC::with_level(content, min, avg, max, Normalization::Level1);
+        stream
             .map(|chunk| {
                 let chunk = chunk.unwrap();
                 (*blake3::hash(&chunk.data).as_bytes(), chunk.length as u64)
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    #[test]
+    fn content_defined_blocks_match_stream_cdc() {
+        let content = noise(20_000);
+        let cdc = CdcConfig::new(64, 256, 1024).unwrap();
+        let expected = stream_blocks(cdc, Cursor::new(&content));
         assert!(expected.len() > 20);
         let chunking = Chunking::ContentDefined(cdc);
         assert_eq!(written_blocks(chunking, Cursor::new(&content)), expected);
         assert_eq!(written_blocks(chunking, ByteReader(&content)), expected);
+    }
+
+    /// Answers reads from fixed steps: bytes, an empty step for one end of input, or a failure.
+    struct Steps(std::collections::VecDeque<io::Result<Vec<u8>>>);
+
+    impl Read for Steps {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Err(error)) => Err(error),
+                Some(Ok(mut data)) => {
+                    let count = data.len().min(buffer.len());
+                    buffer[..count].copy_from_slice(&data[..count]);
+                    if count < data.len() {
+                        self.0.push_front(Ok(data.split_off(count)));
+                    }
+                    Ok(count)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn content_defined_reads_stop_at_the_end() {
+        let first = noise(500);
+        let steps = |last| Steps([Ok(first.clone()), Ok(Vec::new()), last].into());
+        let cdc = CdcConfig::new(64, 256, 1024).unwrap();
+        let expected = stream_blocks(cdc, steps(Ok(noise(500))));
+        assert_eq!(expected.iter().map(|block| block.1).sum::<u64>(), 500);
+        let chunking = Chunking::ContentDefined(cdc);
+        assert_eq!(written_blocks(chunking, steps(Ok(noise(500)))), expected);
+        let failing = steps(Err(io::Error::other("read after the end")));
+        assert_eq!(written_blocks(chunking, failing), expected);
     }
 
     #[test]
