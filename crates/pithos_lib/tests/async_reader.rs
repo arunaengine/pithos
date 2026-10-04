@@ -1167,3 +1167,100 @@ fn dropping_a_stream_while_a_worker_decodes_discards_the_result() {
     assert!(error.is_none());
     assert_eq!(output, content(8));
 }
+
+fn assert_owned<T: Send + 'static>(value: T) -> T {
+    value
+}
+
+#[test]
+fn owned_streams_equal_borrowed_streams() {
+    let bytes = blocks(64, true);
+    let (source, probe, mode) = TestSource::new(&bytes);
+    *mode.lock().unwrap() = Mode::YieldOnce;
+    let archive = block_on(AsyncArchive::open(source, sender(), None))
+        .unwrap()
+        .with_read_limits(ReadLimits {
+            max_in_flight: 3,
+            max_buffered_bytes: 4096,
+            max_request_bytes: 200,
+        });
+    let archive = Arc::new(archive);
+    for range in [0..1024, 0..0, 5..37, 16..32, 1000..1024, 17..18] {
+        let start = probe.reads.lock().unwrap().len();
+        let borrowed = drain(archive.read_range("data", range.clone()).unwrap(), &probe);
+        let middle = probe.reads.lock().unwrap().len();
+        let stream = Arc::clone(&archive)
+            .read_range_owned("data", range.clone())
+            .unwrap();
+        let owned = drain(assert_owned(stream), &probe);
+        assert!(borrowed.1.is_none() && owned.1.is_none(), "{range:?}");
+        assert_eq!(owned.0, borrowed.0, "{range:?}");
+        assert_eq!(
+            owned.0,
+            content(64)[range.start as usize..range.end as usize]
+        );
+        // Both streams issue the same requests in the same order.
+        let reads = probe.reads.lock().unwrap();
+        assert_eq!(reads[start..middle], reads[middle..], "{range:?}");
+    }
+    assert_eq!(probe.outstanding.load(Ordering::SeqCst), 0);
+    assert!(
+        Arc::clone(&archive)
+            .read_range_owned("data", 0..1025)
+            .is_err()
+    );
+    assert!(
+        Arc::clone(&archive)
+            .read_range_owned("missing", 0..1)
+            .is_err()
+    );
+    assert_eq!(Arc::strong_count(&archive), 1);
+}
+
+#[test]
+fn owned_streams_run_in_spawned_tokio_tasks() {
+    let bytes = blocks(64, true);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let output = runtime.block_on(async {
+        let (source, _, mode) = TestSource::new(&bytes);
+        *mode.lock().unwrap() = Mode::YieldOnce;
+        let archive = AsyncArchive::open_with_hook(source, sender(), None, TokioBlocking)
+            .await
+            .unwrap();
+        let mut stream = Arc::new(archive)
+            .read_range_owned("data", 16..1000)
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let mut output = Vec::new();
+            while let Some(chunk) =
+                std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await
+            {
+                output.extend_from_slice(&chunk.unwrap());
+            }
+            output
+        });
+        task.await.unwrap()
+    });
+    assert_eq!(output, content(64)[16..1000]);
+}
+
+#[test]
+fn dropping_an_owned_stream_cancels_outstanding_requests() {
+    let bytes = blocks(16, false);
+    let (archive, probe, mode) = open(&bytes, single_blocks(4, 1 << 20));
+    *mode.lock().unwrap() = Mode::Gated;
+    let archive = Arc::new(archive);
+    let mut stream = Arc::clone(&archive)
+        .read_range_owned("data", 0..256)
+        .unwrap();
+    assert!(next(&mut stream).is_pending());
+    assert_eq!(probe.outstanding.load(Ordering::SeqCst), 4);
+    // The stream and each of its four requests hold the archive.
+    assert_eq!(Arc::strong_count(&archive), 1 + 1 + 4);
+    drop(stream);
+    assert_eq!(probe.outstanding.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.cancelled.load(Ordering::SeqCst), 4);
+    assert_eq!(Arc::strong_count(&archive), 1);
+}
