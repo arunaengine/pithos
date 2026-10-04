@@ -58,14 +58,12 @@ fn encode_with_key(
     let hash = block_hash(requested_flags, &key, plaintext);
     let mut flags = requested_flags;
     let compression_level = zstd_level(flags);
-    let mut stored = Zeroizing::new(
-        if compression_level > 0 && probe_ratio(plaintext, compression_level)? < 0.85 {
-            compress(plaintext, compression_level)?
-        } else {
-            flags.set_compression_level(0);
-            plaintext.to_vec()
-        },
-    );
+    let mut stored = if compression_level > 0 && probe_ratio(plaintext, compression_level)? < 0.85 {
+        compress(plaintext, compression_level)?
+    } else {
+        flags.set_compression_level(0);
+        Zeroizing::new(plaintext.to_vec())
+    };
     if flags.is_aes_256_gcm() {
         stored = Zeroizing::new(crypto::seal_block_aes_with_nonce(&key, &stored, nonce)?);
     } else if flags.is_encrypted() {
@@ -160,15 +158,21 @@ fn probe_ratio(input: &[u8], level: i32) -> Result<f64, PithosError> {
         return Ok(1.0);
     }
     let sample = &input[..input.len().min(4096)];
-    let compressed = Zeroizing::new(compress(sample, level)?);
+    let compressed = compress(sample, level)?;
     Ok(compressed.len() as f64 / sample.len() as f64)
 }
 
-fn compress(input: &[u8], level: i32) -> Result<Vec<u8>, PithosError> {
-    bulk::compress(input, level).map_err(|source| PithosError::Compression {
-        operation: "compress block",
-        source,
-    })
+fn compress(input: &[u8], level: i32) -> Result<Zeroizing<Vec<u8>>, PithosError> {
+    // Compressing into a wiped buffer also wipes the partial output of a failed call.
+    let bound = zstd::zstd_safe::compress_bound(input.len());
+    let mut output = Zeroizing::new(Vec::with_capacity(bound));
+    bulk::Compressor::new(level)
+        .and_then(|mut compressor| compressor.compress_to_buffer(input, &mut *output))
+        .map_err(|source| PithosError::Compression {
+            operation: "compress block",
+            source,
+        })?;
+    Ok(output)
 }
 
 fn decompress(input: &[u8], expected_size: u64) -> Result<Zeroizing<Vec<u8>>, PithosError> {
