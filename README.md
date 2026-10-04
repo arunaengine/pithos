@@ -60,7 +60,7 @@ This branch implements the wire rules in the [Pithos 1.1 draft](spec/PITHOS_1.1.
 
 ## Format 1.1
 
-Format 1.1 keeps every 1.0 structure and encoding. This version reads 1.0 and 1.1 archives, writes new archives as 1.1, and appends to an archive with the rules of its own version. The changes are:
+Format 1.1 keeps every 1.0 structure and encoding. This version reads 1.0 and 1.1 archives, writes new archives as 1.1, and appends to an archive with the rules of its own version. It also reads archives written by Pithos 0.7, but does not append to them (spec Appendix C). The changes are:
 
 - The header version is `0x0101`.
 - A recipient grant key is derived with HKDF-SHA256 instead of using the raw X25519 shared secret.

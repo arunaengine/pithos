@@ -170,7 +170,8 @@ pub struct FileHeader {
 
 Readers MUST reject a header whose magic is not `PITH` or whose version is
 neither `0x0100` nor `0x0101`. The encoded form is exactly six bytes: `PITH 01 01`
-for version 1.1 and `PITH 01 00` for version 1.0.
+for version 1.1 and `PITH 01 00` for version 1.0. As the only exception, a reader
+MAY open a Pithos 0.7 archive, whose version reads as `0x8002` (Appendix C).
 
 ### 4.2 Block Storage
 
@@ -1181,7 +1182,7 @@ Non-POSIX platforms MAY retain them as metadata without an ACL mapping.
 ## 9. Future Extensions
 
 The format reserves space for future extensions:
-- Header versions other than `0x0100` and `0x0101`
+- Header versions other than `0x0100`, `0x0101` and the Pithos 0.7 value `0x8002`
 - FileType values 4-255
 - ProcessingFlags bits 6-7
 - Relationship IDs 10 through 999, for future standard relationships
@@ -1211,6 +1212,7 @@ Extensions MUST maintain backwards compatibility for reading.
 
 - Version 1.0: `0x0100`
 - Version 1.1: `0x0101`
+- Pithos 0.7, read only (Appendix C): `0x8002`
 
 ### 10.3 Key-Derivation Context Strings
 
@@ -1628,4 +1630,30 @@ byte and then refreshing the CRC.
 | Version 1.1 pieces and grants | 1.3, 4.4.2, 5.3, 8.2 | CV-PIECES-HELLO-766, PV-RECIPIENT-WRAP-11; *case:* tag `02` in a version 1.0 archive; *case:* a reader granted only some of a file's piece keys | Valid archive; content readable only with every piece key; reject tag `02` in version 1.0; a partly granted file is unavailable |
 | Version 1.0 compatibility | 1.3, 5.3 | CV-BASE-EMPTY-146, CV-LOCAL-HELLO-279, PV-RECIPIENT-WRAP-01; *case:* an append and a reader grant on a version 1.0 archive keep header `0x0100` and the version 1.0 grant construction | Readable under the version 1.0 rules; under the version 1.1 rules the same grants fail authentication and the open fails, and the reverse |
 | Grant authentication | 5.3, 7, 8.2 | *case:* one changed ciphertext byte in a grant addressed to the reader, while an older grant still gives access, for a recipient key and for a sender key through sender-key recovery; *case:* a reader with no grant | The open fails for an addressed grant that fails authentication; with no grant the open succeeds, the content is unavailable, and reads fail without output |
+| Pithos 0.7 archives (optional) | Appendix C | *case:* archives written by Pithos 0.7.0 and 0.7.3, each with one append; *case:* one changed path byte in a Directory; *case:* an append or grant to such an archive | Content, permissions and symlink targets read back; the changed Directory fails its checksum; the append and the grant fail before writing |
 | Whole-file hash of joined parts (informative) | Appendix A | *case:* aligned parts, a short last part, empty parts, one part, and an empty file; *case:* a part that ends inside a 1024-byte chunk | The hash equals the BLAKE3 of the full read; no hash for the misaligned part |
+
+## Appendix C. Reading Pithos 0.7 Archives (Optional)
+
+Pithos 0.7 wrote archives before this specification fixed the header encoding.
+A reader MAY open them read only. It then applies the version 1.0 rules with the
+differences below. Writers MUST NOT create such archives or append to them.
+
+1. **Header:** the version is the ULEB128 encoding of `0x0100`, the bytes
+   `80 02`. Read as the fixed-width field of Section 4.1, it is `0x8002`.
+2. **Directory checksum:** Pithos 0.7.3 computes the CRC as in Section 4.3.
+   Pithos 0.7.0 computes it over other bytes: the parent option tag and values
+   only when a parent is present, the `files`, `blocks` and `encryption` items
+   without their counts, the `relations` vector with its count, and `dir_len` as
+   ULEB128 instead of `u64be`. The stored CRC MUST match one of the two.
+3. **Relationship names:** the ten standard relationships are stored as
+   `Describes`, `Annotates`, `Derived_From`, `Source_Of`, `Previous_Version`,
+   `Next_Version`, `Part_of`, `Contains`, `Input_To` and `Output_From`. A reader
+   treats them as the names of Section 4.3.2.
+4. **Permissions:** `permissions` stores a full POSIX mode, including the file
+   type bits. A reader keeps only the low 12 bits.
+5. **Sizes:** `Directory` and `Symlink` entries may store a nonzero `file_size`.
+   A reader treats it as `0`.
+6. **Recipient grants:** an append reused the archive's sender key, so one
+   sender and recipient pair may have different grants in several Directories.
+   A reader uses each of them instead of rejecting the conflict.
