@@ -148,6 +148,10 @@ write_ro_crate(writer, loaded, ProcessingOptions::default())?;
 
 The upstream parser accepts RO-Crate 1.1 and 1.2 metadata without upstream validation or warning emission; Pithos then applies its own source, path, limit, metadata, and conversion policy. Conversion stores the inspected `ro-crate-metadata.json` bytes rather than reserializing the graph. ZIP conversion streams retained members and does not extract them first.
 
+## Memory wiping
+
+Pithos wipes its owned Rust buffers. zstd internal allocations may retain plaintext after being freed.
+
 ## Platform behavior
 
 `pithos_lib` builds only on Linux, even with `default-features = false`. The Linux filesystem modules in `fs` and the Unix file source in `source` are always compiled.

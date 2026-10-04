@@ -111,8 +111,8 @@ impl PrivateKey {
         Self(StaticSecret::random().to_bytes())
     }
 
-    /// Takes 32 raw X25519 private key bytes. The consumed container is wiped when it drops,
-    /// so neither the caller nor Pithos keeps an unwiped copy.
+    /// Takes 32 raw X25519 private key bytes. Consumes and wipes the supplied container.
+    /// The returned key wipes its bytes on drop. Callers must wipe other copies.
     pub fn from_raw(bytes: Zeroizing<[u8; 32]>) -> Self {
         Self(*bytes)
     }

@@ -70,6 +70,11 @@ impl ArchiveView {
     /// Fails with [`PithosError::GrantReplacementUnsupported`] unless the archive is version
     /// 1.1 with one directory, and with [`PithosError::ContentUnavailable`] when a key needed
     /// by a sealed block list was not recovered.
+    ///
+    /// This replaces grants. It leaves content keys unchanged. Readers that already recovered
+    /// those keys can still decrypt retained content. Replacing grants does not restrict
+    /// entries whose block lists are stored in the clear. The new directory can be larger than
+    /// the old one, so reopening may need larger [`OpenLimits`](crate::archive::OpenLimits).
     pub fn replace_grants(
         &self,
         directory: &[u8],
