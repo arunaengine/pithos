@@ -2,17 +2,18 @@ use super::access::ResolvedAccess;
 use super::decode_validated_directory;
 use super::index::build_effective_index;
 use super::reader::{
-    AccessKeys, DecodedDirectoryCounts, OpenLimits, OpenOptions, classify_content_availability,
-    move_block_keys, remaining_deserialization_limits, resolve_block_lists, resolve_recipients,
-    validate_directory_len, validate_piece_keys,
+    AccessKeys, BlockListForm, DecodedDirectoryCounts, OpenLimits, OpenOptions,
+    classify_content_availability, move_block_keys, remaining_deserialization_limits,
+    resolve_block_lists, resolve_recipients, validate_directory_len, validate_piece_keys,
 };
 use super::types::{BlockDescriptor, BlockHash, FileId, Span, ValidatedSegment};
 use super::validation::{DescriptorList, IndexLimits, segment_from_parts};
 use super::view::ArchiveView;
 use crate::error::PithosError;
 use crate::format::directory::Directory;
+use crate::format::file_entry::{BlockDataState, FileType};
 use crate::format::header::{FileHeader, FormatVersion};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroizing;
 
@@ -390,12 +391,24 @@ fn complete_open(
     }
 
     let mut segments: Vec<ValidatedSegment> = Vec::new();
+    let mut block_lists = BTreeMap::new();
     for (segment_index, decoded) in raw.into_iter().enumerate() {
         let DecodedDirectory {
             mut directory,
             descriptors,
             span,
         } = decoded;
+        // Record each stored form before key resolution replaces sealed lists.
+        for (id, _, file) in directory.files.iter() {
+            if matches!(file.file_type, FileType::Data | FileType::Metadata) {
+                let form = match &file.block_data {
+                    BlockDataState::Decrypted(_) => BlockListForm::Plain,
+                    BlockDataState::Encrypted(_) => BlockListForm::Sealed,
+                    BlockDataState::Pieces(_) => BlockListForm::Pieces,
+                };
+                block_lists.insert(FileId(id), form);
+            }
+        }
         resolve_block_lists(
             &mut directory,
             &mut access,
@@ -435,5 +448,6 @@ fn complete_open(
         access_keys: std::mem::take(&mut settings.keys),
         limits,
         content_availability,
+        block_lists,
     })
 }

@@ -375,8 +375,23 @@ fn run() -> Result<(), PithosCliError> {
             }
             ReadCommands::List { file } => {
                 let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
+                let version = archive.view().version();
+                write_stdout(format_args!(
+                    "format version {}.{}",
+                    version >> 8,
+                    version & 0xff
+                ))?;
                 for entry in archive.entries() {
-                    write_stdout(format_args!("{} {:?} {}", entry.id, entry.kind, entry.path))?;
+                    match entry.block_list {
+                        Some(form) => write_stdout(format_args!(
+                            "{} {:?} {:?} {}",
+                            entry.id, entry.kind, form, entry.path
+                        ))?,
+                        None => write_stdout(format_args!(
+                            "{} {:?} {}",
+                            entry.id, entry.kind, entry.path
+                        ))?,
+                    }
                 }
             }
             ReadCommands::All { file } => {

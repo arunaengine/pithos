@@ -42,7 +42,7 @@ pub use planning::{
 #[cfg(feature = "crypt4gh")]
 pub(crate) use reader::ContentOperationError;
 pub use reader::{
-    AccessKeys, Archive, ArchiveEntry, ArchiveFeature, ArchiveReference, EntryKind,
+    AccessKeys, Archive, ArchiveEntry, ArchiveFeature, ArchiveReference, BlockListForm, EntryKind,
     ExternalBlockAccessPolicy, ExternalBlockResolver, NoExternalBlocks, OpenLimits, OpenOptions,
 };
 pub(crate) use snapshot::AppendSnapshot;

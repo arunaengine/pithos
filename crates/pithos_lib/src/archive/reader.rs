@@ -273,11 +273,24 @@ pub enum EntryKind {
     Symlink { target: String },
 }
 
+/// How a content entry stores its block list in the archive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockListForm {
+    /// The block list is stored in the clear.
+    Plain,
+    /// The block list is sealed with one file key.
+    Sealed,
+    /// The block list is sealed in independent pieces (format 1.1).
+    Pieces,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveEntry {
     pub id: u64,
     pub path: String,
     pub kind: EntryKind,
+    /// The stored block-list form of a file or metadata entry; `None` for other entries.
+    pub block_list: Option<BlockListForm>,
     pub created: u64,
     pub modified: u64,
     pub permissions: u32,
@@ -530,12 +543,14 @@ pub(super) fn archive_entry(
     index: &ArchiveIndex,
     entry: &super::index::IndexedEntry,
     content_availability: &BTreeMap<FileId, ContentAvailability>,
+    block_lists: &BTreeMap<FileId, BlockListForm>,
 ) -> ArchiveEntry {
     let metadata = entry.entry.metadata();
     ArchiveEntry {
         id: entry.id.0,
         path: entry.path.as_str().to_owned(),
         kind: entry_kind(&entry.entry, entry.id, content_availability),
+        block_list: block_lists.get(&entry.id).copied(),
         created: metadata.created,
         modified: metadata.modified,
         permissions: metadata.permissions,

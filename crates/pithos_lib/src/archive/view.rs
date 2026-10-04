@@ -3,7 +3,7 @@ use super::index::ArchiveIndex;
 use super::planning::{PlannedBlock, ReadPlan, check_block_limits};
 #[cfg(feature = "crypt4gh")]
 use super::reader::AccessKeys;
-use super::reader::{ArchiveEntry, ContentAvailability, OpenLimits, archive_entry};
+use super::reader::{ArchiveEntry, BlockListForm, ContentAvailability, OpenLimits, archive_entry};
 use super::snapshot::AppendSnapshot;
 use super::types::{ArchivePath, FileId, ReadRange, RecipientPair, Span};
 use super::validation::IndexLimits;
@@ -32,6 +32,7 @@ pub struct ArchiveView {
     pub(super) access_keys: AccessKeys,
     pub(super) limits: OpenLimits,
     pub(super) content_availability: BTreeMap<FileId, ContentAvailability>,
+    pub(super) block_lists: BTreeMap<FileId, BlockListForm>,
 }
 
 impl ArchiveView {
@@ -47,17 +48,26 @@ impl ArchiveView {
     }
 
     pub fn entries(&self) -> impl ExactSizeIterator<Item = ArchiveEntry> + '_ {
-        self.index
-            .entries()
-            .map(|entry| archive_entry(&self.index, entry, &self.content_availability))
+        self.index.entries().map(|entry| {
+            archive_entry(
+                &self.index,
+                entry,
+                &self.content_availability,
+                &self.block_lists,
+            )
+        })
     }
 
     pub fn entry(&self, path: &str) -> Result<Option<ArchiveEntry>, PithosError> {
         let path = ArchivePath::new(path)?;
-        Ok(self
-            .index
-            .entry_at_path(&path)
-            .map(|entry| archive_entry(&self.index, entry, &self.content_availability)))
+        Ok(self.index.entry_at_path(&path).map(|entry| {
+            archive_entry(
+                &self.index,
+                entry,
+                &self.content_availability,
+                &self.block_lists,
+            )
+        }))
     }
 
     /// Plans a read of `range` within the content of `path`.

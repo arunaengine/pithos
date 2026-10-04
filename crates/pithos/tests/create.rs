@@ -191,11 +191,10 @@ fn encrypted_archives_list_but_do_not_read_without_a_key() {
         .output()
         .unwrap();
     assert!(listing.status.success());
-    assert!(
-        String::from_utf8(listing.stdout)
-            .unwrap()
-            .contains("available: false")
-    );
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    assert!(listing.contains("available: false"));
+    assert!(listing.starts_with("format version 1.1\n"), "{listing}");
+    assert!(listing.contains(" Sealed "), "{listing}");
 
     let read = command()
         .args(["read", "data", archive.to_str().unwrap(), "encrypted.txt"])

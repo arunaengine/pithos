@@ -2,8 +2,9 @@ mod common;
 
 use common::util::{private_key, public_key};
 use pithos_lib::archive::{
-    AccessKeys, AppendOptions, Archive, ArchivePath, BlockKeyMode, EntryKind, EntryMetadata,
-    OpenOptions, PayloadCipher, Piece, PieceEncoder, ProcessingOptions, compose,
+    AccessKeys, AppendOptions, Archive, ArchivePath, ArchiveWriter, BlockKeyMode, BlockListForm,
+    EntryKind, EntryMetadata, OpenOptions, PayloadCipher, Piece, PieceEncoder, ProcessingOptions,
+    WriteOptions, compose,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
@@ -463,4 +464,45 @@ fn unique_key_pieces_record_no_content_hash_unless_asked() {
         content_hash(&[piece]),
         Some(*blake3::hash(&file).as_bytes())
     );
+}
+
+#[test]
+fn entries_report_how_their_block_list_is_stored() {
+    let composed = open(assemble(&[encode(1, b"pieces")]), recipient());
+    assert_eq!(
+        composed.entry("object").unwrap().unwrap().block_list,
+        Some(BlockListForm::Pieces)
+    );
+
+    for (options, form) in [
+        (WriteOptions::base(), BlockListForm::Plain),
+        (
+            WriteOptions::new(private_key("recipient1"), vec![public_key("recipient1")]),
+            BlockListForm::Sealed,
+        ),
+    ] {
+        let plain = form == BlockListForm::Plain;
+        let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+        writer
+            .add_directory(
+                ArchivePath::new("folder").unwrap(),
+                EntryMetadata::new(0, 0, 0o755),
+            )
+            .unwrap();
+        writer
+            .add_file(
+                ArchivePath::new("folder/data").unwrap(),
+                EntryMetadata::new(0, 0, 0o644),
+                ProcessingOptions::new(!plain, 0).unwrap(),
+                None,
+                std::io::Cursor::new(b"content"),
+            )
+            .unwrap();
+        let archive = open(writer.finish().unwrap(), recipient());
+        assert_eq!(
+            archive.entry("folder/data").unwrap().unwrap().block_list,
+            Some(form)
+        );
+        assert_eq!(archive.entry("folder").unwrap().unwrap().block_list, None);
+    }
 }
