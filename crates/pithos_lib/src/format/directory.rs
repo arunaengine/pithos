@@ -6,8 +6,8 @@ use crate::format::encryption::{
 };
 use crate::format::error::SerializationError;
 use crate::format::file_entry::{
-    BlockDataState, FileEntry, FileType, decode_file_entry, encode_file_entry,
-    validate_unique_block_references,
+    BlockDataState, FileEntry, FileType, VALID_PERMISSION_BITS, decode_file_entry,
+    encode_file_entry, validate_unique_block_references,
 };
 use crate::format::limits::{DeserializationError, DeserializationLimits};
 use crate::format::primitives::{
@@ -231,6 +231,106 @@ pub(crate) const STANDARD_RELATIONSHIPS: [(u64, &str); 10] = [
     (8, "INPUT_TO"),
     (9, "OUTPUT_FROM"),
 ];
+
+/// The names Pithos 0.7 stored for the standard relationships, in ID order.
+const RELATIONSHIP_NAMES_0_7: [&str; 10] = [
+    "Describes",
+    "Annotates",
+    "Derived_From",
+    "Source_Of",
+    "Previous_Version",
+    "Next_Version",
+    "Part_of",
+    "Contains",
+    "Input_To",
+    "Output_From",
+];
+
+/// Rewrites a decoded Pithos 0.7 directory into its version 1.0 form: standard relationship
+/// names, permissions without file type bits, and size 0 for directories and symlinks.
+fn upgrade_0_7_directory(directory: &mut Directory) {
+    for (id, name) in &mut directory.relations {
+        let index = usize::try_from(*id).unwrap_or(usize::MAX);
+        if RELATIONSHIP_NAMES_0_7.get(index) == Some(&name.as_str()) {
+            *name = STANDARD_RELATIONSHIPS[index].1.to_owned();
+        }
+    }
+    let Ok(()) = directory
+        .files
+        .try_for_each_mut::<std::convert::Infallible>(|_, entry| {
+            entry.permissions &= VALID_PERMISSION_BITS;
+            if matches!(entry.file_type, FileType::Directory | FileType::Symlink) {
+                entry.file_size = 0;
+            }
+            Ok(())
+        });
+}
+
+/// The CRC-32 that Pithos 0.7.0 stored. It covers the parent option only when present, the file,
+/// block and encryption items without their counts, the relationships with their count, and the
+/// directory length as ULEB128. Returns `None` when the bytes do not decode.
+fn checksum_0_7_0(bytes: &[u8], limits: &DeserializationLimits) -> Option<u32> {
+    let body = &bytes[..bytes.len() - 12];
+    let mut reader = Cursor::new(body);
+    reader.set_position(DIRECTORY_MARKER.len() as u64);
+    let mut hasher = crc32fast::Hasher::new();
+    let cover = |hasher: &mut crc32fast::Hasher, start: u64, reader: &Cursor<&[u8]>| {
+        hasher.update(&body[start as usize..reader.position() as usize]);
+    };
+    let start = reader.position();
+    if reader.read_u8().ok()? == 1 {
+        reader.read_varint::<u64>().ok()?;
+        reader.read_varint::<u64>().ok()?;
+        cover(&mut hasher, start, &reader);
+    }
+    let mut references = limits.max_references;
+    let mut block_references = limits.max_block_references;
+    let files = bounded_len(reader.read_varint().ok()?, limits.max_file_entries, "files").ok()?;
+    let start = reader.position();
+    for _ in 0..files {
+        reader.read_varint::<u64>().ok()?;
+        decode_string(&mut reader, limits).ok()?;
+        decode_file_entry(&mut reader, limits, &mut references, &mut block_references).ok()?;
+    }
+    cover(&mut hasher, start, &reader);
+    let blocks = bounded_len(
+        reader.read_varint().ok()?,
+        limits.max_block_descriptors,
+        "blocks",
+    );
+    let start = reader.position();
+    for _ in 0..blocks.ok()? {
+        reader.read_exact(&mut [0; 32]).ok()?;
+        decode_block_index_entry(&mut reader, limits).ok()?;
+    }
+    cover(&mut hasher, start, &reader);
+    let start = reader.position();
+    let relations = bounded_len(
+        reader.read_varint().ok()?,
+        limits.max_relationships,
+        "relations",
+    );
+    for _ in 0..relations.ok()? {
+        reader.read_varint::<u64>().ok()?;
+        decode_string(&mut reader, limits).ok()?;
+    }
+    cover(&mut hasher, start, &reader);
+    let limit = limits.max_collection_entries;
+    let sections = bounded_len(reader.read_varint().ok()?, limit, "encryption").ok()?;
+    let start = reader.position();
+    for _ in 0..sections {
+        reader.read_exact(&mut [0; 32]).ok()?;
+        decode_encryption_section(&mut reader, limits).ok()?;
+    }
+    cover(&mut hasher, start, &reader);
+    if reader.position() != body.len() as u64 {
+        return None;
+    }
+    let mut length = Vec::new();
+    length.write_varint(bytes.len() as u64).ok()?;
+    hasher.update(&length);
+    Some(hasher.finalize())
+}
 
 impl Directory {
     pub(crate) fn new(
@@ -523,12 +623,13 @@ pub(crate) fn decode_complete_directory(
     bytes: &[u8],
     limits: &DeserializationLimits,
 ) -> Result<Directory, PithosError> {
-    decode_complete_directory_with_validation(bytes, limits, |_| Ok(()))
+    decode_complete_directory_with_validation(bytes, limits, false, |_| Ok(()))
 }
 
 pub(crate) fn decode_complete_directory_with_validation(
     bytes: &[u8],
     limits: &DeserializationLimits,
+    pithos_0_7: bool,
     validate: impl Fn(&Directory) -> Result<(), PithosError>,
 ) -> Result<Directory, PithosError> {
     let mut remaining_block_references = limits.max_block_references;
@@ -538,6 +639,7 @@ pub(crate) fn decode_complete_directory_with_validation(
         limits,
         &mut remaining_block_references,
         &mut blocks,
+        pithos_0_7,
         validate,
     )?;
     directory.blocks = blocks;
@@ -545,11 +647,13 @@ pub(crate) fn decode_complete_directory_with_validation(
 }
 
 /// Decodes and checks a complete directory. Its block descriptors go to `blocks`.
+/// With `pithos_0_7`, it also accepts the Pithos 0.7.0 checksum and returns the version 1.0 form.
 pub(crate) fn decode_complete_directory_with_validation_and_budget(
     bytes: &[u8],
     limits: &DeserializationLimits,
     remaining_block_references: &mut u64,
     blocks: &mut impl BlockSink,
+    pithos_0_7: bool,
     validate: impl Fn(&Directory) -> Result<(), PithosError>,
 ) -> Result<Directory, PithosError> {
     if bytes.len() < MIN_DIRECTORY_LEN {
@@ -584,15 +688,20 @@ pub(crate) fn decode_complete_directory_with_validation_and_budget(
             .expect("checked directory footer"),
     );
     let computed_crc = crc32fast::hash(&bytes[..bytes.len() - 4]);
-    if encoded_crc != computed_crc {
+    if encoded_crc != computed_crc
+        && !(pithos_0_7 && checksum_0_7_0(bytes, limits) == Some(encoded_crc))
+    {
         return Err(PithosError::DirectoryChecksumMismatch {
             expected: computed_crc,
             actual: encoded_crc,
         });
     }
     let mut reader = Cursor::new(bytes);
-    let directory =
+    let mut directory =
         decode_directory_with_sink(&mut reader, limits, remaining_block_references, blocks)?;
+    if pithos_0_7 {
+        upgrade_0_7_directory(&mut directory);
+    }
     validate(&directory)?;
     if reader.position() != bytes.len() as u64 {
         return Err(PithosError::DirectoryConsumptionMismatch {
@@ -698,6 +807,7 @@ mod tests {
             decode_complete_directory_with_validation(
                 &bytes,
                 &DeserializationLimits::default(),
+                false,
                 |directory| {
                     if directory.files.get_by_path("/invalid").is_some() {
                         Err(PithosError::InvalidArchivePath {

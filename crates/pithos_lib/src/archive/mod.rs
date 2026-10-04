@@ -62,6 +62,7 @@ pub(crate) fn metadata_digest(directory_hashes: &[[u8; 32]]) -> [u8; 32] {
 
 pub(crate) fn decode_validated_directory(
     bytes: &[u8],
+    version: crate::format::header::FormatVersion,
     limits: &crate::format::limits::DeserializationLimits,
     remaining_block_references: &mut u64,
     blocks: &mut impl crate::format::directory::BlockSink,
@@ -71,6 +72,7 @@ pub(crate) fn decode_validated_directory(
         limits,
         remaining_block_references,
         blocks,
+        version == crate::format::header::FormatVersion::V0_7,
         |directory| validate_directory_entries(&directory.files),
     )
 }

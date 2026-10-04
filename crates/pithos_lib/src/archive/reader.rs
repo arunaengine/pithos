@@ -835,7 +835,7 @@ pub(super) fn validate_piece_keys(
         for (id, _, file) in directory.files.iter() {
             file_ids.insert(id);
             if let BlockDataState::Pieces(pieces) = &file.block_data {
-                if version == FormatVersion::V1_0 {
+                if version != FormatVersion::V1_1 {
                     return Err(PithosError::UnsupportedBlockListPieces);
                 }
                 for piece in pieces {

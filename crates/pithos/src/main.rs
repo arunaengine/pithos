@@ -375,12 +375,14 @@ fn run() -> Result<(), PithosCliError> {
             }
             ReadCommands::List { file } => {
                 let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
-                let version = archive.view().version();
-                write_stdout(format_args!(
-                    "format version {}.{}",
-                    version >> 8,
-                    version & 0xff
-                ))?;
+                match archive.view().version() {
+                    0x8002 => write_stdout(format_args!("format version 0.7"))?,
+                    version => write_stdout(format_args!(
+                        "format version {}.{}",
+                        version >> 8,
+                        version & 0xff
+                    ))?,
+                }
                 for entry in archive.entries() {
                     match entry.block_list {
                         Some(form) => write_stdout(format_args!(

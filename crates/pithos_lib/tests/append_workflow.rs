@@ -9,7 +9,7 @@ use pithos_lib::archive::{
     EntryMetadata, PayloadCipher, ProcessingOptions, WriteOptions,
 };
 use pithos_lib::error::PithosError;
-use pithos_lib::fs::{FsError, append_files};
+use pithos_lib::fs::{FsError, append_files, grant_readers};
 use std::io::Cursor;
 use std::path::PathBuf;
 
@@ -30,6 +30,33 @@ fn version_1_0_base_archive(temporary: &tempfile::TempDir) -> PathBuf {
     let path = temporary.path().join("legacy.pith");
     std::fs::write(&path, bytes).unwrap();
     path
+}
+
+#[test]
+fn appends_and_grants_to_pithos_0_7_archives_are_refused_before_writing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let archive = temporary.path().join("pithos-0.7.pith");
+    std::fs::copy("tests/data/pithos-0.7.3.pith", &archive).unwrap();
+    let original = std::fs::read(&archive).unwrap();
+    let source = temporary.path().join("appended.txt");
+    std::fs::write(&source, b"appended payload").unwrap();
+    let options = || AppendOptions::new(private_key("recipient1"), vec![public_key("recipient2")]);
+    let refused = |result| {
+        matches!(
+            result,
+            Err(FsError::Core {
+                source: PithosError::UnsupportedFileVersion { actual: 0x8002, .. },
+                ..
+            })
+        )
+    };
+    assert!(refused(
+        append_files(&archive, options(), &[source]).map(|_| ())
+    ));
+    assert!(refused(
+        grant_readers(&archive, options(), &[2]).map(|_| ())
+    ));
+    assert_eq!(std::fs::read(&archive).unwrap(), original);
 }
 
 #[test]

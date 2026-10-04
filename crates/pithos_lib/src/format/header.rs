@@ -25,6 +25,8 @@ impl FileHeader {
 /// The wire rules of one archive. An append keeps the version of the archive it extends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FormatVersion {
+    /// Pithos 0.7, read only. It stored version 1.0 as ULEB128 `80 02`, which reads as `0x8002`.
+    V0_7,
     V1_0,
     V1_1,
 }
@@ -35,6 +37,7 @@ impl FormatVersion {
 
     pub(crate) fn from_wire(version: u16) -> Option<Self> {
         match version {
+            0x8002 => Some(Self::V0_7),
             0x0100 => Some(Self::V1_0),
             0x0101 => Some(Self::V1_1),
             _ => None,
@@ -43,6 +46,7 @@ impl FormatVersion {
 
     pub(crate) fn wire(self) -> u16 {
         match self {
+            Self::V0_7 => 0x8002,
             Self::V1_0 => 0x0100,
             Self::V1_1 => 0x0101,
         }

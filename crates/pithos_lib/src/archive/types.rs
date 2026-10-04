@@ -181,7 +181,7 @@ impl Processing {
         }
         let encrypted = value & 0x08 != 0;
         if value & ProcessingFlags::VERSION_1_1_MASK != 0 {
-            if version == FormatVersion::V1_0 {
+            if version != FormatVersion::V1_1 {
                 return Err(PithosError::UnsupportedProcessingFlags(value));
             }
             if !encrypted {

@@ -10,6 +10,59 @@ use pithos_lib::error::PithosError;
 use pithos_lib::fs::{ExtractionOptions, extract, extract_all, extract_all_with_options};
 use pithos_lib::source::MemorySource;
 
+const PITHOS_0_7_FIXTURES: [&str; 2] = [
+    "tests/data/pithos-0.7.0.pith",
+    "tests/data/pithos-0.7.3.pith",
+];
+
+#[test]
+fn pithos_0_7_archives_read_with_their_content_and_metadata() {
+    for fixture in PITHOS_0_7_FIXTURES {
+        let path = std::path::Path::new(fixture);
+        let archive = open(path, AccessKeys::new().with_key(private_key("recipient1")));
+        assert_eq!(archive.view().version(), 0x8002, "{fixture}");
+        let files: [(&str, &[u8]); 4] = [
+            ("alpha.txt", b"alpha\n"),
+            ("data/empty.txt", b""),
+            ("data/raw/beta.txt", b"beta\n"),
+            ("gamma.txt", b"gamma\n"),
+        ];
+        for (path, expected) in files {
+            let mut content = Vec::new();
+            archive.copy_to(path, &mut content).unwrap();
+            assert_eq!(content, expected, "{fixture} {path}");
+        }
+        let alpha = archive.entry("alpha.txt").unwrap().unwrap();
+        assert_eq!(alpha.permissions, 0o600, "{fixture}");
+        let data = archive.entry("data").unwrap().unwrap();
+        assert!(matches!(data.kind, EntryKind::Directory));
+        assert_eq!(data.permissions, 0o750, "{fixture}");
+        let link = archive.entry("data/link").unwrap().unwrap();
+        assert!(matches!(link.kind, EntryKind::Symlink { ref target } if target == "raw/beta.txt"));
+    }
+}
+
+#[test]
+fn pithos_0_7_archives_reject_a_changed_directory() {
+    for fixture in PITHOS_0_7_FIXTURES {
+        let mut bytes = std::fs::read(fixture).unwrap();
+        let path = bytes
+            .windows(8)
+            .rposition(|window| window == b"data/raw")
+            .unwrap();
+        bytes[path] ^= 1;
+        let options = OpenOptions::default()
+            .with_access_keys(AccessKeys::new().with_key(private_key("recipient1")));
+        assert!(
+            matches!(
+                Archive::open(MemorySource::new(bytes), options),
+                Err(PithosError::DirectoryChecksumMismatch { .. })
+            ),
+            "{fixture}"
+        );
+    }
+}
+
 #[test]
 fn public_reader_lists_copies_ranges_extracts_and_exports() {
     let temporary = tempfile::tempdir().unwrap();

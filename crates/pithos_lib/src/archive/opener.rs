@@ -262,6 +262,7 @@ impl ArchiveOpener {
                 let mut descriptors = DescriptorList::new(decoded_chain.version, response.len());
                 let directory = decode_validated_directory(
                     &response,
+                    decoded_chain.version,
                     &limits,
                     &mut decoded_chain.remaining_block_references,
                     &mut descriptors,
@@ -364,7 +365,9 @@ fn complete_open(
         for (sender, section) in &directory.encryption {
             for (recipient, recipient_section) in &section.recipients {
                 let pair = (*sender, *recipient);
-                if let Some(first) = first_grants.get(&pair)
+                // Pithos 0.7 appends reused the writer key, so one pair may hold several grants.
+                if version != FormatVersion::V0_7
+                    && let Some(first) = first_grants.get(&pair)
                     && *first != &recipient_section.recipient_data
                 {
                     return Err(PithosError::ConflictingRecipientGrant);

@@ -29,17 +29,19 @@ fn public_open_rejects_a_footer_claiming_an_impossible_directory() {
 }
 
 #[test]
-fn public_open_rejects_the_legacy_varint_header() {
-    let (mut bytes, _) = archive_with_entries(Vec::new());
-    bytes[..6].copy_from_slice(b"PITH\x80\x02");
+fn public_open_rejects_unknown_header_versions() {
+    for version in [0x0102u16, 0x8003] {
+        let (mut bytes, _) = archive_with_entries(Vec::new());
+        bytes[4..6].copy_from_slice(&version.to_be_bytes());
 
-    assert!(matches!(
-        Archive::open(MemorySource::new(bytes), OpenOptions::default()),
-        Err(PithosError::UnsupportedFileVersion {
-            supported: 0x0101,
-            actual: 0x8002,
-        })
-    ));
+        assert!(matches!(
+            Archive::open(MemorySource::new(bytes), OpenOptions::default()),
+            Err(PithosError::UnsupportedFileVersion {
+                supported: 0x0101,
+                actual,
+            }) if actual == version
+        ));
+    }
 }
 
 fn archive_with_entries(entries: Vec<(&str, EntryMetadata)>) -> (Vec<u8>, PrivateKey) {

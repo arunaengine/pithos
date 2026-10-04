@@ -42,7 +42,8 @@ impl ArchiveView {
         self.metadata_digest
     }
 
-    /// The format version stored in the file header: `0x0100` for 1.0, `0x0101` for 1.1.
+    /// The format version stored in the file header: `0x0100` for 1.0, `0x0101` for 1.1, and
+    /// `0x8002` for a read-only Pithos 0.7 archive.
     pub fn version(&self) -> u16 {
         self.version.wire()
     }

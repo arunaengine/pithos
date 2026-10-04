@@ -39,6 +39,7 @@ pub fn decode_directory(data: &[u8]) -> FuzzOutcome {
         indexmap::IndexMap::new();
     match crate::archive::decode_validated_directory(
         data,
+        crate::format::header::FormatVersion::CURRENT,
         &limits,
         &mut remaining_block_references,
         &mut blocks,

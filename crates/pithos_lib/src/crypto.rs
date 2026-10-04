@@ -270,7 +270,7 @@ pub(crate) fn grant_wrapping_key(
     nonce: &[u8; 12],
 ) -> SharedSecret {
     match version {
-        FormatVersion::V1_0 => shared,
+        FormatVersion::V0_7 | FormatVersion::V1_0 => shared,
         FormatVersion::V1_1 => {
             let mut info = Zeroizing::new([0u8; GRANT_KEY_INFO.len() + 64]);
             info[..GRANT_KEY_INFO.len()].copy_from_slice(GRANT_KEY_INFO);

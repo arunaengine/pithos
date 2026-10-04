@@ -4,6 +4,7 @@ use crate::archive::{
 };
 use crate::crypto::PrivateKey;
 use crate::error::PithosError;
+use crate::format::header::FormatVersion;
 use crate::fs::FsError;
 use crate::fs::ingest::{InputManifest, build_input_manifest};
 use crate::source::{ArchiveSource, FileSource, SourceError};
@@ -333,15 +334,23 @@ fn open_snapshot(
     reads: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
 ) -> Result<AppendSnapshot, PithosError> {
-    Archive::open(
+    let archive = Archive::open(
         AppendSource {
             source: FileSource::from_file(locked.try_clone()?)?,
             reads,
             bytes,
         },
         OpenOptions::default().with_access_keys(AccessKeys::new().with_key(sender)),
-    )
-    .map(Archive::into_append_snapshot)
+    )?;
+    let version = archive.view().version();
+    // Pithos 0.7 archives are read only.
+    if version == FormatVersion::V0_7.wire() {
+        return Err(PithosError::UnsupportedFileVersion {
+            supported: FormatVersion::CURRENT.wire(),
+            actual: version,
+        });
+    }
+    Ok(archive.into_append_snapshot())
 }
 
 fn fresh_wrapping_sender(snapshot: &AppendSnapshot, options: &AppendOptions) -> PrivateKey {
