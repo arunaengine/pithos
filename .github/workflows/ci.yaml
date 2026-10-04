@@ -44,3 +44,21 @@ jobs:
 
       - name: Run MSRV workspace tests
         run: cargo +1.89.0 test --locked --workspace --all-features
+
+  block-count:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the ignored 5 TiB block-count test in release mode
+        run: >-
+          cargo +stable test --locked --release -p pithos_lib --test pieces
+          a_composition_with_the_block_count_of_5_tib_opens_with_default_limits -- --ignored --exact
