@@ -65,6 +65,7 @@ zeroize = "1.8.2"
 criterion = "0.8.2"
 peak_alloc = "0.3.0"
 proptest = "1.6.0"
+rustversion = "1.0.23"
 tempfile = "3.21"
 tokio = { version = "1.52.3", default-features = false, features = ["rt"] }
 trybuild = "1.0.104"

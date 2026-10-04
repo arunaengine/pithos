@@ -1,3 +1,5 @@
+// Compiler messages change between releases, so the expected output pins the MSRV compiler.
+#[rustversion::attr(not(stable(1.89)), ignore = "expected output is from Rust 1.89")]
 #[test]
 fn secret_ownership_and_writer_typestate_are_compile_time_enforced() {
     let cases = trybuild::TestCases::new();

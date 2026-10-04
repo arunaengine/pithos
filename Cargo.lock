@@ -1434,6 +1434,7 @@ dependencies = [
  "proptest",
  "ro-crate-rs",
  "rustix",
+ "rustversion",
  "sha2",
  "shake",
  "tempfile",
