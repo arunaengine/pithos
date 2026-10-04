@@ -14,9 +14,10 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::ops::Range;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 /// How the test source answers reads.
 #[derive(Clone, Copy, Debug)]
@@ -1068,4 +1069,101 @@ fn encrypted_repeated_blocks_retain_only_their_output() {
     // Both batches were outstanding at once, and each fetched the stored block once.
     assert_eq!(probe.reads.lock().unwrap()[3..].len(), 2);
     assert_eq!(probe.max_outstanding.load(Ordering::SeqCst), 2);
+}
+
+/// A generous cap that turns a lost signal into a failure instead of a hang.
+const HANG_CAP: Duration = Duration::from_secs(60);
+
+/// What a worker thread reports and waits for.
+struct WorkerSignals {
+    started: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    /// Whether the reader still received the result.
+    finished: mpsc::Sender<bool>,
+}
+
+/// Runs tasks inline until `threaded` is set, then each on its own thread once released.
+#[derive(Clone)]
+struct WorkerHook {
+    threaded: Arc<AtomicBool>,
+    signals: Arc<WorkerSignals>,
+    workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+
+impl BlockingHook for WorkerHook {
+    fn spawn_blocking<F, T>(&self, task: F) -> impl Future<Output = T> + Send
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel();
+        if self.threaded.load(Ordering::SeqCst) {
+            let signals = Arc::clone(&self.signals);
+            let worker = std::thread::spawn(move || {
+                signals.started.send(()).unwrap();
+                signals
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(HANG_CAP)
+                    .unwrap();
+                let delivered = sender.send(task()).is_ok();
+                signals.finished.send(delivered).unwrap();
+            });
+            self.workers.lock().unwrap().push(worker);
+        } else {
+            sender.send(task()).unwrap();
+        }
+        std::future::poll_fn(move |_| match receiver.try_recv() {
+            Ok(output) => Poll::Ready(output),
+            Err(mpsc::TryRecvError::Empty) => Poll::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => panic!("the worker stopped"),
+        })
+    }
+}
+
+#[test]
+fn dropping_a_stream_while_a_worker_decodes_discards_the_result() {
+    let bytes = blocks(8, true);
+    let (started, started_signal) = mpsc::channel();
+    let (release, release_signal) = mpsc::channel();
+    let (finished, finished_signal) = mpsc::channel();
+    let hook = WorkerHook {
+        threaded: Arc::default(),
+        signals: Arc::new(WorkerSignals {
+            started,
+            release: Mutex::new(release_signal),
+            finished,
+        }),
+        workers: Arc::default(),
+    };
+    let (source, probe, _) = TestSource::new(&bytes);
+    let archive = block_on(AsyncArchive::open_with_hook(
+        source,
+        sender(),
+        None,
+        hook.clone(),
+    ))
+    .unwrap()
+    .with_read_limits(single_blocks(1, 1));
+    hook.threaded.store(true, Ordering::SeqCst);
+    let mut stream = archive.read_range("data", 0..128).unwrap();
+    assert!(next(&mut stream).is_pending());
+    started_signal.recv_timeout(HANG_CAP).unwrap();
+    drop(stream);
+    release.send(()).unwrap();
+    // The worker completed, but nobody received its result.
+    assert!(!finished_signal.recv_timeout(HANG_CAP).unwrap());
+    let workers = std::mem::take(&mut *hook.workers.lock().unwrap());
+    assert_eq!(workers.len(), 1);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    // Only the test and the archive still hold the hook state, and the archive reads again.
+    assert_eq!(Arc::strong_count(&hook.signals), 2);
+    assert_eq!(probe.outstanding.load(Ordering::SeqCst), 0);
+    hook.threaded.store(false, Ordering::SeqCst);
+    let (output, error) = drain(archive.read_range("data", 0..128).unwrap(), &probe);
+    assert!(error.is_none());
+    assert_eq!(output, content(8));
 }
