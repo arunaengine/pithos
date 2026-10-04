@@ -1,7 +1,8 @@
 //! Checks that secret buffers are wiped before their allocations are freed.
 //!
 //! The unit-test binary uses an allocator that inspects freed blocks only while the current
-//! thread watches, so other tests running in parallel are not affected.
+//! thread watches, so other tests running in parallel are not affected. It reads only blocks
+//! whose bytes are known to be initialized: blocks it filled itself and buffers the test names.
 
 use crate::format::encryption::decode_decrypted_recipient_list;
 use crate::format::limits::DeserializationLimits;
@@ -20,10 +21,16 @@ const SECRET: [u8; 32] = {
     bytes
 };
 
+/// Most blocks one watch can track; the tests allocate far fewer.
+const TRACKED_CAPACITY: usize = 64;
+/// Fill byte for blocks allocated while watching, so every inspected byte is initialized.
+const FILL: u8 = 0xEE;
+
 thread_local! {
     static WATCHED_SIZE: Cell<Option<usize>> = const { Cell::new(None) };
     static ZEROED_FREES: Cell<usize> = const { Cell::new(0) };
     static SECRET_FREES: Cell<usize> = const { Cell::new(0) };
+    static TRACKED: Cell<[usize; TRACKED_CAPACITY]> = const { Cell::new([0; TRACKED_CAPACITY]) };
 }
 
 struct Inspecting;
@@ -33,11 +40,38 @@ impl Inspecting {
         WATCHED_SIZE.try_with(Cell::get).ok().flatten().is_some()
     }
 
-    /// Records whether a block about to be freed is wiped or still holds the secret.
+    fn track(pointer: *mut u8) {
+        let _ = TRACKED.try_with(|tracked| {
+            let mut slots = tracked.get();
+            if let Some(slot) = slots.iter_mut().find(|slot| **slot == 0) {
+                *slot = pointer as usize;
+                tracked.set(slots);
+            }
+        });
+    }
+
+    /// Removes `pointer` from the tracked blocks and reports whether it was tracked.
+    fn untrack(pointer: *mut u8) -> bool {
+        TRACKED
+            .try_with(|tracked| {
+                let mut slots = tracked.get();
+                let found = slots.iter_mut().find(|slot| **slot == pointer as usize);
+                let was_tracked = found.map(|slot| *slot = 0).is_some();
+                tracked.set(slots);
+                was_tracked
+            })
+            .unwrap_or(false)
+    }
+
+    /// Records whether a tracked block about to be freed is wiped or still holds the secret.
     unsafe fn inspect(pointer: *mut u8, layout: Layout) {
         let Ok(Some(size)) = WATCHED_SIZE.try_with(Cell::get) else {
             return;
         };
+        if !Self::untrack(pointer) {
+            return;
+        }
+        // Tracked blocks were filled at allocation or named by the test as fully initialized.
         let bytes = unsafe { std::slice::from_raw_parts(pointer, layout.size()) };
         if layout.size() == size && bytes.iter().all(|byte| *byte == 0) {
             ZEROED_FREES.set(ZEROED_FREES.get() + 1);
@@ -50,7 +84,12 @@ impl Inspecting {
 
 unsafe impl GlobalAlloc for Inspecting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { System.alloc(layout) }
+        let pointer = unsafe { System.alloc(layout) };
+        if Self::watching() && !pointer.is_null() {
+            unsafe { std::ptr::write_bytes(pointer, FILL, layout.size()) };
+            Self::track(pointer);
+        }
+        pointer
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
@@ -80,35 +119,52 @@ unsafe impl GlobalAlloc for Inspecting {
 #[global_allocator]
 static ALLOCATOR: Inspecting = Inspecting;
 
-/// Runs `action` while watching freed blocks of `size` bytes. Returns the number of wiped
-/// blocks of that size and the number of freed blocks of any size that held the secret.
-fn watch<T>(size: usize, action: impl FnOnce() -> T) -> (T, usize, usize) {
+/// Runs `action` while watching freed blocks of `size` bytes. `initialized` names existing
+/// buffers whose whole allocation is initialized; blocks allocated during the watch count too.
+/// Returns the number of wiped blocks of that size and of freed blocks that held the secret.
+fn watch<T>(
+    size: usize,
+    initialized: &[*const u8],
+    action: impl FnOnce() -> T,
+) -> (T, usize, usize) {
     ZEROED_FREES.set(0);
     SECRET_FREES.set(0);
+    TRACKED.set([0; TRACKED_CAPACITY]);
+    for pointer in initialized {
+        Inspecting::track(pointer.cast_mut());
+    }
     WATCHED_SIZE.set(Some(size));
     let result = action();
     WATCHED_SIZE.set(None);
+    TRACKED.set([0; TRACKED_CAPACITY]);
     (result, ZEROED_FREES.get(), SECRET_FREES.get())
 }
 
 #[test]
 fn secret_growth_and_drop_wipe_freed_buffers() {
+    // `vec![SECRET]` has no spare capacity, so its whole allocation is initialized.
     let mut secrets = Zeroizing::new(vec![SECRET]);
-    let (grown, zeroed, leaked) = watch(32, || reserve_secret(&mut secrets, 3, "secrets"));
+    let initialized = [secrets.as_ptr().cast::<u8>()];
+    let (grown, zeroed, leaked) = watch(32, &initialized, || {
+        reserve_secret(&mut secrets, 3, "secrets")
+    });
     grown.unwrap();
     assert_eq!((zeroed, leaked), (1, 0));
     assert_eq!(secrets.as_slice(), &[SECRET]);
     let capacity = secrets.capacity();
     assert!(capacity >= 4);
 
-    let ((), zeroed, leaked) = watch(capacity * 32, || drop(secrets));
+    // The grown buffer was allocated, and so filled, while the first watch ran.
+    let initialized = [secrets.as_ptr().cast::<u8>()];
+    let ((), zeroed, leaked) = watch(capacity * 32, &initialized, || drop(secrets));
     assert_eq!((zeroed, leaked), (1, 0));
 }
 
 #[test]
 fn ordinary_growth_is_detected() {
     let mut plain = vec![SECRET];
-    let ((), _, leaked) = watch(32, || plain.reserve_exact(7));
+    let initialized = [plain.as_ptr().cast::<u8>()];
+    let ((), _, leaked) = watch(32, &initialized, || plain.reserve_exact(7));
     assert_eq!(leaked, 1);
 }
 
@@ -120,7 +176,7 @@ fn decode_error_wipes_partial_secrets() {
     bytes.push(1);
     bytes.extend_from_slice(&[0; 32]);
     let limits = DeserializationLimits::default();
-    let (decoded, zeroed, leaked) = watch(2 * size_of::<(u64, [u8; 32])>(), || {
+    let (decoded, zeroed, leaked) = watch(2 * size_of::<(u64, [u8; 32])>(), &[], || {
         decode_decrypted_recipient_list(&bytes, &limits).map(|_| ())
     });
     assert!(decoded.is_err());
