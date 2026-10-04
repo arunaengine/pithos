@@ -1,0 +1,15 @@
+error[E0382]: borrow of moved value: `writer`
+ --> tests/ui/writer_use_after_finish.rs:9:13
+  |
+7 |     let mut writer = ArchiveWriter::create(Vec::new(), WriteOptions::new(sender, vec![recipient])).unwrap();
+  |         ---------- move occurs because `writer` has type `ArchiveWriter<Vec<u8>>`, which does not implement the `Copy` trait
+8 |     let _sink = writer.finish().unwrap();
+  |                        -------- `writer` moved due to this method call
+9 |     let _ = writer.add_directory(ArchivePath::new("after").unwrap(), EntryMetadata::new(0, 0, 0));
+  |             ^^^^^^ value borrowed here after move
+  |
+note: `ArchiveWriter::<W>::finish` takes ownership of the receiver `self`, which moves `writer`
+ --> src/archive/writer.rs
+  |
+  |     pub fn finish(mut self) -> Result<W, FinishError<W>> {
+  |                       ^^^^

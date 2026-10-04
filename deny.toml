@@ -106,7 +106,8 @@ confidence-threshold = 0.8
 exceptions = [
     { allow = ["MPL-2.0"], crate = "option-ext" },
     { allow = ["Zlib"], crate = "zlib-rs" },
-    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "winx" }
+    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "winx" },
+    { allow = ["NCSA"], crate = "libfuzzer-sys" }
 ]
 
 # Some crates don't have (easily) machine readable licensing information,

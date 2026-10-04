@@ -1,41 +1,28 @@
-use crate::helpers::chacha_poly1305::ChaChaPoly1305Error;
-use crate::helpers::crypt4gh::Crypt4GHError;
-use crate::helpers::x25519_keys::CryptError;
-use crate::helpers::zstd::ZstdError;
-use crate::model::deserialization::DeserializationError;
-use crate::model::serialization::SerializationError;
-use rocraters::ro_crate::read::CrateReadError;
+use crate::archive::ArchiveFeature;
+use crate::crypto::CryptoError;
+use crate::source::SourceError;
 use std::io;
-use std::path::PathBuf;
-use std::time::SystemTimeError;
 use thiserror::Error;
-use zip::result::ZipError;
+
+pub use crate::format::error::SerializationError;
+pub use crate::format::limits::DeserializationError;
 
 /// Custom top-level error type for all of Pithos
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum PithosError {
-    #[error("IO error: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("Conversion error: {0}")]
-    Conversion(String),
-    #[error("System time error: {0}")]
-    SystemTimeError(#[from] SystemTimeError),
-    #[error("Failed to strip prefix: {0}")]
-    StripPrefix(#[from] std::path::StripPrefixError),
-    #[error("Walkdir error: {0}")]
-    WalkDir(#[from] walkdir::Error),
+    #[error("archive source error: {0}")]
+    Source(#[from] SourceError),
     #[error("FastCDC error: {0}")]
     FastCDC(#[from] fastcdc::v2020::Error),
-    #[error("Serialization error: {0:?}")]
+    #[error("serialization error: {0}")]
     Serialization(#[from] SerializationError),
-    #[error("Deserialization error: {0:?}")]
+    #[error("deserialization error: {0}")]
     Deserialization(#[from] DeserializationError),
     #[error("Unsupported file version: supported {supported:#06x}, actual {actual:#06x}")]
     UnsupportedFileVersion { supported: u16, actual: u16 },
-    #[error("Multiple reader keys are not supported")]
-    UnsupportedMultipleReaderKeys,
-    #[error("Reference content is not supported for file entry construction")]
-    UnsupportedReferenceContent,
     #[error("Invalid directory marker: expected {expected:?}, got {actual:?}")]
     InvalidDirectoryMarker { expected: [u8; 8], actual: [u8; 8] },
     #[error("Directory length mismatch: expected {expected}, got {actual}")]
@@ -52,49 +39,100 @@ pub enum PithosError {
     },
     #[error("allocation failed for {field}: {size}")]
     AllocationFailed { field: &'static str, size: u64 },
-    #[error("invalid directory range: {0}")]
-    InvalidDirectoryRange(String),
-    #[error("invalid directory chain: {0}")]
-    InvalidDirectoryChain(String),
+    #[error("invalid directory range while {operation}")]
+    InvalidDirectoryRange { operation: &'static str },
+    #[error("invalid directory chain while {operation}")]
+    InvalidDirectoryChain { operation: &'static str },
     #[error("Crypt error: {0}")]
-    Crypt(#[from] CryptError),
-    #[error("Crypt4GH error: {0}")]
-    Crypt4GH(#[from] Crypt4GHError),
-    #[error("Encryption error: {0}")]
-    Cipher(#[from] ChaChaPoly1305Error),
-    #[error("Decryption error: {0}")]
-    Compression(#[from] ZstdError),
-    #[error("RO-Crate parse or validation error: {0}")]
-    RoCrate(#[from] CrateReadError),
-    #[error("ZIP archive error: {0}")]
-    Zip(#[from] ZipError),
-    #[error("Invalid RO-Crate source {path}: expected {expected}")]
-    InvalidRoCrateSource {
-        path: PathBuf,
-        expected: &'static str,
+    Crypt(#[from] CryptoError),
+    #[error("{operation} failed: {source}")]
+    Compression {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
     },
-    #[error("RO-Crate metadata file is missing from {0}")]
-    MissingRoCrateMetadata(PathBuf),
-    #[error("Unsafe ZIP member path: {0}")]
-    UnsafeZipPath(String),
-    #[error("Duplicate ZIP member path after normalization: {0}")]
-    DuplicateZipPath(String),
-    #[error("ZIP member path conflicts with a required directory: {0}")]
-    ZipPathConflict(String),
-    #[error("Overlapping ZIP members are not supported: {0}")]
-    OverlappingZipEntries(PathBuf),
-    #[error("Encrypted ZIP member is not supported: {0}")]
-    EncryptedZipEntry(String),
-    #[error("Unsupported ZIP entry type or compression for {0}")]
-    UnsupportedZipEntry(String),
     #[error("Invalid block data state: {0}")]
     InvalidBlockDataState(String),
-    #[error("external block source required")]
-    ExternalBlockSourceRequired,
+    #[error("invalid block descriptor: {0}")]
+    InvalidBlockDescriptor(&'static str),
+    #[error("invalid entry combination for {path}: {reason}")]
+    InvalidEntryCombination { path: String, reason: String },
+    #[error("content is unavailable with the supplied access keys")]
+    ContentUnavailable,
+    #[error("archive uses unsupported feature: {0:?}")]
+    UnsupportedFeature(ArchiveFeature),
+    #[error("external block access denied by policy")]
+    ExternalBlockAccessDenied,
+    #[error("append snapshot does not contain file id {0}")]
+    SnapshotFileIdNotFound(u64),
+    #[error("content for snapshot file id {0} is unavailable with the supplied access keys")]
+    SnapshotContentUnavailable(u64),
+    #[error("snapshot file id {0} is a directory and has no content key")]
+    SnapshotDirectoryHasNoContent(u64),
+    #[error("snapshot file id {0} is a symlink and has no content key")]
+    SnapshotSymlinkHasNoContent(u64),
     #[error("external block framing error: {0}")]
     ExternalBlockFraming(String),
     #[error("Block hash not found: {0:?}")]
     BlockHashNotFound([u8; 32]),
+    #[error("duplicate encoded block hash")]
+    DuplicateBlockHash,
+    #[error("duplicate encoded sender key")]
+    DuplicateSenderKey,
+    #[error("duplicate encoded recipient key")]
+    DuplicateRecipientKey,
+    #[error("duplicate encoded block reference")]
+    DuplicateBlockReference,
+    #[error("block list pieces require format version 1.1")]
+    UnsupportedBlockListPieces,
+    #[error("block list piece key id {0} is already used by a file or another piece")]
+    PieceKeyIdConflict(u64),
+    #[error("invalid piece record")]
+    InvalidPieceRecord,
+    #[error("the piece encoder holds written bytes that were not flushed")]
+    UnflushedPieceBytes,
+    #[error("content offset {0} is not a multiple of 1024")]
+    InvalidContentOffset(u64),
+    #[error("piece content options must be set before any content is added")]
+    PieceContentStarted,
+    #[error("archive metadata does not match the expected digest")]
+    MetadataDigestMismatch,
+    #[error("grant replacement needs a version 1.1 archive with exactly one directory")]
+    GrantReplacementUnsupported,
+    #[error("duplicate encoded recipient file id")]
+    DuplicateRecipientFileId,
+    #[error("reserved processing bits are set: {0:#04x}")]
+    ReservedProcessingBits(u8),
+    #[error("processing flags {0:#04x} require format version 1.1")]
+    UnsupportedProcessingFlags(u8),
+    #[error("processing flags {0:#04x} require encryption")]
+    ProcessingRequiresEncryption(u8),
+    #[error("conflicting relationship definition for id {0}")]
+    ConflictingRelationshipDefinition(u64),
+    #[error("invalid relationship definition for id {id}: {reason}")]
+    InvalidRelationshipDefinition { id: u64, reason: String },
+    #[error("invalid permissions: {0:#o}")]
+    InvalidPermissions(u32),
+    #[error("unknown relationship id {0}")]
+    UnknownRelationshipId(u64),
+    #[error("missing reference target file id {0}")]
+    MissingReferenceTarget(u64),
+    #[error("missing block descriptor")]
+    MissingBlockDescriptor,
+    #[error(
+        "accessible file size does not match its block sizes: expected {expected}, actual {actual}"
+    )]
+    AccessibleFileSizeMismatch { expected: u64, actual: u64 },
+    #[error("conflicting recovered file key")]
+    ConflictingRecoveredFileKey,
+    #[error("conflicting recipient grant")]
+    ConflictingRecipientGrant,
+    #[error("invalid half-open read range {start}..{end} for file size {file_size}")]
+    InvalidReadRange {
+        start: u64,
+        end: u64,
+        file_size: u64,
+    },
     #[error("Block size mismatch: expected {expected}, got {actual}")]
     BlockSizeMismatch { expected: u64, actual: u64 },
     #[error("Block hash mismatch: expected {expected:?}, got {actual:?}")]
@@ -130,14 +168,65 @@ pub enum PithosError {
     },
     #[error("Invalid symlink entry {path}: {reason}")]
     InvalidSymlinkEntry { path: String, reason: String },
-    #[error("Extraction collision at {path}: {reason}")]
-    ExtractionCollision { path: String, reason: String },
-    #[error("Invalid file type: {0}")]
-    InvalidFileType(String),
     #[error("No recipient section found for the provided private key")]
     NoMatchingRecipient,
     #[error("Invalid recipient data state: {0}")]
     InvalidRecipientDataState(String),
-    #[error("Other error: {0}")]
-    Other(String),
+    #[error("archive creation requires at least one recipient")]
+    WriterRequiresRecipient,
+    #[error("base writer requires local, uncompressed, unencrypted processing")]
+    BaseWriterRequiresPlainProcessing,
+    #[error("granting reader access requires at least one file or metadata id")]
+    GrantRequiresFileId,
+    #[error("invalid CDC configuration {min_size},{avg_size},{max_size}")]
+    InvalidCdcConfig {
+        min_size: usize,
+        avg_size: usize,
+        max_size: usize,
+    },
+    #[error("invalid fixed block size {0}")]
+    InvalidBlockSize(usize),
+    #[error("writer is poisoned")]
+    WriterPoisoned,
+    #[error("streamed content size overflow")]
+    WriterSizeOverflow,
+    #[error("streamed content size mismatch: expected {expected}, actual {actual}")]
+    WriterExpectedSizeMismatch { expected: u64, actual: u64 },
+    #[error("content entry has an unsealed block list")]
+    WriterUnsealedBlockList,
+    #[error("recipient record has an unsealed file-key list")]
+    WriterUnsealedRecipientList,
+    #[error("directory or symlink has block-key material")]
+    WriterNoContentHasBlockMaterial,
+    #[error("append failed after mutation but was rolled back: {source}")]
+    AppendRolledBack {
+        #[source]
+        source: Box<PithosError>,
+    },
+    #[error(
+        "append failed after mutation and rollback failed (original length {original_len}, observed length {observed_len}): original failure: {source}; rollback failure: {rollback}"
+    )]
+    AppendRollbackFailed {
+        #[source]
+        source: Box<PithosError>,
+        rollback: io::Error,
+        original_len: u64,
+        observed_len: u64,
+    },
+    #[error("planned IDs are only valid for append writers")]
+    PlannedIdsRequireAppendWriter,
+    #[error("grant child must not contain file entries or block descriptors")]
+    GrantChildContainsContent,
+    #[error("granting reader access requires an append snapshot")]
+    GrantRequiresAppendSnapshot,
+    #[error("file manifest entry has no retained source")]
+    MissingManifestSource,
+    #[error("append plan entry count does not match manifest")]
+    AppendPlanLengthMismatch,
+    #[error("read response does not answer the outstanding request")]
+    UnexpectedReadResponse,
+    #[error("read response length mismatch: expected {expected}, got {actual}")]
+    ReadResponseLength { expected: u64, actual: u64 },
+    #[error("archive open has requests left")]
+    OpenIncomplete,
 }

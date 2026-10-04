@@ -3,21 +3,27 @@ pub mod utils;
 
 use crate::io::utils::{load_private_key_from_pem, load_public_key_from_pem};
 use clap::{Parser, Subcommand, ValueEnum};
-use pithos_lib::error::PithosError;
-use pithos_lib::helpers::x25519_keys::{
-    generate_private_key, private_key_to_pem_bytes, public_key_to_pem_bytes,
+use pithos_lib::adapters::crypt4gh;
+use pithos_lib::adapters::crypt4gh::Crypt4GHError;
+use pithos_lib::archive::{
+    AccessKeys, AppendDurability, AppendOptions, Archive, ArchiveWriter, BlockKeyMode, CdcConfig,
+    Chunking, OpenOptions, PayloadCipher, ProcessingOptions, WriteOptions, WriterError,
 };
-use pithos_lib::io::pithosreader::PithosReaderSimple;
-use pithos_lib::io::pithoswriter::{InputFile, PithosWriter};
+use pithos_lib::crypto::{PrivateKey, PublicKey, generate_private_key};
+use pithos_lib::error::PithosError;
+use pithos_lib::fs::ingest::build_input_manifest;
+use pithos_lib::fs::{FsError, append_files, extract_all, grant_readers};
+use pithos_lib::source::FileSource;
+use rustix::fs::{AtFlags, Mode, OFlags, fchmod, linkat, open, openat, unlinkat};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
-use tracing::dispatcher::SetGlobalDefaultError;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::util::TryInitError;
 use utils::conversion::{evaluate_log_level, parse_cdc_input, parse_range_input};
-use x25519_dalek::PublicKey;
 
 #[derive(Clone, Default, ValueEnum)]
 enum KeyFormat {
@@ -33,6 +39,40 @@ enum ExportFormat {
     #[default]
     Crypt4gh,
     //RoCrate,
+}
+
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum CliAppendDurability {
+    #[default]
+    Flush,
+    SyncAll,
+}
+
+impl From<CliAppendDurability> for AppendDurability {
+    fn from(value: CliAppendDurability) -> Self {
+        match value {
+            CliAppendDurability::Flush => Self::Flush,
+            CliAppendDurability::SyncAll => Self::SyncAll,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum CliCipher {
+    #[default]
+    #[value(name = "chacha20-poly1305")]
+    ChaCha20Poly1305,
+    #[value(name = "aes-256-gcm")]
+    Aes256Gcm,
+}
+
+impl From<CliCipher> for PayloadCipher {
+    fn from(value: CliCipher) -> Self {
+        match value {
+            CliCipher::ChaCha20Poly1305 => Self::ChaCha20Poly1305,
+            CliCipher::Aes256Gcm => Self::Aes256Gcm,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -88,9 +128,21 @@ enum PithosCommands {
         #[arg(long)]
         reader_public_keys: Option<Vec<PathBuf>>, // Iterate files and parse all keys
         */
-        /// Set values for content-defined chunking
+        /// Use content-defined chunking with these sizes instead of fixed blocks
         #[arg(long="cdc", value_parser=parse_cdc_input, value_name = "MIN,AVG,MAX")]
-        cdc: Option<(usize, usize, usize)>,
+        cdc: Option<CdcConfig>,
+        /// Size of fixed blocks in bytes
+        #[arg(long, value_name = "BYTES", default_value_t = Chunking::DEFAULT_BLOCK_SIZE, conflicts_with = "cdc")]
+        block_size: usize,
+        /// Cipher for encrypted blocks; needs an encrypted archive for aes-256-gcm
+        #[arg(long, value_enum, default_value_t)]
+        cipher: CliCipher,
+        /// Encrypt every block with its own random key, without deduplication; needs encryption
+        #[arg(long)]
+        unique_keys: bool,
+        /// Create a local, uncompressed, unencrypted base archive
+        #[arg(long, conflicts_with_all = ["secret_key", "public_keys"])]
+        plain: bool,
         /// Input files
         #[arg(value_name = "FILES")]
         files: Vec<PathBuf>,
@@ -113,7 +165,7 @@ enum PithosCommands {
         #[arg(short, long)]
         format: Option<KeyFormat>,
         /// Key file prefix (e.g. sender -> sender.<sec/pub>.pem)
-        #[arg(short, long)]
+        #[arg(short = 'k', long)]
         prefix: Option<String>,
     },
     /// Export a Pithos file into another compatible file format
@@ -195,6 +247,9 @@ enum AppendCommands {
         // List of file ids the readers shall get access to
         #[arg(short, long)]
         ids: Option<Vec<u64>>,
+        /// Durability after publishing the appended directory
+        #[arg(long, value_enum, default_value_t)]
+        durability: CliAppendDurability,
         /// Path to Pithos file
         #[arg(value_name = "FILE")]
         file: PathBuf,
@@ -204,6 +259,21 @@ enum AppendCommands {
         /// Path to Pithos file
         #[arg(short, long, value_name = "PITHOS FILE")]
         file: PathBuf,
+        /// Use content-defined chunking with these sizes instead of fixed blocks
+        #[arg(long = "cdc", value_parser = parse_cdc_input, value_name = "MIN,AVG,MAX")]
+        cdc: Option<CdcConfig>,
+        /// Size of fixed blocks in bytes
+        #[arg(long, value_name = "BYTES", default_value_t = Chunking::DEFAULT_BLOCK_SIZE, conflicts_with = "cdc")]
+        block_size: usize,
+        /// Cipher for new encrypted blocks; aes-256-gcm needs a version 1.1 archive
+        #[arg(long, value_enum, default_value_t)]
+        cipher: CliCipher,
+        /// Encrypt every new block with its own random key, without deduplication; needs version 1.1
+        #[arg(long)]
+        unique_keys: bool,
+        /// Durability after publishing the appended directory
+        #[arg(long, value_enum, default_value_t)]
+        durability: CliAppendDurability,
         /// Input files
         #[arg(value_name = "FILES")]
         files: Vec<PathBuf>,
@@ -212,21 +282,75 @@ enum AppendCommands {
 
 #[derive(Error, Debug)]
 pub enum PithosCliError {
-    #[error("Writer Error: {0}")]
-    TracingError(#[from] SetGlobalDefaultError),
+    #[error("tracing initialization error: {0}")]
+    TracingError(#[from] TryInitError),
     #[error("Invalid argument: {0}")]
     InvalidArgumentError(String),
     #[error("Pithos Error: {0}")]
     PithosError(#[from] PithosError),
+    #[error("Filesystem Error: {0}")]
+    FilesystemError(#[from] FsError),
+    #[error("Writer Error: {0}")]
+    WriterError(#[from] WriterError),
+    #[error("Crypt4GH error: {0}")]
+    Crypt4GHError(#[from] Crypt4GHError),
+    #[error("{operation} failed for {path}: {source}")]
+    KeyFile {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{operation} failed for {path}: {source}")]
+    KeyParse {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: pithos_lib::crypto::CryptoError,
+    },
+    #[error("{operation} failed for {path}: {source}")]
+    OutputFile {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+fn chunking(cdc: Option<CdcConfig>, block_size: usize) -> Chunking {
+    cdc.map_or(Chunking::Fixed(block_size), Chunking::ContentDefined)
+}
+
+/// Applies the key mode and cipher options; the library rejects them without encryption.
+fn block_processing(
+    processing: ProcessingOptions,
+    cipher: CliCipher,
+    unique_keys: bool,
+) -> Result<ProcessingOptions, PithosCliError> {
+    let key_mode = if unique_keys {
+        BlockKeyMode::Unique
+    } else {
+        BlockKeyMode::ContentDerived
+    };
+    let processing = processing.with_key_mode(key_mode).map_err(|error| {
+        PithosCliError::InvalidArgumentError(format!(
+            "--unique-keys needs an encrypted archive: {error}"
+        ))
+    })?;
+    processing.with_cipher(cipher.into()).map_err(|error| {
+        PithosCliError::InvalidArgumentError(format!(
+            "--cipher needs an encrypted archive: {error}"
+        ))
+    })
 }
 
 #[tracing::instrument(level = "trace", skip())]
-fn main() -> Result<(), PithosCliError> {
+fn run() -> Result<(), PithosCliError> {
     // Parse CLI parameter input
     let cli = Cli::parse();
 
     // Initialize tracing logger
-    let logging_filter = evaluate_log_level(cli.log_level);
+    let logging_filter = evaluate_log_level(cli.log_level)?;
     let fmt_layer = tracing_subscriber::fmt::layer()
         .compact()
         .with_file(cli.verbose)
@@ -234,279 +358,736 @@ fn main() -> Result<(), PithosCliError> {
         .with_target(cli.verbose)
         .with_filter(logging_filter);
 
-    tracing_subscriber::registry().with(fmt_layer).init();
+    tracing_subscriber::registry().with(fmt_layer).try_init()?;
 
     // Evaluate subcommand
     match cli.command {
         PithosCommands::Read { read_command } => match read_command {
             ReadCommands::Info { file, path } => {
-                let path_str = path
-                    .to_str()
-                    .expect("No inner path provided or path contains invalid UTF-8");
-                let key = load_private_key_from_pem(
-                    &cli.secret_key
-                        .clone()
-                        .expect("Private key expected to read directory"),
-                )?;
-                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
-                let (directory, _) = reader.read_directory()?;
-                match directory.get_file_by_path(path_str) {
-                    Some(entry) => println!("{entry}"),
+                let path_str = path.to_str().ok_or_else(|| {
+                    PithosCliError::InvalidArgumentError("archive path is not valid UTF-8".into())
+                })?;
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
+                match archive.entry(path_str)? {
+                    Some(entry) => write_stdout(format_args!("{entry:#?}"))?,
                     None => Err(PithosError::FileNotFound(path_str.to_string()))?,
                 }
             }
             ReadCommands::List { file } => {
-                let key = load_private_key_from_pem(
-                    &cli.secret_key
-                        .clone()
-                        .expect("Private key expected to read directory"),
-                )?;
-                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
-                let (directory, _) = reader.read_directory()?;
-                directory
-                    .files
-                    .iter()
-                    .for_each(|(id, path, fe)| println!("{} {:?} {}", id, fe.file_type, path))
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
+                match archive.view().version() {
+                    0x8002 => write_stdout(format_args!("format version 0.7"))?,
+                    version => write_stdout(format_args!(
+                        "format version {}.{}",
+                        version >> 8,
+                        version & 0xff
+                    ))?,
+                }
+                for entry in archive.entries() {
+                    match entry.block_list {
+                        Some(form) => write_stdout(format_args!(
+                            "{} {:?} {:?} {}",
+                            entry.id, entry.kind, form, entry.path
+                        ))?,
+                        None => write_stdout(format_args!(
+                            "{} {:?} {}",
+                            entry.id, entry.kind, entry.path
+                        ))?,
+                    }
+                }
             }
             ReadCommands::All { file } => {
-                let key = load_private_key_from_pem(
-                    &cli.secret_key
-                        .clone()
-                        .expect("Private key expected to read directory"),
-                )?;
-                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
-                let (directory, _) = reader.read_directory()?;
-
-                for path in directory.files.get_paths_ref() {
-                    reader.read_file(path, &directory, cli.output.as_ref(), None)?;
-                }
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
+                let output = cli
+                    .output
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                extract_all(&archive, output)?;
             }
             ReadCommands::Data {
                 file,
                 paths,
                 ranges,
             } => {
-                let key = load_private_key_from_pem(
-                    &cli.secret_key
-                        .clone()
-                        .expect("Private key expected to read directory"),
-                )?;
-
-                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
-                let (directory, _) = reader.read_directory()?;
-
-                for path in paths {
-                    reader.read_file(
-                        path.to_str()
-                            .expect("No inner path provided or path contains invalid UTF-8"),
-                        &directory,
-                        cli.output.as_ref(),
-                        ranges.clone(),
-                    )?;
+                if paths.is_empty() {
+                    return Err(PithosCliError::InvalidArgumentError(
+                        "at least one archive path is required".into(),
+                    ));
+                }
+                if cli.output.is_some() && paths.len() > 1 {
+                    return Err(PithosCliError::InvalidArgumentError(
+                        "a file output accepts exactly one archive path".into(),
+                    ));
+                }
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
+                if let Some(output_path) = cli.output.as_ref() {
+                    if let Some(path) = paths.first() {
+                        let path = path.to_str().ok_or_else(|| {
+                            PithosCliError::InvalidArgumentError(
+                                "archive path is not valid UTF-8".into(),
+                            )
+                        })?;
+                        let mut output = StagedOutput::create(
+                            output_path,
+                            Mode::RUSR
+                                | Mode::WUSR
+                                | Mode::RGRP
+                                | Mode::WGRP
+                                | Mode::ROTH
+                                | Mode::WOTH,
+                            "open archive output",
+                        )?;
+                        let result = (|| {
+                            if let Some(ranges) = &ranges {
+                                for range in ranges {
+                                    archive.copy_range_to(
+                                        path,
+                                        range.clone(),
+                                        output.file_mut(),
+                                    )?;
+                                }
+                            } else {
+                                archive.copy_to(path, output.file_mut())?;
+                            }
+                            output.flush("flush archive output")
+                        })();
+                        result?;
+                        output.publish("publish archive output")?;
+                    }
+                } else {
+                    for path in paths {
+                        let path = path.to_str().ok_or_else(|| {
+                            PithosCliError::InvalidArgumentError(
+                                "archive path is not valid UTF-8".into(),
+                            )
+                        })?;
+                        wait_before_stdout_for_test();
+                        let mut output = std::io::stdout();
+                        if let Some(ranges) = &ranges {
+                            for range in ranges {
+                                archive.copy_range_to(path, range.clone(), &mut output)?;
+                            }
+                        } else {
+                            archive.copy_to(path, &mut output)?;
+                        }
+                        output.flush().map_err(PithosError::Io)?;
+                    }
                 }
             }
             ReadCommands::Directory { file } => {
-                let key = load_private_key_from_pem(
-                    &cli.secret_key
-                        .clone()
-                        .expect("Private key expected to read directory"),
-                )?;
-                let mut reader = PithosReaderSimple::new_with_key(&file, key)?;
-
-                println!("{:#?}", reader.read_directory()?);
+                let archive = open_archive(&file, optional_private_key(&cli.secret_key)?)?;
+                for entry in archive.entries() {
+                    write_stdout(format_args!("{entry:#?}"))?;
+                }
             }
         },
-        PithosCommands::Create { cdc, files } => {
+        PithosCommands::Create {
+            cdc,
+            block_size,
+            cipher,
+            unique_keys,
+            plain,
+            files,
+        } => {
+            if plain && (cli.secret_key.is_some() || cli.public_keys.is_some()) {
+                return Err(PithosCliError::InvalidArgumentError(
+                    "--plain conflicts with --secret-key and --public-keys".into(),
+                ));
+            }
             if files.is_empty() {
                 return Err(PithosCliError::InvalidArgumentError(
                     "No files provided".to_string(),
                 ));
             }
 
-            let output = if let Some(outfile) = cli.output {
-                File::create(outfile).map_err(PithosError::Io)?
+            let chunking = chunking(cdc, block_size);
+            let (options, processing) = if plain {
+                (
+                    WriteOptions::base().with_chunking(chunking),
+                    ProcessingOptions::new(false, 0).expect("zero compression is valid"),
+                )
             } else {
-                // Default outfile
-                println!("No outfile specified, writing output to \"/tmp/out.pithos\""); //TODO: Replace with tracing::warn!()
-                File::create("/tmp/out.pithos").map_err(PithosError::Io)?
+                let sender_key = required_private_key(&cli.secret_key)?;
+                let reader_keys: Result<Vec<PublicKey>, PithosCliError> = cli
+                    .public_keys
+                    .ok_or_else(|| {
+                        PithosCliError::InvalidArgumentError(
+                            "at least one recipient key is required".into(),
+                        )
+                    })?
+                    .iter()
+                    .map(|path| load_public_key_from_pem(path))
+                    .collect();
+                (
+                    WriteOptions::new(sender_key, reader_keys?).with_chunking(chunking),
+                    ProcessingOptions::default(),
+                )
             };
+            options.validate()?;
+            let processing = block_processing(processing, cipher, unique_keys)?;
+            let manifest = build_input_manifest(&files)?;
 
-            let sender_key = load_private_key_from_pem(
-                &cli.secret_key
-                    .clone()
-                    .expect("Private key expected to create Pithos file"),
+            let output_path = match cli.output {
+                Some(path) => path,
+                None => {
+                    write_stdout(format_args!(
+                        "No outfile specified, writing output to \"/tmp/out.pithos\""
+                    ))?;
+                    PathBuf::from("/tmp/out.pithos")
+                }
+            };
+            let mut output = StagedOutput::create(
+                &output_path,
+                Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                "open archive output",
             )?;
-            let reader_keys: Result<Vec<PublicKey>, PithosError> = cli
-                .public_keys
-                .expect("At least one recipient expected")
-                .iter()
-                .map(load_public_key_from_pem)
-                .collect();
-
-            let input_files: Result<Vec<InputFile>, PithosError> =
-                files.iter().map(InputFile::try_from).collect();
-            let mut writer = PithosWriter::new(sender_key, reader_keys?, cdc, Box::new(output))?;
+            let mut writer = match ArchiveWriter::create(output.take_file(), options) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    let (error, sink) = error.into_parts();
+                    drop(sink);
+                    return Err(PithosCliError::PithosError(error));
+                }
+            };
 
             tracing::info!("Start creating Pithos file");
-            writer
-                .write_file_header()
-                .map_err(PithosError::Serialization)?;
-            writer.process_input_files(input_files?)?;
-            writer.write_directory()?;
-        }
-        PithosCommands::Keypair { prefix, .. } => {
-            let private_key = generate_private_key().map_err(PithosError::Crypt)?;
-            let public_key = PublicKey::from(&private_key);
-            let prefix = prefix.unwrap_or("pithos_key".to_string());
-
-            // Write output
-            let (mut sec_output, mut pub_output): (Box<dyn Write>, Box<dyn Write>) =
-                if let Some(dest) = cli.output {
-                    let (sec_target, pub_target) = if dest.is_dir() {
-                        (
-                            &dest.join(format!("{prefix}.sec.pem")),
-                            &dest.join(format!("{prefix}.pub.pem")),
-                        )
-                    } else {
-                        (&dest, &dest)
-                    };
-                    (
-                        Box::new(File::create(sec_target).map_err(PithosError::Io)?),
-                        Box::new(File::create(pub_target).map_err(PithosError::Io)?),
-                    )
-                } else {
-                    (Box::new(std::io::stdout()), Box::new(std::io::stdout()))
-                };
-
-            sec_output
-                .write_all(&private_key_to_pem_bytes(&private_key).map_err(PithosError::Crypt)?)
-                .map_err(PithosError::Io)?;
-            pub_output
-                .write_all(&public_key_to_pem_bytes(&public_key).map_err(PithosError::Crypt)?)
-                .map_err(PithosError::Io)?;
-        }
-        PithosCommands::Append { command } => {
-            match command {
-                AppendCommands::Readers { file, ids } => {
-                    let sender_key = load_private_key_from_pem(
-                        &cli.secret_key
-                            .clone()
-                            .expect("Private key expected to append to Pithos file"),
-                    )?;
-                    let reader_keys_result: Result<Vec<PublicKey>, PithosError> = cli
-                        .public_keys
-                        .expect("At least one recipient expected")
-                        .iter()
-                        .map(load_public_key_from_pem)
-                        .collect();
-                    let reader_keys = reader_keys_result?;
-
-                    let mut reader = PithosReaderSimple::new_with_key(&file, sender_key.clone())?;
-                    let (directory, _) = reader.read_directory()?;
-
-                    let mut fes = vec![];
-                    if let Some(ids) = ids {
-                        for id in ids {
-                            fes.push((
-                                id,
-                                directory
-                                    .get_file_by_id(id)
-                                    .ok_or(PithosError::FileNotFound(format!(
-                                        "File with id {id} not available."
-                                    )))?,
-                            ));
-                        }
-                    }
-                    if fes.is_empty() {
-                        return Err(PithosCliError::InvalidArgumentError(
-                            "No available id or path provided".to_string(),
-                        ));
-                    }
-
-                    let mut writer = PithosWriter::new_from_file(
-                        sender_key.clone(),
-                        reader_keys.clone(),
-                        None,
-                        &file,
-                    )?;
-
-                    let directory = writer.get_directory_mut();
-                    for (id, _) in fes {
-                        let enc_key =
-                            directory
-                                .get_file_encryption_key(id)
-                                .ok_or(PithosError::Other(format!(
-                                    "Could not extract encryption key for file {id}"
-                                )))?;
-
-                        for reader in &reader_keys {
-                            directory.add_file_to_recipient(&sender_key, reader, (id, enc_key))?;
-                        }
-                    }
-
-                    writer.write_directory()?
+            if let Err(error) = fail_after_create_for_test() {
+                discard_incomplete_writer(writer);
+                return Err(error.into());
+            }
+            if let Err(error) = manifest.ingest(&mut writer, processing) {
+                discard_incomplete_writer(writer);
+                return Err(error.into());
+            }
+            match writer.finish() {
+                Ok(sink) => {
+                    output.restore_file(sink);
+                    output.publish("publish archive output")?;
                 }
-                AppendCommands::Files { file, files } => {
-                    let sender_key = load_private_key_from_pem(
-                        &cli.secret_key
-                            .clone()
-                            .expect("Private key expected to append to Pithos file"),
-                    )?;
-                    let reader_keys: Result<Vec<PublicKey>, PithosError> = cli
-                        .public_keys
-                        .expect("At least one recipient expected")
-                        .iter()
-                        .map(load_public_key_from_pem)
-                        .collect();
-
-                    let append_files: Result<Vec<InputFile>, PithosError> =
-                        files.iter().map(InputFile::try_from).collect();
-
-                    let mut writer =
-                        PithosWriter::new_from_file(sender_key, reader_keys?, None, &file)?;
-
-                    // Append files
-                    writer.process_input_files(append_files?)?;
-                    writer.write_directory()?;
+                Err(error) => {
+                    let (error, sink) = error.into_parts();
+                    drop(sink);
+                    return Err(PithosCliError::PithosError(error));
                 }
             }
-
-            unimplemented!()
         }
+        PithosCommands::Keypair { prefix, .. } => {
+            let prefix = validate_keypair_prefix(prefix)?;
+            let private_key = generate_private_key();
+            let public_key = private_key.public_key();
+            let private_pem = private_key
+                .to_private_pem_bytes()
+                .map_err(PithosError::Crypt)?;
+            let public_pem = public_key
+                .to_public_pem_bytes()
+                .map_err(PithosError::Crypt)?;
+
+            if let Some(output) = cli.output {
+                if let Some(directory) = open_keypair_output_directory(&output)? {
+                    write_keypair_files(&output, directory, &prefix, &private_pem, &public_pem)?;
+                } else {
+                    write_combined_keypair_file(&output, &private_pem, &public_pem)?;
+                }
+            } else {
+                wait_before_stdout_for_test();
+                let mut output = std::io::stdout();
+                output.write_all(&private_pem).map_err(PithosError::Io)?;
+                output.write_all(&public_pem).map_err(PithosError::Io)?;
+                output.flush().map_err(PithosError::Io)?;
+            }
+        }
+        PithosCommands::Append { command } => match command {
+            AppendCommands::Readers {
+                file,
+                ids,
+                durability,
+            } => {
+                let ids = ids.unwrap_or_default();
+                if ids.is_empty() {
+                    return Err(PithosCliError::InvalidArgumentError(
+                        "No available id or path provided".to_string(),
+                    ));
+                }
+                let sender_key = required_private_key(&cli.secret_key)?;
+                let reader_keys = required_recipient_keys(&cli.public_keys)?;
+                grant_readers(
+                    &file,
+                    AppendOptions::new(sender_key, reader_keys).with_durability(durability.into()),
+                    &ids,
+                )?;
+            }
+            AppendCommands::Files {
+                file,
+                cdc,
+                block_size,
+                cipher,
+                unique_keys,
+                durability,
+                files,
+            } => {
+                if files.is_empty() {
+                    return Err(PithosCliError::InvalidArgumentError(
+                        "No files provided".to_string(),
+                    ));
+                }
+                let sender_key = required_private_key(&cli.secret_key)?;
+                let reader_keys = required_recipient_keys(&cli.public_keys)?;
+                let options = AppendOptions::new(sender_key, reader_keys)
+                    .with_chunking(chunking(cdc, block_size))
+                    .with_durability(durability.into());
+                let processing = block_processing(options.processing(), cipher, unique_keys)?;
+                append_files(&file, options.with_processing(processing), &files)?;
+            }
+        },
         PithosCommands::Export { file, path, .. } => {
-            let path_str = path
-                .to_str()
-                .expect("No inner path provided or path contains invalid UTF-8");
-            let sender_key = load_private_key_from_pem(
-                &cli.secret_key
-                    .clone()
-                    .expect("Private key expected to create Pithos file"),
-            )?;
-            let reader_keys: Result<Vec<PublicKey>, PithosError> = cli
+            let path_str = path.to_str().ok_or_else(|| {
+                PithosCliError::InvalidArgumentError("archive path is not valid UTF-8".into())
+            })?;
+            let sender_key = required_private_key(&cli.secret_key)?;
+            let reader_keys: Result<Vec<PublicKey>, PithosCliError> = cli
                 .public_keys
-                .expect("At least one recipient expected")
+                .ok_or_else(|| {
+                    PithosCliError::InvalidArgumentError(
+                        "at least one recipient key is required".into(),
+                    )
+                })?
                 .iter()
-                .map(load_public_key_from_pem)
+                .map(|path| load_public_key_from_pem(path))
                 .collect();
 
-            let mut reader = PithosReaderSimple::new_with_key(&file, sender_key)?;
-            let (directory, _) = reader.read_directory()?;
+            let archive = open_archive(&file, Some(sender_key))?;
 
-            // Write output
-            let output_target: Box<dyn Write> = if let Some(dest) = cli.output {
-                Box::new(std::fs::File::create(dest).map_err(PithosError::Io)?)
+            if let Some(destination) = cli.output {
+                let mut output = StagedOutput::create(
+                    &destination,
+                    Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                    "open export output",
+                )?;
+                let result = (|| {
+                    crypt4gh::export(&archive, path_str, reader_keys?, output.file_mut())?;
+                    output.flush("flush export output")
+                })();
+                result?;
+                output.publish("publish export output")?;
             } else {
-                Box::new(std::io::stdout())
-            };
-
-            reader.read_file_to_crypt4gh(
-                path_str,
-                &directory,
-                reader_keys?,
-                Some(output_target),
-            )?;
+                wait_before_stdout_for_test();
+                let mut output = std::io::stdout();
+                crypt4gh::export(&archive, path_str, reader_keys?, &mut output)?;
+                output.flush().map_err(PithosError::Io)?;
+            }
         }
     }
 
     Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn required_private_key(path: &Option<PathBuf>) -> Result<PrivateKey, PithosCliError> {
+    let path = path
+        .as_ref()
+        .ok_or_else(|| PithosCliError::InvalidArgumentError("private key is required".into()))?;
+    load_private_key_from_pem(path)
+}
+
+fn optional_private_key(path: &Option<PathBuf>) -> Result<Option<PrivateKey>, PithosCliError> {
+    path.as_ref()
+        .map(|path| load_private_key_from_pem(path))
+        .transpose()
+}
+
+fn validate_keypair_prefix(prefix: Option<String>) -> Result<String, PithosCliError> {
+    let prefix = prefix.unwrap_or_else(|| "pithos_key".to_string());
+    let mut components = Path::new(&prefix).components();
+    let is_one_normal_component = matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    );
+    if prefix.is_empty()
+        || prefix.contains(['/', '\\'])
+        || Path::new(&prefix).is_absolute()
+        || !is_one_normal_component
+    {
+        return Err(PithosCliError::InvalidArgumentError(
+            "key prefix must be one normal filename component".into(),
+        ));
+    }
+    Ok(prefix)
+}
+
+fn open_output_directory(path: &Path) -> rustix::io::Result<File> {
+    let start = if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
+    let mut directory = File::from(open(
+        start,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+
+    for component in path.components() {
+        if matches!(component, Component::RootDir | Component::CurDir) {
+            continue;
+        }
+        directory = File::from(openat(
+            &directory,
+            component.as_os_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+    }
+    Ok(directory)
+}
+
+fn open_keypair_output_directory(path: &Path) -> Result<Option<File>, PithosCliError> {
+    match open_output_directory(path) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
+            Ok(None)
+        }
+        Err(source) => Err(PithosCliError::OutputFile {
+            operation: "inspect keypair output",
+            path: path.to_path_buf(),
+            source: source.into(),
+        }),
+    }
+}
+
+fn write_combined_keypair_file(
+    path: &Path,
+    private_pem: &[u8],
+    public_pem: &[u8],
+) -> Result<(), PithosCliError> {
+    let mut output = StagedOutput::create(
+        path,
+        Mode::RUSR | Mode::WUSR,
+        "open combined keypair output",
+    )?;
+    fchmod(output.file_mut(), Mode::RUSR | Mode::WUSR).map_err(|source| {
+        PithosCliError::OutputFile {
+            operation: "set combined keypair permissions",
+            path: path.to_path_buf(),
+            source: source.into(),
+        }
+    })?;
+    let result =
+        (|| {
+            output.file_mut().write_all(private_pem).map_err(|source| {
+                PithosCliError::OutputFile {
+                    operation: "write private key",
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+            output.file_mut().write_all(public_pem).map_err(|source| {
+                PithosCliError::OutputFile {
+                    operation: "write public key",
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+            output.flush("flush combined keypair output")
+        })();
+    result?;
+    output.publish("publish combined keypair output")
+}
+
+fn write_keypair_files(
+    output_directory: &Path,
+    directory: File,
+    prefix: &str,
+    private_pem: &[u8],
+    public_pem: &[u8],
+) -> Result<(), PithosCliError> {
+    let private_name = format!("{prefix}.sec.pem");
+    let public_name = format!("{prefix}.pub.pem");
+    let private_path = output_directory.join(&private_name);
+    let public_path = output_directory.join(&public_name);
+
+    let mut private_output = create_keypair_file(
+        &directory,
+        &private_name,
+        &private_path,
+        Mode::RUSR | Mode::WUSR,
+        true,
+    )?;
+    let mut public_output = match create_keypair_file(
+        &directory,
+        &public_name,
+        &public_path,
+        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
+        false,
+    ) {
+        Ok(file) => file,
+        Err(error) => {
+            drop(private_output);
+            remove_keypair_file(&directory, &private_name);
+            return Err(error);
+        }
+    };
+
+    let result = (|| {
+        private_output
+            .write_all(private_pem)
+            .map_err(|source| PithosCliError::OutputFile {
+                operation: "write private key",
+                path: private_path.clone(),
+                source,
+            })?;
+        public_output
+            .write_all(public_pem)
+            .map_err(|source| PithosCliError::OutputFile {
+                operation: "write public key",
+                path: public_path.clone(),
+                source,
+            })?;
+        private_output
+            .flush()
+            .map_err(|source| PithosCliError::OutputFile {
+                operation: "flush private key",
+                path: private_path.clone(),
+                source,
+            })?;
+        public_output
+            .flush()
+            .map_err(|source| PithosCliError::OutputFile {
+                operation: "flush public key",
+                path: public_path.clone(),
+                source,
+            })
+    })();
+    if result.is_err() {
+        drop(private_output);
+        drop(public_output);
+        remove_keypair_file(&directory, &private_name);
+        remove_keypair_file(&directory, &public_name);
+    }
+    result
+}
+
+fn create_keypair_file(
+    directory: &File,
+    name: &str,
+    path: &Path,
+    mode: Mode,
+    private: bool,
+) -> Result<File, PithosCliError> {
+    let fd = openat(
+        directory,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        mode,
+    )
+    .map_err(|source| PithosCliError::OutputFile {
+        operation: if private {
+            "create private key"
+        } else {
+            "create public key"
+        },
+        path: path.to_path_buf(),
+        source: source.into(),
+    })?;
+    if private && let Err(source) = fchmod(&fd, Mode::RUSR | Mode::WUSR) {
+        drop(fd);
+        remove_keypair_file(directory, name);
+        return Err(PithosCliError::OutputFile {
+            operation: "set private key permissions",
+            path: path.to_path_buf(),
+            source: source.into(),
+        });
+    }
+    Ok(File::from(fd))
+}
+
+fn remove_keypair_file(directory: &File, name: &str) {
+    let _ = unlinkat(directory, name, AtFlags::empty());
+}
+
+struct StagedOutput {
+    directory: File,
+    destination_name: OsString,
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl StagedOutput {
+    fn create(path: &Path, mode: Mode, operation: &'static str) -> Result<Self, PithosCliError> {
+        let destination_name =
+            path.file_name()
+                .map(OsString::from)
+                .ok_or_else(|| PithosCliError::OutputFile {
+                    operation,
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "output path must name a file",
+                    ),
+                })?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory =
+            open_output_directory(parent).map_err(|source| PithosCliError::OutputFile {
+                operation,
+                path: path.to_path_buf(),
+                source: source.into(),
+            })?;
+        let file = File::from(
+            openat(
+                &directory,
+                ".",
+                OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+                mode,
+            )
+            .map_err(|source| PithosCliError::OutputFile {
+                operation,
+                path: path.to_path_buf(),
+                source: source.into(),
+            })?,
+        );
+
+        Ok(Self {
+            directory,
+            destination_name,
+            path: path.to_path_buf(),
+            file: Some(file),
+        })
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("staged output file is present")
+    }
+
+    fn take_file(&mut self) -> File {
+        self.file.take().expect("staged output file is present")
+    }
+
+    fn restore_file(&mut self, file: File) {
+        self.file = Some(file);
+    }
+
+    fn flush(&mut self, operation: &'static str) -> Result<(), PithosCliError> {
+        self.file_mut()
+            .flush()
+            .map_err(|source| PithosCliError::OutputFile {
+                operation,
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    fn publish(mut self, operation: &'static str) -> Result<(), PithosCliError> {
+        let file = self.take_file();
+        linkat(
+            &file,
+            "",
+            &self.directory,
+            &self.destination_name,
+            AtFlags::EMPTY_PATH,
+        )
+        .map_err(|source| PithosCliError::OutputFile {
+            operation,
+            path: self.path.clone(),
+            source: source.into(),
+        })
+    }
+}
+
+fn required_recipient_keys(paths: &Option<Vec<PathBuf>>) -> Result<Vec<PublicKey>, PithosCliError> {
+    let paths = paths.as_ref().ok_or_else(|| {
+        PithosCliError::InvalidArgumentError("at least one recipient key is required".into())
+    })?;
+    if paths.is_empty() {
+        return Err(PithosCliError::InvalidArgumentError(
+            "at least one recipient key is required".into(),
+        ));
+    }
+    paths
+        .iter()
+        .map(|path| load_public_key_from_pem(path))
+        .collect()
+}
+
+fn write_stdout(arguments: std::fmt::Arguments<'_>) -> Result<(), PithosCliError> {
+    wait_before_stdout_for_test();
+    let mut output = std::io::stdout().lock();
+    writeln!(output, "{arguments}").map_err(PithosError::Io)?;
+    Ok(())
+}
+
+fn wait_before_stdout_for_test() {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PITHOS_TEST_DELAY_STDOUT").is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn discard_incomplete_writer(writer: ArchiveWriter<File>) {
+    match writer.into_incomplete() {
+        Ok(sink) => drop(sink),
+        Err(writer) => drop(writer),
+    }
+}
+
+// This deliberately narrow process-test seam exercises cleanup after the
+// destination has been created without depending on a filesystem race.
+fn fail_after_create_for_test() -> Result<(), PithosError> {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("PITHOS_TEST_FAIL_AFTER_CREATE").is_some() {
+            return Err(PithosError::Io(std::io::Error::other(
+                "writer runtime failure injected for testing",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn open_archive(
+    path: &std::path::Path,
+    key: Option<PrivateKey>,
+) -> Result<Archive<FileSource>, PithosError> {
+    let access_keys = key.map_or_else(AccessKeys::new, |key| AccessKeys::new().with_key(key));
+    Archive::open(
+        FileSource::open(path)?,
+        OpenOptions::default().with_access_keys(access_keys),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_commands_parse_without_constructing_a_legacy_reader() {
+        assert!(Cli::try_parse_from(["pithos", "read", "list", "archive.pith"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "pithos",
+                "read",
+                "data",
+                "archive.pith",
+                "entry",
+                "--ranges",
+                "4:2",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reader_key_requirement_is_a_cli_error() {
+        assert!(matches!(
+            required_private_key(&None),
+            Err(PithosCliError::InvalidArgumentError(_))
+        ));
+    }
 }

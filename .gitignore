@@ -1,5 +1,8 @@
 # Cargo build output
 /target/
+/fuzz/target/
+/fuzz/artifacts/
+/.coverage/
 
 # rustfmt backups
 **/*.rs.bk
@@ -15,6 +18,7 @@ rustc-ice-*.txt
 
 # Local notes/scratch files
 todo.md
+/docs
 
 # Local IDE config
 .idea/

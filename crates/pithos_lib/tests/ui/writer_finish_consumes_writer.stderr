@@ -1,0 +1,15 @@
+error[E0382]: use of moved value: `writer`
+ --> tests/ui/writer_finish_consumes_writer.rs:9:18
+  |
+7 |     let writer = ArchiveWriter::create(Vec::new(), WriteOptions::new(sender, vec![recipient])).unwrap();
+  |         ------ move occurs because `writer` has type `ArchiveWriter<Vec<u8>>`, which does not implement the `Copy` trait
+8 |     let first = writer.finish();
+  |                        -------- `writer` moved due to this method call
+9 |     let second = writer.finish();
+  |                  ^^^^^^ value used here after move
+  |
+note: `ArchiveWriter::<W>::finish` takes ownership of the receiver `self`, which moves `writer`
+ --> src/archive/writer.rs
+  |
+  |     pub fn finish(mut self) -> Result<W, FinishError<W>> {
+  |                       ^^^^

@@ -1,0 +1,43 @@
+[package]
+name = "pithos-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.12"
+pithos_lib = { path = "../crates/pithos_lib", features = ["fuzzing"] }
+
+[[bin]]
+name = "header_decode"
+path = "fuzz_targets/header_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "directory_decode"
+path = "fuzz_targets/directory_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypt4gh_decode"
+path = "fuzz_targets/crypt4gh_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chain_validation"
+path = "fuzz_targets/chain_validation.rs"
+test = false
+doc = false
+bench = false

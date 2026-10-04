@@ -1,0 +1,76 @@
+name: Fuzzing
+
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "30 2 * * 0" # Sundays at 02:30 UTC.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  dependency-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Check fuzz dependency policy
+        run: cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml --locked check
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    needs: dependency-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - header_decode
+          - directory_decode
+          - crypt4gh_decode
+          - chain_validation
+    env:
+      FUZZ_MAX_TOTAL_TIME: ${{ github.event_name == 'pull_request' && '60' || '900' }}
+      FUZZ_TIMEOUT: ${{ github.event_name == 'pull_request' && '5' || '10' }}
+      FUZZ_RSS_LIMIT_MB: ${{ github.event_name == 'pull_request' && '1024' || '1536' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz 0.13.2
+        run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Run ${{ matrix.target }}
+        id: fuzz
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            -max_total_time="$FUZZ_MAX_TOTAL_TIME" \
+            -timeout="$FUZZ_TIMEOUT" \
+            -rss_limit_mb="$FUZZ_RSS_LIMIT_MB"
+
+      - name: Upload fuzz artifacts
+        if: failure() && steps.fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

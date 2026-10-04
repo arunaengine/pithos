@@ -55,8 +55,9 @@ jobs:
           }
 
           for package in pithos_lib pithos; do
-            package_id="$(cargo pkgid -p "$package")"
-            package_version="${package_id##*@}"
+            package_id="$(cargo +stable pkgid -p "$package")"
+            package_version="${package_id##*#}"
+            package_version="${package_version##*@}"
             if [[ "$package_version" != "$RELEASE_VERSION" ]]; then
               printf '%s version %s does not match release tag %s.\n' "$package" "$package_version" "$RELEASE_VERSION" >&2
               exit 1
@@ -65,40 +66,43 @@ jobs:
 
           printf 'RELEASE_VERSION=%s\n' "$RELEASE_VERSION" >> "$GITHUB_ENV"
 
-      - name: Run workspace tests
-        run: cargo test --locked --workspace --all-targets
+      - name: Run stable workspace tests
+        run: cargo +stable test --locked --workspace --all-features --lib --bins --tests
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: cargo +stable fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo +stable clippy --locked --workspace --all-targets --all-features -- -D warnings
 
-      - name: Check dependency policy
-        run: cargo deny check
+      - name: Check root dependency policy
+        run: cargo deny --locked check
+
+      - name: Check fuzz dependency policy
+        run: cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml --locked check
 
       - name: Package library
-        run: cargo package -p pithos_lib --locked
+        run: cargo +stable package -p pithos_lib --locked
 
       - name: Dry-run library publish
-        run: cargo publish -p pithos_lib --dry-run --locked
+        run: cargo +stable publish -p pithos_lib --dry-run --locked
 
       - name: Publish or verify library
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
         run: |
-          if cargo publish -p pithos_lib --locked; then
+          if cargo +stable publish -p pithos_lib --locked; then
             exit 0
           fi
 
-          cargo info "pithos_lib@$RELEASE_VERSION" --registry crates-io >/dev/null
+          cargo +stable info "pithos_lib@$RELEASE_VERSION" --registry crates-io >/dev/null
 
       - name: Wait for library to reach crates.io
         shell: bash
         run: |
           for _ in {1..30}; do
-            if cargo info "pithos_lib@$RELEASE_VERSION" --registry crates-io >/dev/null 2>&1; then
+            if cargo +stable info "pithos_lib@$RELEASE_VERSION" --registry crates-io >/dev/null 2>&1; then
               exit 0
             fi
 
@@ -109,18 +113,18 @@ jobs:
           exit 1
 
       - name: Package CLI
-        run: cargo package -p pithos --locked
+        run: cargo +stable package -p pithos --locked
 
       - name: Dry-run CLI publish
-        run: cargo publish -p pithos --dry-run --locked
+        run: cargo +stable publish -p pithos --dry-run --locked
 
       - name: Publish or verify CLI
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
         run: |
-          if cargo publish -p pithos --locked; then
+          if cargo +stable publish -p pithos --locked; then
             exit 0
           fi
 
-          cargo info "pithos@$RELEASE_VERSION" --registry crates-io >/dev/null
+          cargo +stable info "pithos@$RELEASE_VERSION" --registry crates-io >/dev/null

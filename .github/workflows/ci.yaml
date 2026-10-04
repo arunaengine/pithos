@@ -1,7 +1,9 @@
 name: CI
 on:
-  - push
-  - pull_request
+  push:
+    branches:
+      - main
+  pull_request:
 
 permissions:
   contents: read
@@ -11,20 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  actionlint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install actionlint
-        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-
-      - name: Check workflows
-        run: |
-          "$(go env GOPATH)/bin/actionlint"
-
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -38,45 +26,28 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run workspace tests
-        run: cargo test --locked --workspace --all-targets
+      - name: Run stable workspace tests
+        run: cargo +stable test --locked --workspace --all-features --lib --bins --tests
 
-  fmt:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install stable rustfmt
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-  clippy:
+  msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install stable clippy
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install Rust 1.89.0
+        uses: dtolnay/rust-toolchain@1.89.0
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Run MSRV workspace tests
+        run: cargo +1.89.0 test --locked --workspace --all-features
 
-  deny:
+  block-count:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 40
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -84,10 +55,10 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
 
-      - name: Check dependency policy
-        run: cargo deny check
+      - name: Run the ignored 5 TiB block-count test in release mode
+        run: >-
+          cargo +stable test --locked --release -p pithos_lib --test pieces
+          a_composition_with_the_block_count_of_5_tib_opens_with_default_limits -- --ignored --exact

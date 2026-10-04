@@ -2,11 +2,20 @@ on:
   push:
     branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 name: coverage
 jobs:
   report:
     name: Report
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -31,7 +40,7 @@ jobs:
         name: Generate Coverage Report
         run: |
           mkdir -p .coverage
-          cargo llvm-cov --locked --workspace --all-targets --lcov --output-path=./.coverage/lcov.info
+          cargo llvm-cov --locked --workspace --lib --bins --tests --lcov --output-path=./.coverage/lcov.info
 
       - id: upload
         name: Upload Coverage Report

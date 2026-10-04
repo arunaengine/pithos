@@ -12,7 +12,7 @@
         "Dataset"
       ],
       "name": "Dummy RO-Crate",
-      "description": "A fixture RO-Crate used by the Pithos reader tests.",
+      "description": "An RO-Crate adapter and conversion fixture for Pithos tests.",
       "datePublished": "2026-01-01",
       "license": {"@id": "https://spdx.org/licenses/MIT"},
       "hasPart": [
@@ -53,10 +53,10 @@
       "description": "This directory contains supplementary literature to provide additional context information.",
       "hasPart": [
         {
-          "@id": "literature/Hodges06_human_brain_Affy.pdf",
+          "@id": "literature/pithos-placeholder.pdf",
           "@type": "File",
-          "name": "Regional and cellular gene expression changes in human Huntington’s disease brain",
-          "contentSize": "359786",
+          "name": "Pithos RO-Crate placeholder document",
+          "contentSize": "327",
           "encodingFormat": "application/pdf"
         }
       ]
@@ -72,11 +72,11 @@
           "@type": "Dataset",
           "hasPart": [
             {
-              "@id": "dataset/brain_gene_expression_data/brain_data_assession_number.txt",
+              "@id": "dataset/brain_gene_expression_data/brain_data_accession_number.txt",
               "@type": "File",
-              "name": "Assesion number of brain data input",
-              "contentSize": "29",
-              "encodingFormat": "test/plain"
+              "name": "Accession number of brain data input",
+              "contentSize": "30",
+              "encodingFormat": "text/plain"
             }
           ]
         }

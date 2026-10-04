@@ -1,0 +1,5 @@
+error[E0599]: no method named `into_writer` found for struct `Box<IncompleteWriter<Vec<u8>>>` in the current scope
+  --> tests/ui/incomplete_writer_cannot_resume.rs:10:24
+   |
+10 |     let _ = incomplete.into_writer();
+   |                        ^^^^^^^^^^^ method not found in `Box<IncompleteWriter<Vec<u8>>>`

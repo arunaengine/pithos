@@ -1,34 +1,132 @@
 [package]
 name = "pithos_lib"
-description = "Library and components for encrypting / compressing pithos (.pith) files, including specification"
-version = "0.7.3"
+description = "Library and components for encrypting / compressing pithos (.pith) files"
+version = "0.8.0"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = ["crates-io"]
+include = [
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "!benches/**",
+    "!tests/**",
+]
+autobenches = false
+
+[lib]
+bench = false
+
+[features]
+default = ["ro-crate", "crypt4gh"]
+# RO-Crate directory and ZIP conversion.
+ro-crate = ["dep:ro-crate-rs", "dep:zip"]
+# Crypt4GH export.
+crypt4gh = ["dep:blake2"]
+fuzzing = ["crypt4gh"]
+# Async source, reader and range stream without an async runtime.
+async = ["dep:futures-core"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+blake2 = { version = "0.10.6", optional = true }
 blake3 = "1.8.2"
 byteorder = "1.5.0"
-chacha20poly1305 = "0.11.0"
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 crc32fast = "1.5.0"
 cap-std = "4.0.2"
 digest = "0.11.3"
 fastcdc = "4.0.1"
+futures-core = { version = "0.3.32", default-features = false, optional = true }
+hkdf = "0.13.0"
 indexmap = "2.11.0"
 integer-encoding = "4.1.0"
+libc = "0.2.178"
 pkcs8 = { version = "0.11.0", features = ["pem", "alloc"] }
-ro-crate-rs = { version = "0.5.1", default-features = false }
+ro-crate-rs = { version = "0.5.1", default-features = false, optional = true }
+rustix = { version = "1.1.4", features = ["fs"] }
+sha2 = "0.11.0"
 shake = "0.1.0"
 thiserror = { workspace = true }
 tracing = { workspace = true }
-walkdir = "2.5.0"
 x25519-dalek = { workspace = true }
-zip = { version = "8.6.0", default-features = false, features = ["deflate", "time"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate", "time"], optional = true }
 zstd = "0.13.3"
+zeroize = "1.8.2"
 
 [dev-dependencies]
+criterion = "0.8.2"
+peak_alloc = "0.3.0"
+proptest = "1.6.0"
+rustversion = "1.0.23"
 tempfile = "3.21"
+tokio = { version = "1.52.3", default-features = false, features = ["rt"] }
+trybuild = "1.0.104"
+
+[[bench]]
+name = "archive_path"
+harness = false
+
+[[bench]]
+name = "block_pipeline"
+harness = false
+
+[[bench]]
+name = "archive_io"
+harness = false
+
+[[bench]]
+name = "append"
+harness = false
+
+[[bench]]
+name = "adapters"
+harness = false
+required-features = ["ro-crate", "crypt4gh"]
+
+[[test]]
+name = "crypt4gh_export"
+required-features = ["crypt4gh"]
+
+[[test]]
+name = "reader"
+required-features = ["crypt4gh"]
+
+[[test]]
+name = "public_api"
+required-features = ["ro-crate", "crypt4gh"]
+
+[[test]]
+name = "ro_crate_conversion"
+required-features = ["ro-crate"]
+
+[[test]]
+name = "ro_crate_directory"
+required-features = ["ro-crate"]
+
+[[test]]
+name = "ro_crate_zip"
+required-features = ["ro-crate"]
+
+[[example]]
+name = "crypt4gh"
+required-features = ["crypt4gh"]
+
+[[example]]
+name = "ro_crate"
+required-features = ["ro-crate"]
+
+[[test]]
+name = "async_reader"
+required-features = ["async"]
+
+[[test]]
+name = "compile_fail"
+required-features = ["crypt4gh"]
