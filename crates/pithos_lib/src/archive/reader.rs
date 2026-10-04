@@ -328,8 +328,8 @@ where
         let (settings, external, external_access_policy) = options.into_parts();
         let mut opener = ArchiveOpener::with_settings(archive_len, settings)?;
         while let Some(request) = opener.request() {
-            let response = read_source(&source, request.offset(), request.len(), "directory")?;
-            opener.feed(request, response)?;
+            let mut response = read_source(&source, request.offset(), request.len(), "directory")?;
+            opener.feed(request, std::mem::take(&mut *response))?;
         }
         let view = opener.finish()?;
         Ok(Self {
@@ -507,6 +507,8 @@ where
                             PithosError::ExternalBlockFraming("response policy overflow".into())
                         })?,
                 )?;
+                // A rejected response may hold plaintext, so it is wiped like an accepted one.
+                let response = Zeroizing::new(response);
                 if response.len() as u64 != len {
                     return Err(PithosError::ExternalBlockFraming(
                         "response does not match expected size".into(),
@@ -515,7 +517,7 @@ where
                 response
             }
         };
-        self.view.decode_block(block, &Zeroizing::new(stored))
+        self.view.decode_block(block, &stored)
     }
 }
 
@@ -662,10 +664,11 @@ fn read_source<S: ArchiveSource>(
     offset: u64,
     len: u64,
     field: &'static str,
-) -> Result<Vec<u8>, PithosError> {
+) -> Result<Zeroizing<Vec<u8>>, PithosError> {
     let len = usize::try_from(len)
         .map_err(|_| PithosError::InvalidDirectoryRange { operation: field })?;
-    let mut bytes = Vec::new();
+    // A failed read may have filled part of the buffer, so it is wiped like a complete one.
+    let mut bytes = Zeroizing::new(Vec::new());
     bytes
         .try_reserve_exact(len)
         .map_err(|_| PithosError::AllocationFailed {

@@ -2080,11 +2080,103 @@ fn version_1_1_appends_reuse_ciphers_and_give_unique_blocks_fresh_identities() {
     }
 }
 
+mod read_wiping {
+    use super::*;
+    use crate::format::zeroing_tests::{SECRET, watch};
+    use std::sync::atomic::AtomicBool;
+
+    /// A plain archive whose file "data" has four 64-byte blocks that each hold the secret.
+    pub(super) fn secret_blocks() -> Vec<u8> {
+        let content: Vec<u8> = (0..4)
+            .flat_map(|block| [SECRET, [0xB0 + block; 32]])
+            .flatten()
+            .collect();
+        let options = WriteOptions::base().with_chunking(Chunking::Fixed(64));
+        let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+        writer
+            .add_file(
+                ArchivePath::new("data").unwrap(),
+                EntryMetadata::new(0, 0, 0o644),
+                ProcessingOptions::new(false, 0).unwrap(),
+                Some(content.len() as u64),
+                Cursor::new(content),
+            )
+            .unwrap();
+        writer.finish().unwrap()
+    }
+
+    /// Serves `bytes`. Once `failing` is set, a read fills all but one byte and fails.
+    struct Failing {
+        bytes: Vec<u8>,
+        failing: Arc<AtomicBool>,
+    }
+
+    impl ArchiveSource for Failing {
+        fn len(&self) -> Result<u64, SourceError> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> Result<(), SourceError> {
+            let start = offset as usize;
+            let filled = output.len() - usize::from(self.failing.load(Ordering::Relaxed));
+            output[..filled].copy_from_slice(&self.bytes[start..start + filled]);
+            if filled < output.len() {
+                return Err(SourceError::UnexpectedEof {
+                    offset,
+                    expected: output.len(),
+                    actual: filled,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_block_read_is_wiped() {
+        let failing = Arc::new(AtomicBool::new(false));
+        let source = Failing {
+            bytes: secret_blocks(),
+            failing: Arc::clone(&failing),
+        };
+        let archive = Archive::open(source, OpenOptions::default()).unwrap();
+        failing.store(true, Ordering::Relaxed);
+        let (result, _, leaked) = watch(0, &[], || archive.copy_to("data", &mut Vec::new()));
+        assert!(matches!(
+            result,
+            Err(PithosError::Source(SourceError::UnexpectedEof { .. }))
+        ));
+        assert_eq!(leaked, 0);
+    }
+
+    #[test]
+    fn rejected_resolver_response_is_wiped() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("external.pith");
+        std::fs::write(&path, secret_blocks()).unwrap();
+        let mut response = as_external(&path);
+        response.pop();
+        let resolver = CountingResolver {
+            response: Arc::from(response),
+            calls: Arc::default(),
+            expected: Arc::default(),
+        };
+        let options = OpenOptions::default()
+            .with_external_resolver(resolver)
+            .with_external_access_policy(allowing_policy());
+        let source = MemorySource::new(std::fs::read(&path).unwrap());
+        let archive = Archive::open(source, options).unwrap();
+        let (result, _, leaked) = watch(0, &[], || archive.copy_to("data", &mut Vec::new()));
+        assert!(matches!(result, Err(PithosError::ExternalBlockFraming(_))));
+        assert_eq!(leaked, 0);
+    }
+}
+
 #[cfg(feature = "async")]
 mod async_wiping {
+    use super::read_wiping::secret_blocks;
     use super::*;
     use crate::archive::AsyncArchive;
-    use crate::format::zeroing_tests::{SECRET, watch};
+    use crate::format::zeroing_tests::watch;
     use crate::source::AsyncArchiveSource;
     use futures_core::Stream;
     use std::future::Future;
@@ -2114,26 +2206,6 @@ mod async_wiping {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("an in-memory read is pending"),
         }
-    }
-
-    /// A plain archive whose file "data" has four 64-byte blocks that each hold the secret.
-    fn secret_blocks() -> Vec<u8> {
-        let content: Vec<u8> = (0..4)
-            .flat_map(|block| [SECRET, [0xB0 + block; 32]])
-            .flatten()
-            .collect();
-        let options = WriteOptions::base().with_chunking(Chunking::Fixed(64));
-        let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
-        writer
-            .add_file(
-                ArchivePath::new("data").unwrap(),
-                EntryMetadata::new(0, 0, 0o644),
-                ProcessingOptions::new(false, 0).unwrap(),
-                Some(content.len() as u64),
-                Cursor::new(content),
-            )
-            .unwrap();
-        writer.finish().unwrap()
     }
 
     fn open(bytes: Vec<u8>, short: &Arc<AtomicBool>) -> AsyncArchive<Bytes> {
