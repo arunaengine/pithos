@@ -23,7 +23,8 @@ use zeroize::Zeroizing;
 ///
 /// Write [`GrantReplacement::header`], then the old archive bytes in
 /// [`GrantReplacement::copy_range`] unchanged, then [`GrantReplacement::directory`].
-/// It holds no key material.
+/// It holds no recovered secrets. Block keys that the directory already stores in the clear
+/// stay in it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GrantReplacement {
     copy_range: Range<u64>,
