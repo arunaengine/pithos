@@ -47,7 +47,7 @@ jobs:
       - name: Run Clippy
         run: cargo +stable clippy --locked --workspace --all-targets --all-features -- -D warnings
 
-  dependency-policy:
+  deny:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
