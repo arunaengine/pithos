@@ -7,9 +7,7 @@
 use crate::archive::content_tree::{self, ContentTree, Subtree, TreeHasher};
 use crate::archive::path_validation::validate_entry;
 use crate::archive::types::{ArchivePath, Processing};
-use crate::archive::writer::{
-    BlockKeyMode, Chunking, EntryMetadata, ProcessingOptions, validate_block_size,
-};
+use crate::archive::writer::{BlockKeyMode, CdcConfig, Chunking, EntryMetadata, ProcessingOptions};
 use crate::block;
 use crate::crypto::{self, FileKey, PublicKey};
 use crate::error::PithosError;
@@ -22,6 +20,7 @@ use crate::format::file_entry::{
 };
 use crate::format::header::{FileHeader, FormatVersion, encode_header};
 use crate::format::limits::DeserializationError;
+use fastcdc::v2020::{FastCDC, Normalization};
 use indexmap::IndexMap;
 use integer_encoding::{VarIntReader, VarIntWriter};
 use std::collections::HashSet;
@@ -62,8 +61,8 @@ pub struct Piece {
 /// Encodes the blocks of one piece. The caller appends every returned byte string, in order,
 /// to the piece's stored bytes.
 ///
-/// [`PieceEncoder::write`] and [`PieceEncoder::flush`] split the content into fixed-size blocks,
-/// which is the recommended use. [`PieceEncoder::push`] instead encodes caller-chosen blocks.
+/// [`PieceEncoder::write`] and [`PieceEncoder::flush`] split the content with the configured
+/// [`Chunking`], fixed 4 MiB blocks by default. [`PieceEncoder::push`] encodes caller-chosen blocks.
 ///
 /// The encoder also records BLAKE3 subtree chaining values of the piece plaintext, so that
 /// [`Composition::content_hash`] can report the whole-file BLAKE3. They are plaintext
@@ -78,7 +77,7 @@ pub struct PieceEncoder {
     seen: HashSet<[u8; 32]>,
     stored_len: u64,
     original_size: u64,
-    block_size: usize,
+    chunking: Chunking,
     pending: Zeroizing<Vec<u8>>,
     content_offset: u64,
     tree: Option<TreeHasher>,
@@ -119,7 +118,7 @@ impl PieceEncoder {
             seen: HashSet::new(),
             stored_len: 0,
             original_size: 0,
-            block_size: Chunking::DEFAULT_BLOCK_SIZE,
+            chunking: Chunking::default(),
             pending: Zeroizing::new(Vec::new()),
             content_offset: 0,
             tree: (processing.key_mode() != BlockKeyMode::Unique).then(|| TreeHasher::new(0)),
@@ -155,49 +154,84 @@ impl PieceEncoder {
         Ok(())
     }
 
-    /// Sets the block size used by [`PieceEncoder::write`]. The default is 4 MiB.
+    /// Sets fixed blocks of `size` bytes for [`PieceEncoder::write`]. The default is 4 MiB.
     /// Fails once content was added, because buffered bytes assume the old size.
-    pub fn with_block_size(mut self, size: usize) -> Result<Self, PithosError> {
+    pub fn with_block_size(self, size: usize) -> Result<Self, PithosError> {
+        self.with_chunking(Chunking::Fixed(size))
+    }
+
+    /// Sets how [`PieceEncoder::write`] splits content into blocks. The default is fixed 4 MiB.
+    /// FastCDC gives the same blocks as [`ArchiveWriter`](crate::archive::ArchiveWriter) for the
+    /// same content. Fails once content was added.
+    pub fn with_chunking(mut self, chunking: Chunking) -> Result<Self, PithosError> {
         self.ensure_no_content()?;
-        validate_block_size(size)?;
-        self.block_size = size;
+        chunking.validate()?;
+        self.chunking = chunking;
         Ok(self)
     }
 
     /// Adds content and returns the stored bytes of every block it completes.
-    /// Blocks have the configured size no matter how the content is split across calls.
-    /// After the last write, call [`PieceEncoder::flush`] for the short final block.
+    /// Block boundaries do not depend on how the content is split across calls.
+    /// After the last write, call [`PieceEncoder::flush`] for the final blocks.
     pub fn write(&mut self, mut content: &[u8]) -> Result<Vec<u8>, PithosError> {
         let mut stored = Vec::new();
+        let (buffer_size, cdc) = match self.chunking {
+            Chunking::Fixed(size) => (size, None),
+            Chunking::ContentDefined(cdc) => (cdc.max_size(), Some(cdc)),
+        };
         while !content.is_empty() {
-            if self.pending.is_empty() && content.len() >= self.block_size {
-                let (block, rest) = content.split_at(self.block_size);
+            if cdc.is_none() && self.pending.is_empty() && content.len() >= buffer_size {
+                let (block, rest) = content.split_at(buffer_size);
                 stored.extend(self.encode(block)?);
                 content = rest;
                 continue;
             }
-            let missing = self.block_size - self.pending.len();
-            // Reserving the rest of the block once keeps plaintext from being copied on growth.
+            let missing = buffer_size - self.pending.len();
+            // Reserving the rest of the buffer once keeps plaintext from being copied on growth.
             self.pending.reserve_exact(missing);
             let take = missing.min(content.len());
             self.pending.extend_from_slice(&content[..take]);
             content = &content[take..];
-            if self.pending.len() == self.block_size {
-                stored.extend(self.flush()?);
+            if self.pending.len() == buffer_size {
+                stored.extend(match cdc {
+                    Some(cdc) => self.cut_block(cdc)?,
+                    None => self.flush()?,
+                });
             }
         }
         Ok(stored)
     }
 
-    /// Encodes the bytes buffered by [`PieceEncoder::write`] as one block, if there are any.
+    /// Encodes the bytes buffered by [`PieceEncoder::write`] as the final blocks, if there are any.
     pub fn flush(&mut self) -> Result<Vec<u8>, PithosError> {
-        if self.pending.is_empty() {
-            return Ok(Vec::new());
+        let Chunking::ContentDefined(cdc) = self.chunking else {
+            if self.pending.is_empty() {
+                return Ok(Vec::new());
+            }
+            let block = std::mem::take(&mut self.pending);
+            let stored = self.encode(&block);
+            self.pending = block;
+            self.pending.clear();
+            return stored;
+        };
+        let mut stored = Vec::new();
+        while !self.pending.is_empty() {
+            stored.extend(self.cut_block(cdc)?);
         }
+        Ok(stored)
+    }
+
+    /// Encodes the first FastCDC block of the buffered bytes and removes it from the buffer.
+    /// Like `StreamCDC`, it cuts only with a full buffer or at the end of the content.
+    fn cut_block(&mut self, cdc: CdcConfig) -> Result<Vec<u8>, PithosError> {
+        let (min, avg, max) = (cdc.min_size(), cdc.avg_size(), cdc.max_size());
+        let len = self.pending.len();
+        let (_, end) =
+            FastCDC::with_level(&self.pending, min, avg, max, Normalization::Level1).cut(0, len);
         let block = std::mem::take(&mut self.pending);
-        let stored = self.encode(&block);
+        let stored = self.encode(&block[..end]);
         self.pending = block;
-        self.pending.clear();
+        self.pending.drain(..end);
         stored
     }
 
@@ -733,6 +767,54 @@ mod tests {
                 Err(PithosError::InvalidPieceRecord)
             ));
         }
+    }
+
+    #[test]
+    fn written_fragments_give_the_same_fastcdc_blocks_as_the_archive_writer() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let content = (0..20_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+        let cdc = CdcConfig::new(64, 256, 1024).unwrap();
+        let stream = fastcdc::v2020::StreamCDC::with_level(
+            Cursor::new(&content),
+            cdc.min_size(),
+            cdc.avg_size(),
+            cdc.max_size(),
+            Normalization::Level1,
+        );
+        let expected = stream
+            .map(|chunk| chunk.unwrap().length as u64)
+            .collect::<Vec<_>>();
+        assert!(expected.len() > 20);
+        let recipient = crate::crypto::PrivateKey::generate().public_key();
+        let processing = ProcessingOptions::new(true, 0).unwrap();
+        let encoder = || PieceEncoder::new(1, vec![recipient], processing).unwrap();
+        for fragment in [1, 7, 1000, 4096, content.len()] {
+            let chunking = Chunking::ContentDefined(cdc);
+            let mut written = encoder().with_chunking(chunking).unwrap();
+            let mut stored = 0;
+            for part in content.chunks(fragment) {
+                stored += written.write(part).unwrap().len();
+            }
+            stored += written.flush().unwrap().len();
+            let piece = written.finish().unwrap();
+            let sizes = piece.blocks.iter().map(|block| block.original_size);
+            assert_eq!(sizes.collect::<Vec<_>>(), expected, "{fragment}");
+            assert_eq!(piece.stored_len, stored as u64);
+        }
+
+        let mut started = encoder();
+        started.write(b"pending").unwrap();
+        assert!(matches!(
+            started.with_chunking(Chunking::ContentDefined(cdc)),
+            Err(PithosError::PieceContentStarted)
+        ));
     }
 
     #[test]

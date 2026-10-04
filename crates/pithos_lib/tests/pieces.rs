@@ -3,8 +3,8 @@ mod common;
 use common::util::{private_key, public_key};
 use pithos_lib::archive::{
     AccessKeys, AppendOptions, Archive, ArchivePath, ArchiveWriter, BlockKeyMode, BlockListForm,
-    EntryKind, EntryMetadata, OpenOptions, PayloadCipher, Piece, PieceEncoder, ProcessingOptions,
-    WriteOptions, compose,
+    CdcConfig, Chunking, EntryKind, EntryMetadata, OpenOptions, PayloadCipher, Piece, PieceEncoder,
+    ProcessingOptions, WriteOptions, compose,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
@@ -404,6 +404,36 @@ fn content_hash_of_aligned_parts_is_the_blake3_of_the_file() {
         let pieces = hashed_parts(&file, sizes);
         assert_eq!(content_hash(&pieces), Some(*blake3::hash(&file).as_bytes()));
     }
+}
+
+#[test]
+fn content_defined_pieces_compose_with_the_file_content_hash() {
+    let file = content(7, 300_000);
+    let chunking = Chunking::ContentDefined(CdcConfig::new(1024, 4096, 16_384).unwrap());
+    let processing = ProcessingOptions::new(true, 3).unwrap();
+    let mut parts = Vec::new();
+    for (key_id, range) in [(1, 0..102_400), (2, 102_400..file.len())] {
+        let mut encoder = PieceEncoder::new(key_id, vec![public_key("recipient1")], processing)
+            .unwrap()
+            .with_chunking(chunking)
+            .unwrap()
+            .with_content_offset(range.start as u64)
+            .unwrap();
+        let mut stored = Vec::new();
+        for fragment in file[range].chunks(5000) {
+            stored.extend(encoder.write(fragment).unwrap());
+        }
+        stored.extend(encoder.flush().unwrap());
+        parts.push((stored, encoder.finish().unwrap()));
+    }
+    let pieces = parts.iter().map(|(_, piece)| piece.clone());
+    let expected = *blake3::hash(&file).as_bytes();
+    assert_eq!(content_hash(&pieces.collect::<Vec<_>>()), Some(expected));
+
+    let archive = open(assemble(&parts), recipient());
+    let mut output = Vec::new();
+    archive.copy_to("object", &mut output).unwrap();
+    assert_eq!(output, file);
 }
 
 #[test]
