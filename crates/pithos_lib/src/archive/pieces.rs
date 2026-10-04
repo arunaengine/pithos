@@ -416,10 +416,12 @@ impl Piece {
         let list_len = read_count(&mut reader, 1)?;
         let sealed_list = read_vec(&mut reader, list_len)?;
         let sender = read_array(&mut reader)?;
+        crypto::validate_x25519_public_key(&sender)?;
         let grant_count = read_count(&mut reader, 32 + 1)?;
         let mut grants = Vec::with_capacity(grant_count);
         for _ in 0..grant_count {
             let recipient = read_array(&mut reader)?;
+            crypto::validate_x25519_public_key(&recipient)?;
             let len = read_count(&mut reader, 1)?;
             grants.push((recipient, read_vec(&mut reader, len)?));
         }
@@ -772,6 +774,28 @@ mod tests {
             assert!(matches!(
                 Piece::from_bytes(&invalid.to_bytes()),
                 Err(PithosError::InvalidPieceRecord)
+            ));
+        }
+    }
+
+    #[test]
+    fn piece_records_reject_non_contributory_keys() {
+        let recipient = crate::crypto::PrivateKey::generate().public_key();
+        let processing = ProcessingOptions::new(true, 0).unwrap();
+        let mut encoder = PieceEncoder::new(1, vec![recipient], processing).unwrap();
+        encoder.push(b"piece").unwrap();
+        let piece = encoder.finish().unwrap();
+        assert_eq!(Piece::from_bytes(&piece.to_bytes()).unwrap(), piece);
+        let mut sender = piece.clone();
+        sender.sender = [0; 32];
+        let mut grant = piece;
+        grant.grants[0].0 = [0; 32];
+        for damaged in [sender, grant] {
+            assert!(matches!(
+                Piece::from_bytes(&damaged.to_bytes()),
+                Err(PithosError::Crypt(
+                    crate::crypto::CryptoError::NonContributoryPublicKey
+                ))
             ));
         }
     }
