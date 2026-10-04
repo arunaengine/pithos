@@ -70,7 +70,7 @@ Format 1.1 keeps every 1.0 structure and encoding. This version reads 1.0 and 1.
 
 Breaking changes in the 0.8 API:
 
-- New writers use fixed 4 MiB blocks by default. Use `Chunking::ContentDefined` with `WriteOptions::with_chunking` for FastCDC blocks.
+- New writers use fixed 4 MiB blocks by default. Use `Chunking::ContentDefined` with `WriteOptions::with_chunking` or `PieceEncoder::with_chunking` for FastCDC blocks.
 - The RO-Crate and Crypt4GH adapters are behind the default features `ro-crate` and `crypt4gh`.
 - `Archive::open` no longer reads block markers. A missing or changed marker fails when the block is read.
 - The default `OpenLimits` admit objects up to 5 TiB.

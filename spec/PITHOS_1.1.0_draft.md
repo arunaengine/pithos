@@ -9,7 +9,7 @@
 
 This document specifies the Pithos file format using the key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
 
-Pithos is an append-only archive format designed for efficient storage and sharing of scientific data. It combines block-level deduplication, convergent encryption, and flexible metadata support optimized for object storage systems.
+Pithos is an append-only archive format designed for efficient storage and sharing of scientific data. It combines block-level deduplication with content-defined or fixed-size blocks, convergent encryption, and flexible metadata support optimized for object storage systems.
 
 **Illustrative data model.** Rust declarations in this document illustrate the
 data model only; implementations may use different declarations. Normative
@@ -1232,21 +1232,30 @@ Version 1.1 uses these ASCII strings, without a terminator:
 This appendix suggests writer choices only. It does not define archive
 conformance or reader behavior.
 
-**Recommended block size:** fixed 4 MiB (4,194,304 byte) blocks. Every block
-of an independently encoded part has this size except its last, which may be
-shorter. A file written in one pass therefore has at most one short block, at
-its end. A file joined from pieces has one possible short block at the end of
-each piece: two 5 MiB pieces give blocks of 4, 1, 4 and 1 MiB. Block boundaries
-depend only on byte offsets within a part, not on how the input was read. This
-suits object storage and multipart uploads, where parts are written
-independently.
-Content-defined chunking (for example FastCDC) is optional. It can find more
-repeated blocks when content shifts, at the cost of variable block sizes.
+**Block boundaries:** two methods suit different writers. One archive, and one
+file joined from pieces, may use both.
+
+- **Content-defined chunking:** FastCDC chooses boundaries with a gear hash of
+  the content, so content that moves after an insertion or deletion still
+  gives equal blocks. It suits a file written in one pass. Suggested sizes are
+  a 1 MiB minimum, a 4 MiB average and a 16 MiB maximum, with level-one
+  normalization.
+- **Fixed-size blocks:** 4 MiB (4,194,304 byte) blocks. Every block of an
+  independently encoded part has this size except its last, which may be
+  shorter. A file joined from pieces has one possible short block at the end of
+  each piece: two 5 MiB pieces give blocks of 4, 1, 4 and 1 MiB. Boundaries
+  depend only on byte offsets within a part. This suits object storage and
+  multipart uploads, where parts are written independently.
+
+Either method gives the same boundaries no matter how the input was read.
+Content-defined boundaries in a joined file restart at the start of every
+piece.
 
 **Directory size:** each block adds one descriptor and one block-list entry, so
 the directory grows with the block count. A 5 TiB file at 4 MiB blocks has
 about 1.31 million blocks and roughly 150 MB of directory. Smaller blocks
-increase this size in proportion.
+increase this size in proportion. With content-defined chunking the count
+depends on the content; the minimum block size bounds it.
 
 **Recommended compression mapping:** a writer may map ProcessingFlags values
 `1` through `7` to Zstandard levels `1`, `4`, `8`, `11`, `15`, `18`, and `22`,
