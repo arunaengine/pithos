@@ -47,8 +47,8 @@ type Pending<'a, T> = Pin<Box<dyn Future<Output = Result<T, PithosError>> + Send
 
 enum State<'a> {
     Fetching(Pending<'a, Vec<u8>>, Vec<PlannedBlock>),
-    Decoding(Pending<'a, Vec<Vec<u8>>>),
-    Ready(VecDeque<Vec<u8>>),
+    Decoding(Pending<'a, Vec<Zeroizing<Vec<u8>>>>),
+    Ready(VecDeque<Zeroizing<Vec<u8>>>),
     Failed(PithosError),
     Taken,
 }
@@ -140,7 +140,7 @@ trait Reader<'a> {
         &self,
         blocks: Vec<PlannedBlock>,
         stored: Zeroizing<Vec<u8>>,
-    ) -> Pending<'a, Vec<Vec<u8>>>;
+    ) -> Pending<'a, Vec<Zeroizing<Vec<u8>>>>;
 }
 
 impl<'a, S, E, B> Reader<'a> for &'a AsyncArchive<S, E, B>
@@ -157,7 +157,7 @@ where
         &self,
         blocks: Vec<PlannedBlock>,
         stored: Zeroizing<Vec<u8>>,
-    ) -> Pending<'a, Vec<Vec<u8>>> {
+    ) -> Pending<'a, Vec<Zeroizing<Vec<u8>>>> {
         let archive: &'a AsyncArchive<S, E, B> = self;
         let view = Arc::clone(&archive.view);
         Box::pin(
@@ -183,7 +183,7 @@ where
         &self,
         blocks: Vec<PlannedBlock>,
         stored: Zeroizing<Vec<u8>>,
-    ) -> Pending<'static, Vec<Vec<u8>>> {
+    ) -> Pending<'static, Vec<Zeroizing<Vec<u8>>>> {
         let archive = Arc::clone(self);
         Box::pin(async move {
             let view = Arc::clone(&archive.view);
@@ -326,10 +326,11 @@ where
         };
         let item = match &mut slot.state {
             State::Ready(chunks) => match chunks.pop_front() {
-                Some(chunk) => {
+                Some(mut chunk) => {
                     slot.reserved -= retained(&chunk);
                     self.buffered -= retained(&chunk);
-                    Ok(chunk)
+                    // Only the delivered chunk leaves its wiping wrapper.
+                    Ok(std::mem::take(&mut *chunk))
                 }
                 None => {
                     self.buffered -= slot.reserved;
@@ -477,7 +478,7 @@ fn split(batch: &BlockBatch, max_bytes: u64) -> VecDeque<Group> {
 }
 
 /// The bytes a delivered chunk holds: its capacity, not only its length.
-fn retained(chunk: &Vec<u8>) -> u64 {
+fn retained(chunk: &Zeroizing<Vec<u8>>) -> u64 {
     chunk.capacity() as u64
 }
 
@@ -486,7 +487,7 @@ fn decode_group(
     view: &ArchiveView,
     blocks: &[PlannedBlock],
     stored: &[u8],
-) -> Result<Vec<Vec<u8>>, PithosError> {
+) -> Result<Vec<Zeroizing<Vec<u8>>>, PithosError> {
     let mut previous: Option<&PlannedBlock> = None;
     let expected = blocks
         .iter()
@@ -516,14 +517,14 @@ fn decode_group(
             }
         };
         last = Some((block, bytes));
-        let mut plaintext = view.decode_block(block, bytes)?;
+        let plaintext = view.decode_block(block, bytes)?;
         let output = block.output();
         let whole = output.start == 0 && output.end == plaintext.len();
         // A buffer with spare capacity is copied, so a chunk keeps only its planned bytes.
         chunks.push(if whole && plaintext.capacity() == plaintext.len() {
-            std::mem::take(&mut *plaintext)
+            plaintext
         } else {
-            plaintext[output].to_vec()
+            Zeroizing::new(plaintext[output].to_vec())
         });
     }
     Ok(chunks)

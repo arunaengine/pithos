@@ -2079,3 +2079,88 @@ fn version_1_1_appends_reuse_ciphers_and_give_unique_blocks_fresh_identities() {
         assert_eq!(output, content, "{name}");
     }
 }
+
+#[cfg(feature = "async")]
+mod async_wiping {
+    use super::*;
+    use crate::archive::AsyncArchive;
+    use crate::format::zeroing_tests::{SECRET, watch};
+    use crate::source::AsyncArchiveSource;
+    use futures_core::Stream;
+    use std::future::Future;
+    use std::pin::{Pin, pin};
+    use std::task::{Context, Poll, Waker};
+
+    struct Bytes(Vec<u8>);
+
+    impl AsyncArchiveSource for Bytes {
+        async fn len(&self) -> Result<u64, SourceError> {
+            Ok(self.0.len() as u64)
+        }
+
+        async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, SourceError> {
+            Ok(self.0[offset as usize..(offset + len) as usize].to_vec())
+        }
+    }
+
+    fn ready<F: Future>(future: F) -> F::Output {
+        match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("an in-memory read is pending"),
+        }
+    }
+
+    /// A plain archive whose file "data" has four 64-byte blocks that each hold the secret.
+    fn secret_blocks() -> Vec<u8> {
+        let content: Vec<u8> = (0..4)
+            .flat_map(|block| [SECRET, [0xB0 + block; 32]])
+            .flatten()
+            .collect();
+        let options = WriteOptions::base().with_chunking(Chunking::Fixed(64));
+        let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+        writer
+            .add_file(
+                ArchivePath::new("data").unwrap(),
+                EntryMetadata::new(0, 0, 0o644),
+                ProcessingOptions::new(false, 0).unwrap(),
+                Some(content.len() as u64),
+                Cursor::new(content),
+            )
+            .unwrap();
+        writer.finish().unwrap()
+    }
+
+    /// Takes the first item of a stream over all blocks, then drops the stream.
+    /// Returns the item length and the number of freed buffers that still held the secret.
+    fn first_then_drop(bytes: Vec<u8>) -> (Result<usize, PithosError>, usize) {
+        let source = Bytes(bytes);
+        let archive = ready(AsyncArchive::open(source, OpenOptions::default(), None)).unwrap();
+        let (first, _, leaked) = watch(64, &[], || {
+            let mut stream = archive.read_range("data", 0..256).unwrap();
+            let mut cx = Context::from_waker(Waker::noop());
+            let Poll::Ready(Some(first)) = Pin::new(&mut stream).poll_next(&mut cx) else {
+                panic!("an in-memory stream has no first item");
+            };
+            drop(stream);
+            first.map(|chunk| Zeroizing::new(chunk).len())
+        });
+        (first, leaked)
+    }
+
+    #[test]
+    fn dropped_stream_wipes_chunks() {
+        let (first, leaked) = first_then_drop(secret_blocks());
+        assert_eq!(first.unwrap(), 64);
+        assert_eq!(leaked, 0);
+    }
+
+    #[test]
+    fn decode_failure_wipes_chunks() {
+        let mut bytes = secret_blocks();
+        let second = bytes.windows(32).position(|window| window == [0xB1; 32]);
+        bytes[second.unwrap()] ^= 1;
+        let (first, leaked) = first_then_drop(bytes);
+        assert!(matches!(first, Err(PithosError::BlockHashMismatch { .. })));
+        assert_eq!(leaked, 0);
+    }
+}

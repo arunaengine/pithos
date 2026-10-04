@@ -11,7 +11,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use zeroize::Zeroizing;
 
-const SECRET: [u8; 32] = {
+pub(crate) const SECRET: [u8; 32] = {
     let mut bytes = [0; 32];
     let mut index = 0;
     while index < 32 {
@@ -136,7 +136,7 @@ static ALLOCATOR: Inspecting = Inspecting;
 /// Runs `action` while watching freed blocks of `size` bytes. `initialized` names existing
 /// buffers whose whole allocation is initialized; blocks allocated during the watch count too.
 /// Returns the number of wiped blocks of that size and of freed blocks that held the secret.
-fn watch<T>(
+pub(crate) fn watch<T>(
     size: usize,
     initialized: &[*const u8],
     action: impl FnOnce() -> T,
