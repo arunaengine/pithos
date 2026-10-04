@@ -97,6 +97,8 @@ pub enum PithosError {
     PieceContentStarted,
     #[error("archive metadata does not match the expected digest")]
     MetadataDigestMismatch,
+    #[error("grant replacement needs a version 1.1 archive with exactly one directory")]
+    GrantReplacementUnsupported,
     #[error("duplicate encoded recipient file id")]
     DuplicateRecipientFileId,
     #[error("reserved processing bits are set: {0:#04x}")]

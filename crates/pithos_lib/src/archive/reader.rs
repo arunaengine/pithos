@@ -608,7 +608,7 @@ pub(super) fn classify_content_availability(
     Ok(availability)
 }
 
-fn deserialization_limits(limits: OpenLimits) -> DeserializationLimits {
+pub(super) fn deserialization_limits(limits: OpenLimits) -> DeserializationLimits {
     DeserializationLimits {
         max_collection_entries: limits.max_entries,
         max_file_entries: limits.max_entries,

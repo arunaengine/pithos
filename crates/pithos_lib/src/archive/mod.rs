@@ -11,6 +11,7 @@ mod async_reader;
 #[cfg(feature = "async")]
 mod async_stream;
 mod content_tree;
+mod grant_replacement;
 mod index;
 mod opener;
 mod path_validation;
@@ -31,6 +32,7 @@ pub use append::{AppendDurability, AppendObservation, AppendOptions};
 pub use async_reader::{AsyncArchive, AsyncExternalBlockResolver, BlockingHook, InlineBlocking};
 #[cfg(feature = "async")]
 pub use async_stream::{OwnedRangeStream, RangeStream, ReadLimits};
+pub use grant_replacement::GrantReplacement;
 pub use opener::{ArchiveOpener, ReadRequest};
 pub(crate) use path_validation::{
     validate_directory_entries, validate_new_candidate, validate_symlink_target,

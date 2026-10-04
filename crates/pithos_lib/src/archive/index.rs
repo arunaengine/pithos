@@ -41,6 +41,11 @@ impl ArchiveIndex {
             .and_then(|index| self.entries.get(*index))
     }
 
+    /// The number of directories, from the base to the terminal directory.
+    pub(crate) fn directory_count(&self) -> usize {
+        self.segment_spans.len()
+    }
+
     pub(crate) fn entry_at_path(&self, path: &ArchivePath) -> Option<&IndexedEntry> {
         self.by_path
             .get(path.as_str())

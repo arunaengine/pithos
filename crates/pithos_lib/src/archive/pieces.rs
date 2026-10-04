@@ -97,17 +97,7 @@ impl PieceEncoder {
             return Err(PithosError::WriterRequiresRecipient);
         }
         processing.validate_for(FormatVersion::V1_1)?;
-        let recipients = recipients
-            .into_iter()
-            .map(|recipient| recipient.into_dalek_public_key().to_bytes())
-            .collect::<Vec<_>>();
-        let mut unique = HashSet::with_capacity(recipients.len());
-        if recipients
-            .iter()
-            .any(|recipient| !unique.insert(*recipient))
-        {
-            return Err(PithosError::DuplicateRecipientKey);
-        }
+        let recipients = distinct_keys(recipients)?;
         Ok(Self {
             key_id,
             recipients,
@@ -533,6 +523,30 @@ fn read_count(reader: &mut Cursor<&[u8]>, item_len: u64) -> Result<usize, Pithos
     usize::try_from(count).map_err(|_| PithosError::InvalidPieceRecord)
 }
 
+/// The raw keys of `recipients`. A key given twice is rejected.
+pub(crate) fn distinct_keys(recipients: Vec<PublicKey>) -> Result<Vec<[u8; 32]>, PithosError> {
+    let recipients = recipients
+        .into_iter()
+        .map(|recipient| recipient.into_dalek_public_key().to_bytes())
+        .collect::<Vec<_>>();
+    let mut unique = HashSet::with_capacity(recipients.len());
+    if recipients
+        .iter()
+        .any(|recipient| !unique.insert(*recipient))
+    {
+        return Err(PithosError::DuplicateRecipientKey);
+    }
+    Ok(recipients)
+}
+
+/// The file header of a version 1.1 archive.
+pub(crate) fn v1_1_header() -> [u8; FileHeader::ENCODED_LEN] {
+    let mut header = [0; FileHeader::ENCODED_LEN];
+    encode_header(&FormatVersion::V1_1.header(), &mut header.as_mut_slice())
+        .expect("the header fits its fixed length");
+    header
+}
+
 fn checked_add(left: u64, right: u64) -> Result<u64, PithosError> {
     left.checked_add(right)
         .ok_or(PithosError::InvalidDirectoryRange {
@@ -552,10 +566,7 @@ pub struct Composition {
 
 impl Composition {
     pub fn header(&self) -> [u8; FileHeader::ENCODED_LEN] {
-        let mut header = [0; FileHeader::ENCODED_LEN];
-        encode_header(&FormatVersion::V1_1.header(), &mut header.as_mut_slice())
-            .expect("the header fits its fixed length");
-        header
+        v1_1_header()
     }
 
     /// Archive offset at which each piece's stored bytes start.

@@ -3,8 +3,8 @@ mod common;
 use common::util::{private_key, public_key};
 use pithos_lib::archive::{
     AccessKeys, AppendOptions, Archive, ArchivePath, ArchiveWriter, BlockKeyMode, BlockListForm,
-    CdcConfig, Chunking, EntryKind, EntryMetadata, OpenOptions, PayloadCipher, Piece, PieceEncoder,
-    ProcessingOptions, WriteOptions, compose,
+    CdcConfig, Chunking, EntryKind, EntryMetadata, GrantReplacement, OpenOptions, PayloadCipher,
+    Piece, PieceEncoder, ProcessingOptions, WriteOptions, compose,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
 use pithos_lib::source::MemorySource;
@@ -534,5 +534,114 @@ fn entries_report_how_their_block_list_is_stored() {
             Some(form)
         );
         assert_eq!(archive.entry("folder").unwrap().unwrap().block_list, None);
+    }
+}
+
+/// Plans grants for recipient2 only, from an archive opened with recipient1's key.
+fn replace_grants(bytes: &[u8]) -> Result<GrantReplacement, PithosError> {
+    let archive = open(bytes.to_vec(), recipient());
+    let directory = &bytes[archive.view().directory_range().start as usize..];
+    archive
+        .view()
+        .replace_grants(directory, vec![public_key("recipient2")])
+}
+
+/// Replaces the grants of `bytes` and checks the new archive and both readers.
+fn check_replaced_grants(bytes: Vec<u8>, path: &str, expected: &[u8]) {
+    let plan = replace_grants(&bytes).unwrap();
+    let range = plan.copy_range();
+    let mut replaced = plan.header().to_vec();
+    replaced.extend_from_slice(&bytes[range.start as usize..range.end as usize]);
+    replaced.extend_from_slice(plan.directory());
+    assert_eq!(replaced.len() as u64, plan.archive_len());
+    // The header and every stored block keep their bytes and offsets.
+    let old = open(bytes.clone(), recipient());
+    assert_eq!(range.end, old.view().directory_range().start);
+    assert_eq!(replaced[..range.end as usize], bytes[..range.end as usize]);
+    assert_ne!(plan.metadata_digest(), old.metadata_digest());
+
+    let reader = AccessKeys::new().with_key(private_key("recipient2"));
+    let options = OpenOptions::default().with_access_keys(reader);
+    let source = MemorySource::new(replaced.clone());
+    let archive = Archive::open(
+        source,
+        options.with_expected_metadata_digest(plan.metadata_digest()),
+    )
+    .unwrap();
+    let mut output = Vec::new();
+    archive.copy_to(path, &mut output).unwrap();
+    assert_eq!(output, expected);
+    let stale = OpenOptions::default().with_expected_metadata_digest(old.metadata_digest());
+    assert!(matches!(
+        Archive::open(MemorySource::new(replaced.clone()), stale),
+        Err(PithosError::MetadataDigestMismatch)
+    ));
+    let former = open(replaced, recipient());
+    assert!(matches!(
+        former.copy_to(path, &mut Vec::new()),
+        Err(PithosError::ContentUnavailable)
+    ));
+}
+
+#[test]
+fn replaced_grants_move_piece_keys_to_a_new_reader() {
+    let first = content(6, 2500);
+    let second = content(7, 900);
+    let parts = vec![encode(2, &first), encode(5, &second)];
+    check_replaced_grants(assemble(&parts), "object", &[first, second].concat());
+}
+
+#[test]
+fn replaced_grants_move_a_file_key_to_a_new_reader() {
+    let options = WriteOptions::new(private_key("sender"), vec![public_key("recipient1")]);
+    let options = options.with_chunking(Chunking::Fixed(BLOCK));
+    let mut writer = ArchiveWriter::create(Vec::new(), options).unwrap();
+    let data = content(8, 3000);
+    writer
+        .add_file(
+            ArchivePath::new("data").unwrap(),
+            EntryMetadata::new(0, 0, 0o644),
+            ProcessingOptions::new(true, 3).unwrap(),
+            None,
+            std::io::Cursor::new(&data),
+        )
+        .unwrap();
+    check_replaced_grants(writer.finish().unwrap(), "data", &data);
+}
+
+#[test]
+fn grant_replacement_rejects_unsupported_archives_and_missing_keys() {
+    let bytes = assemble(&[encode(1, &content(9, 1500))]);
+    let without_keys = open(bytes.clone(), AccessKeys::new());
+    let directory = &bytes[without_keys.view().directory_range().start as usize..];
+    assert!(matches!(
+        without_keys
+            .view()
+            .replace_grants(directory, vec![public_key("recipient2")]),
+        Err(PithosError::ContentUnavailable)
+    ));
+    let archive = open(bytes.clone(), recipient());
+    assert!(matches!(
+        archive
+            .view()
+            .replace_grants(&bytes, vec![public_key("recipient2")]),
+        Err(PithosError::MetadataDigestMismatch)
+    ));
+
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("appended.pith");
+    std::fs::write(&path, &bytes).unwrap();
+    pithos_lib::fs::grant_readers(
+        &path,
+        AppendOptions::new(private_key("recipient1"), vec![public_key("recipient2")]),
+        &[0],
+    )
+    .unwrap();
+    let older = std::fs::read("tests/data/pithos-0.7.0.pith").unwrap();
+    for bytes in [std::fs::read(&path).unwrap(), older] {
+        assert!(matches!(
+            replace_grants(&bytes),
+            Err(PithosError::GrantReplacementUnsupported)
+        ));
     }
 }

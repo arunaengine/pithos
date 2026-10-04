@@ -79,3 +79,4 @@ Breaking changes in the 0.8 API:
 Additions in the 0.8 API:
 
 - `PublicKey::from_raw`, `PublicKey::as_bytes` and `PrivateKey::from_raw` import and export raw 32-byte X25519 keys without PEM. `PrivateKey::from_raw` takes a `Zeroizing` container.
+- `ArchiveView::replace_grants` plans a copy of a version 1.1 archive with one directory that grants its keys only to new recipients. It reuses every block and sealed block list unchanged.
