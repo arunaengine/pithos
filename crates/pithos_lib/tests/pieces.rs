@@ -7,7 +7,7 @@ use pithos_lib::archive::{
     Piece, PieceEncoder, ProcessingOptions, WriteOptions, compose,
 };
 use pithos_lib::error::{DeserializationError, PithosError};
-use pithos_lib::source::MemorySource;
+use pithos_lib::source::{ArchiveSource, MemorySource, SourceError};
 
 const BLOCK: usize = 1000;
 
@@ -644,4 +644,49 @@ fn grant_replacement_rejects_unsupported_archives_and_missing_keys() {
             Err(PithosError::GrantReplacementUnsupported)
         ));
     }
+}
+
+/// Serves an archive with its directory moved to the end of a `u64::MAX` byte object.
+struct AtEnd {
+    bytes: Vec<u8>,
+    directory: usize,
+}
+
+impl ArchiveSource for AtEnd {
+    fn len(&self) -> Result<u64, SourceError> {
+        Ok(u64::MAX)
+    }
+
+    fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<(), SourceError> {
+        let tail_start = u64::MAX - (self.bytes.len() - self.directory) as u64;
+        let start = match offset.checked_sub(tail_start) {
+            Some(position) => self.directory + position as usize,
+            None => offset as usize,
+        };
+        buffer.copy_from_slice(&self.bytes[start..start + buffer.len()]);
+        Ok(())
+    }
+}
+
+#[test]
+fn grant_replacement_rejects_an_archive_length_overflow() {
+    let bytes = assemble(&[encode(1, &content(9, 1500))]);
+    let directory = open(bytes.clone(), recipient())
+        .view()
+        .directory_range()
+        .start as usize;
+    let source = AtEnd {
+        bytes: bytes.clone(),
+        directory,
+    };
+    let options = OpenOptions::default().with_access_keys(recipient());
+    let archive = Archive::open(source, options).unwrap();
+    // Two recipients make the new directory larger than the old one.
+    let recipients = vec![public_key("recipient2"), public_key("sender")];
+    assert!(matches!(
+        archive
+            .view()
+            .replace_grants(&bytes[directory..], recipients),
+        Err(PithosError::InvalidDirectoryRange { .. })
+    ));
 }

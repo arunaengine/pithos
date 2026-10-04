@@ -93,8 +93,13 @@ impl ArchiveView {
         directory.encryption = grant(&list, &recipients)?;
         let directory = encode_complete_directory(&directory)?;
         let copy_range = FileHeader::ENCODED_LEN as u64..self.terminal_directory.start();
+        let archive_len = copy_range.end.checked_add(directory.len() as u64).ok_or(
+            PithosError::InvalidDirectoryRange {
+                operation: "add the replacement directory length",
+            },
+        )?;
         Ok(GrantReplacement {
-            archive_len: copy_range.end + directory.len() as u64,
+            archive_len,
             copy_range,
             directory,
         })
