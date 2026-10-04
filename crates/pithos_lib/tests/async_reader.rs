@@ -643,7 +643,7 @@ fn a_tokio_blocking_pool_reads_like_the_sync_archive() {
     assert_eq!(output, expected);
 }
 
-const SPEC: &str = include_str!("../../../spec/PITHOS_1.0.0_draft.md");
+const SPEC: &str = include_str!("../../../spec/PITHOS_1.1.0_draft.md");
 const INITIAL_TARGET: &str = "https://storage.test/initial";
 const REDIRECT_TARGET: &str = "https://storage.test/redirect";
 

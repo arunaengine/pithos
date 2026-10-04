@@ -56,4 +56,4 @@ The filesystem operations are Linux-only and require destination filesystem supp
 
 Version 0.8 is a source break from 0.7. Use the selected public API in `pithos_lib::archive`, `crypto`, `source`, `fs`, and `adapters`; old model, helper, and wire-record paths are not compatibility APIs.
 
-This branch implements the wire rules in the [Pithos 1.0 draft](spec/PITHOS_1.0.0_draft.md). Cargo package versioning is maintained separately from the wire-format version.
+This branch implements the wire rules in the [Pithos 1.1 draft](spec/PITHOS_1.1.0_draft.md). Cargo package versioning is maintained separately from the wire-format version.

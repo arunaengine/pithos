@@ -14,7 +14,7 @@ use pithos_lib::source::MemorySource;
 use std::io::Cursor;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const SPEC: &str = include_str!("../../../spec/PITHOS_1.0.0_draft.md");
+const SPEC: &str = include_str!("../../../spec/PITHOS_1.1.0_draft.md");
 const RELATIONS: [(u8, &str); 10] = [
     (0, "DESCRIBES"),
     (1, "ANNOTATES"),
