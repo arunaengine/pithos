@@ -99,6 +99,10 @@ async runtime.
 - `read_range(path, range)` returns a `Stream` of verified plaintext chunks in file order.
   `ReadLimits` bounds the outstanding requests and the bytes held for responses, decoding and
   ordered delivery. Dropping the stream cancels its outstanding requests.
+- `read_range_owned(path, range)` takes the archive in an `Arc` and returns an
+  `OwnedRangeStream` that holds it. It reads like `read_range`, with the same order, bounds and
+  cancellation, but it is `Send + 'static`. A server handler can return it as a streaming
+  response body, for example after mapping its error type.
 - The source must serve one immutable object revision for the open and every later read, and
   each response must have exactly the requested length.
 - Decoding directories and blocks is CPU work. `open` runs it inline, which suits only small
@@ -107,6 +111,25 @@ async runtime.
 - External blocks follow the rules of the synchronous reader: they are read only when both a
   resolver and an access policy are supplied, and the resolver checks the policy before its
   initial access and before every redirect.
+
+A handler that shares one opened archive can return a body stream like this:
+
+```rust,no_run
+use futures_core::Stream;
+use pithos_lib::archive::AsyncArchive;
+use pithos_lib::error::PithosError;
+use pithos_lib::source::AsyncArchiveSource;
+use std::ops::Range;
+use std::sync::Arc;
+
+fn body<S: AsyncArchiveSource + 'static>(
+    archive: &Arc<AsyncArchive<S>>,
+    path: &str,
+    range: Range<u64>,
+) -> Result<impl Stream<Item = Result<Vec<u8>, PithosError>> + Send + 'static, PithosError> {
+    Arc::clone(archive).read_range_owned(path, range)
+}
+```
 
 ## RO-Crate ingestion
 
