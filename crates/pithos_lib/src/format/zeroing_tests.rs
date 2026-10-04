@@ -31,6 +31,7 @@ thread_local! {
     static ZEROED_FREES: Cell<usize> = const { Cell::new(0) };
     static SECRET_FREES: Cell<usize> = const { Cell::new(0) };
     static TRACKED: Cell<[usize; TRACKED_CAPACITY]> = const { Cell::new([0; TRACKED_CAPACITY]) };
+    static TRACKING_FULL: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Inspecting;
@@ -43,9 +44,13 @@ impl Inspecting {
     fn track(pointer: *mut u8) {
         let _ = TRACKED.try_with(|tracked| {
             let mut slots = tracked.get();
-            if let Some(slot) = slots.iter_mut().find(|slot| **slot == 0) {
-                *slot = pointer as usize;
-                tracked.set(slots);
+            match slots.iter_mut().find(|slot| **slot == 0) {
+                Some(slot) => {
+                    *slot = pointer as usize;
+                    tracked.set(slots);
+                }
+                // A skipped block could hide a leak, so `watch` fails the test instead.
+                None => TRACKING_FULL.set(true),
             }
         });
     }
@@ -103,14 +108,23 @@ unsafe impl GlobalAlloc for Inspecting {
         if !Self::watching() {
             return unsafe { System.realloc(pointer, layout, new_size) };
         }
-        // While watching, a reallocation frees the old block through `dealloc`.
+        // While watching, a reallocation frees the old block through `dealloc`. The copy keeps
+        // any uninitialized bytes of the old block, so the new block is tracked only when the
+        // old block was known to be fully initialized.
+        let old_tracked = TRACKED
+            .try_with(|tracked| tracked.get().contains(&(pointer as usize)))
+            .unwrap_or(false);
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let moved = unsafe { self.alloc(new_layout) };
+        let moved = unsafe { System.alloc(new_layout) };
         if !moved.is_null() {
             unsafe {
+                std::ptr::write_bytes(moved, FILL, new_size);
                 std::ptr::copy_nonoverlapping(pointer, moved, layout.size().min(new_size));
-                self.dealloc(pointer, layout);
             }
+            if old_tracked {
+                Self::track(moved);
+            }
+            unsafe { self.dealloc(pointer, layout) };
         }
         moved
     }
@@ -130,6 +144,7 @@ fn watch<T>(
     ZEROED_FREES.set(0);
     SECRET_FREES.set(0);
     TRACKED.set([0; TRACKED_CAPACITY]);
+    TRACKING_FULL.set(false);
     for pointer in initialized {
         Inspecting::track(pointer.cast_mut());
     }
@@ -137,6 +152,10 @@ fn watch<T>(
     let result = action();
     WATCHED_SIZE.set(None);
     TRACKED.set([0; TRACKED_CAPACITY]);
+    assert!(
+        !TRACKING_FULL.get(),
+        "the watch tracked more blocks than it can hold"
+    );
     (result, ZEROED_FREES.get(), SECRET_FREES.get())
 }
 
@@ -181,4 +200,16 @@ fn decode_error_wipes_partial_secrets() {
     });
     assert!(decoded.is_err());
     assert_eq!((zeroed, leaked), (1, 0));
+}
+
+#[test]
+fn untracked_buffers_with_spare_capacity_are_never_read() {
+    // Spare capacity is uninitialized, so neither this block nor its grown copy may be read.
+    let mut partial = Vec::with_capacity(8);
+    partial.push(SECRET);
+    let ((), zeroed, leaked) = watch(32, &[], || {
+        partial.reserve_exact(64);
+        drop(std::mem::take(&mut partial));
+    });
+    assert_eq!((zeroed, leaked), (0, 0));
 }
