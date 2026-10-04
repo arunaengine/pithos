@@ -150,7 +150,7 @@ The upstream parser accepts RO-Crate 1.1 and 1.2 metadata without upstream valid
 
 ## Memory wiping
 
-Pithos wipes its owned Rust buffers. zstd internal allocations may retain plaintext after being freed.
+Pithos wipes its protected internal key and transform buffers. They hold keys, key lists, and block content while Pithos chunks, compresses, encrypts, decrypts, decompresses and verifies it. Other buffers are not wiped. For example, `MemorySource` keeps the archive bytes in a plain `Arc<[u8]>`, which holds the plaintext of plain blocks. Plaintext that a read hands to the caller is the caller's to wipe. zstd internal allocations may retain plaintext after being freed.
 
 ## Platform behavior
 
