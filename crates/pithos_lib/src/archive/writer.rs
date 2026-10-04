@@ -129,6 +129,7 @@ enum Chunker<R: Read> {
         content: R,
         size: usize,
         block: Zeroizing<Vec<u8>>,
+        ended: bool,
     },
     ContentDefined {
         content: R,
@@ -146,6 +147,7 @@ impl<R: Read> Chunker<R> {
                 content,
                 size,
                 block: Zeroizing::new(Vec::new()),
+                ended: false,
             },
             Chunking::ContentDefined(cdc) => Self::ContentDefined {
                 content,
@@ -164,11 +166,17 @@ impl<R: Read> Chunker<R> {
                 content,
                 size,
                 block,
+                ended,
             } => {
-                // Reserving the whole block once keeps plaintext from being copied on growth.
                 block.clear();
+                if *ended {
+                    return Ok(None);
+                }
+                // Reserving the whole block once keeps plaintext from being copied on growth.
                 block.reserve_exact(*size);
                 content.by_ref().take(*size as u64).read_to_end(block)?;
+                // A short block means a read returned 0, so it is the last one.
+                *ended = block.len() < *size;
                 Ok((!block.is_empty()).then_some(block.as_slice()))
             }
             Self::ContentDefined {
@@ -2601,10 +2609,28 @@ mod tests {
         }
     }
 
+    /// Answers with `first`, then reports the end once, then answers with `last`.
+    fn ended_after(first: &[u8], last: io::Result<Vec<u8>>) -> Steps {
+        Steps([Ok(first.to_vec()), Ok(Vec::new()), last].into())
+    }
+
+    #[test]
+    fn fixed_reads_stop_at_the_end() {
+        let first = noise(500);
+        let expected = vec![(*blake3::hash(&first).as_bytes(), 500)];
+        let fixed = Chunking::Fixed(1024);
+        assert_eq!(
+            written_blocks(fixed, ended_after(&first, Ok(noise(500)))),
+            expected
+        );
+        let failing = ended_after(&first, Err(io::Error::other("read after the end")));
+        assert_eq!(written_blocks(fixed, failing), expected);
+    }
+
     #[test]
     fn content_defined_reads_stop_at_the_end() {
         let first = noise(500);
-        let steps = |last| Steps([Ok(first.clone()), Ok(Vec::new()), last].into());
+        let steps = |last| ended_after(&first, last);
         let cdc = CdcConfig::new(64, 256, 1024).unwrap();
         let expected = stream_blocks(cdc, steps(Ok(noise(500))));
         assert_eq!(expected.iter().map(|block| block.1).sum::<u64>(), 500);
