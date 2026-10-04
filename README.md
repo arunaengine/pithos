@@ -57,3 +57,21 @@ The filesystem operations are Linux-only and require destination filesystem supp
 Version 0.8 is a source break from 0.7. Use the selected public API in `pithos_lib::archive`, `crypto`, `source`, `fs`, and `adapters`; old model, helper, and wire-record paths are not compatibility APIs.
 
 This branch implements the wire rules in the [Pithos 1.1 draft](spec/PITHOS_1.1.0_draft.md). Cargo package versioning is maintained separately from the wire-format version.
+
+## Format 1.1
+
+Format 1.1 keeps every 1.0 structure and encoding. This version reads 1.0 and 1.1 archives, writes new archives as 1.1, and appends to an archive with the rules of its own version. The changes are:
+
+- The header version is `0x0101`.
+- A recipient grant key is derived with HKDF-SHA256 instead of using the raw X25519 shared secret.
+- A file's block list can be sealed in independent pieces, each with its own key. Pieces can be joined later without opening a key.
+- An encrypted block can use a random key instead of its content-derived key. Such blocks are never deduplicated.
+- An encrypted block payload can use AES-256-GCM instead of ChaCha20-Poly1305.
+
+Breaking changes in the 0.8 API:
+
+- New writers use fixed 4 MiB blocks by default. Use `Chunking::ContentDefined` with `WriteOptions::with_chunking` for FastCDC blocks.
+- The RO-Crate and Crypt4GH adapters are behind the default features `ro-crate` and `crypt4gh`.
+- `Archive::open` no longer reads block markers. A missing or changed marker fails when the block is read.
+- The default `OpenLimits` admit objects up to 5 TiB.
+- The minimum supported Rust version is 1.89.
