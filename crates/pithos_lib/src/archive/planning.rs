@@ -304,6 +304,8 @@ impl Iterator for BlockBatches<'_> {
             Err(error) => return Some(Err(error)),
         };
         let Some((offset, len)) = first.local_span() else {
+            // A repeated external block could reuse the response, but the async stream detects
+            // repeats by local span only, so joining external repeats needs a change there too.
             return Some(Ok(BlockBatch {
                 blocks: vec![first],
             }));
