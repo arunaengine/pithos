@@ -1,4 +1,4 @@
-use super::async_stream::{RangeStream, ReadLimits};
+use super::async_stream::{OwnedRangeStream, RangeStream, ReadLimits};
 use super::opener::ArchiveOpener;
 use super::planning::BlockRequest;
 use super::reader::{
@@ -174,8 +174,8 @@ where
     ///
     /// Path, range and availability errors are returned before any request. Each item is the
     /// planned part of one completely verified block. The stream ends after its first error.
-    /// Dropping it cancels every outstanding request. To move the stream into a task that
-    /// needs `'static`, share the archive in an `Arc` and read inside an async block.
+    /// Dropping it cancels every outstanding request. For a `'static` stream, use
+    /// [`AsyncArchive::read_range_owned`].
     pub fn read_range(
         &self,
         path: &str,
@@ -187,6 +187,28 @@ where
             plan.batches(self.limits.max_request_bytes),
             self.limits,
         ))
+    }
+
+    /// Streams like [`AsyncArchive::read_range`], but the stream holds the shared archive
+    /// instead of a borrow. It is `Send + 'static`, so a server handler can return it as a
+    /// response body or move it into a task. Dropping it cancels every outstanding request.
+    pub fn read_range_owned(
+        self: Arc<Self>,
+        path: &str,
+        range: Range<u64>,
+    ) -> Result<OwnedRangeStream<S, E, B>, PithosError>
+    where
+        S: 'static,
+        E: 'static,
+        B: 'static,
+    {
+        let cursor = self
+            .view
+            .plan_range(path, range)?
+            .batches(self.limits.max_request_bytes)
+            .detach();
+        let limits = self.limits;
+        Ok(OwnedRangeStream::new(self, cursor, limits))
     }
 
     /// Fetches the stored bytes of one batch request.

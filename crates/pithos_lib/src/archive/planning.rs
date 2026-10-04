@@ -1,7 +1,7 @@
 use crate::archive::index::ArchiveIndex;
 use crate::archive::types::{
-    BlockDescriptor, BlockHash, BlockLocation, ContentState, Entry, ExternalLocation, FileId,
-    ReadRange,
+    BlockDescriptor, BlockHash, BlockLocation, BlockReferences, ContentState, Entry,
+    ExternalLocation, FileId, ReadRange,
 };
 use crate::block;
 use crate::error::PithosError;
@@ -95,18 +95,7 @@ impl<'a> ReadPlan<'a> {
         range: ReadRange,
         limits: block::Limits,
     ) -> Result<Self, PithosError> {
-        let content = index
-            .entry(file)
-            .and_then(|entry| match &entry.entry {
-                Entry::File(content) | Entry::Metadata(content) => Some(content),
-                Entry::Directory(_) | Entry::Symlink { .. } => None,
-            })
-            .ok_or_else(|| {
-                PithosError::InvalidBlockDataState("only data/metadata entries have content".into())
-            })?;
-        let ContentState::Available(references) = &content.content else {
-            return Err(PithosError::ContentUnavailable);
-        };
+        let references = available_references(index, file)?;
         // The plan starts at the last offset checkpoint before the range.
         let (first_position, cursor) = references.start_near(range.start());
         let references = if range.start() < range.end() {
@@ -123,6 +112,42 @@ impl<'a> ReadPlan<'a> {
             range,
             limits,
         })
+    }
+
+    /// Continues a plan at the reference `position`, whose block starts at `cursor`.
+    /// `None` continues a plan that has ended.
+    #[cfg(feature = "async")]
+    fn resume(
+        index: &'a ArchiveIndex,
+        file: FileId,
+        range: ReadRange,
+        limits: block::Limits,
+        position: Option<usize>,
+        cursor: u64,
+    ) -> Result<Self, PithosError> {
+        let references = match position {
+            Some(position) => available_references(index, file)?
+                .as_slice()
+                .get(position..)
+                .unwrap_or_default(),
+            None => &[],
+        };
+        Ok(Self {
+            index,
+            file,
+            references: references.iter().enumerate(),
+            first_position: position.unwrap_or_default(),
+            cursor,
+            range,
+            limits,
+        })
+    }
+
+    /// The position of the next reference, or `None` when the plan has ended.
+    #[cfg(feature = "async")]
+    fn position(&self) -> Option<usize> {
+        let (offset, _) = self.references.clone().next()?;
+        Some(self.first_position + offset)
     }
 
     /// Plans the block at the cursor, or returns `None` when it lies before the range.
@@ -164,6 +189,26 @@ impl<'a> ReadPlan<'a> {
             descriptor: descriptor.clone(),
             output: output_start..output_end,
         }))
+    }
+}
+
+/// The block references of an available data or metadata entry.
+fn available_references(
+    index: &ArchiveIndex,
+    file: FileId,
+) -> Result<&BlockReferences, PithosError> {
+    let content = index
+        .entry(file)
+        .and_then(|entry| match &entry.entry {
+            Entry::File(content) | Entry::Metadata(content) => Some(content),
+            Entry::Directory(_) | Entry::Symlink { .. } => None,
+        })
+        .ok_or_else(|| {
+            PithosError::InvalidBlockDataState("only data/metadata entries have content".into())
+        })?;
+    match &content.content {
+        ContentState::Available(references) => Ok(references),
+        ContentState::Unavailable => Err(PithosError::ContentUnavailable),
     }
 }
 
@@ -333,5 +378,67 @@ impl Iterator for BlockBatches<'_> {
             }
         }
         Some(Ok(BlockBatch { blocks }))
+    }
+}
+
+#[cfg(feature = "async")]
+impl BlockBatches<'_> {
+    /// Detaches the remaining batches from the index. See [`BatchCursor::next_batch`].
+    pub(crate) fn detach(self) -> BatchCursor {
+        BatchCursor {
+            file: self.plan.file,
+            range: self.plan.range,
+            limits: self.plan.limits,
+            position: self.plan.position(),
+            cursor: self.plan.cursor,
+            max_bytes: self.max_bytes,
+            pending: self.pending,
+        }
+    }
+}
+
+/// The remaining batches of a plan without a borrow of the index, for owned streams.
+#[cfg(feature = "async")]
+pub(crate) struct BatchCursor {
+    file: FileId,
+    range: ReadRange,
+    limits: block::Limits,
+    position: Option<usize>,
+    cursor: u64,
+    max_bytes: u64,
+    pending: Option<Result<PlannedBlock, PithosError>>,
+}
+
+#[cfg(feature = "async")]
+impl BatchCursor {
+    /// Plans the next batch. `index` must be the index the cursor was detached from.
+    pub(crate) fn next_batch(
+        &mut self,
+        index: &ArchiveIndex,
+    ) -> Option<Result<BlockBatch, PithosError>> {
+        let plan = ReadPlan::resume(
+            index,
+            self.file,
+            self.range,
+            self.limits,
+            self.position,
+            self.cursor,
+        );
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.position = None;
+                self.pending = None;
+                return Some(Err(error));
+            }
+        };
+        let mut batches = BlockBatches {
+            plan,
+            max_bytes: self.max_bytes,
+            pending: self.pending.take(),
+        };
+        let batch = batches.next();
+        *self = batches.detach();
+        batch
     }
 }

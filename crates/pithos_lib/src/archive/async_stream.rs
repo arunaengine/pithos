@@ -1,5 +1,5 @@
 use super::async_reader::{AsyncArchive, AsyncExternalBlockResolver, BlockingHook};
-use super::planning::{BlockBatch, BlockBatches, BlockRequest, PlannedBlock};
+use super::planning::{BatchCursor, BlockBatch, BlockBatches, BlockRequest, PlannedBlock};
 use super::view::ArchiveView;
 use crate::error::PithosError;
 use crate::format::block::ProcessingFlags;
@@ -60,13 +60,7 @@ struct Slot<'a> {
 
 /// Verified plaintext chunks of a range, in file order. See [`AsyncArchive::read_range`].
 pub struct RangeStream<'a, S, E, B> {
-    archive: &'a AsyncArchive<S, E, B>,
-    batches: Option<BlockBatches<'a>>,
-    waiting: VecDeque<Group>,
-    slots: VecDeque<Slot<'a>>,
-    limits: ReadLimits,
-    buffered: u64,
-    fetching: usize,
+    engine: Engine<'a, &'a AsyncArchive<S, E, B>, BlockBatches<'a>>,
 }
 
 impl<'a, S, E, B> RangeStream<'a, S, E, B>
@@ -81,7 +75,145 @@ where
         limits: ReadLimits,
     ) -> Self {
         Self {
-            archive,
+            engine: Engine::new(archive, batches, limits),
+        }
+    }
+
+    /// The bytes currently reserved by requests that are fetched, decoded or waiting for
+    /// delivery, as described in [`ReadLimits`].
+    pub fn buffered_bytes(&self) -> u64 {
+        self.engine.buffered
+    }
+}
+
+/// A [`RangeStream`] that shares the archive instead of borrowing it.
+/// See [`AsyncArchive::read_range_owned`].
+pub struct OwnedRangeStream<S, E, B> {
+    engine: Engine<'static, Arc<AsyncArchive<S, E, B>>, SharedBatches>,
+}
+
+impl<S, E, B> OwnedRangeStream<S, E, B>
+where
+    S: AsyncArchiveSource + 'static,
+    E: AsyncExternalBlockResolver + 'static,
+    B: BlockingHook + 'static,
+{
+    pub(super) fn new(
+        archive: Arc<AsyncArchive<S, E, B>>,
+        cursor: BatchCursor,
+        limits: ReadLimits,
+    ) -> Self {
+        let batches = SharedBatches {
+            view: Arc::clone(&archive.view),
+            cursor,
+        };
+        Self {
+            engine: Engine::new(archive, batches, limits),
+        }
+    }
+
+    /// The bytes currently reserved, as in [`RangeStream::buffered_bytes`].
+    pub fn buffered_bytes(&self) -> u64 {
+        self.engine.buffered
+    }
+}
+
+/// The batches of a plan over a shared view, planned one at a time.
+struct SharedBatches {
+    view: Arc<ArchiveView>,
+    cursor: BatchCursor,
+}
+
+impl Iterator for SharedBatches {
+    type Item = Result<BlockBatch, PithosError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.cursor.next_batch(&self.view.index)
+    }
+}
+
+/// How a stream reaches its archive: borrowed, or shared by an owned stream.
+trait Reader<'a> {
+    fn fetch(&self, request: BlockRequest) -> Pending<'a, Vec<u8>>;
+
+    fn decode(
+        &self,
+        blocks: Vec<PlannedBlock>,
+        stored: Zeroizing<Vec<u8>>,
+    ) -> Pending<'a, Vec<Vec<u8>>>;
+}
+
+impl<'a, S, E, B> Reader<'a> for &'a AsyncArchive<S, E, B>
+where
+    S: AsyncArchiveSource,
+    E: AsyncExternalBlockResolver,
+    B: BlockingHook,
+{
+    fn fetch(&self, request: BlockRequest) -> Pending<'a, Vec<u8>> {
+        Box::pin(AsyncArchive::fetch(*self, request))
+    }
+
+    fn decode(
+        &self,
+        blocks: Vec<PlannedBlock>,
+        stored: Zeroizing<Vec<u8>>,
+    ) -> Pending<'a, Vec<Vec<u8>>> {
+        let archive: &'a AsyncArchive<S, E, B> = self;
+        let view = Arc::clone(&archive.view);
+        Box::pin(
+            archive
+                .hook
+                .spawn_blocking(move || decode_group(&view, &blocks, &stored)),
+        )
+    }
+}
+
+impl<S, E, B> Reader<'static> for Arc<AsyncArchive<S, E, B>>
+where
+    S: AsyncArchiveSource + 'static,
+    E: AsyncExternalBlockResolver + 'static,
+    B: BlockingHook + 'static,
+{
+    fn fetch(&self, request: BlockRequest) -> Pending<'static, Vec<u8>> {
+        let archive = Arc::clone(self);
+        Box::pin(async move { AsyncArchive::fetch(&archive, request).await })
+    }
+
+    fn decode(
+        &self,
+        blocks: Vec<PlannedBlock>,
+        stored: Zeroizing<Vec<u8>>,
+    ) -> Pending<'static, Vec<Vec<u8>>> {
+        let archive = Arc::clone(self);
+        Box::pin(async move {
+            let view = Arc::clone(&archive.view);
+            archive
+                .hook
+                .spawn_blocking(move || decode_group(&view, &blocks, &stored))
+                .await
+        })
+    }
+}
+
+/// The ordering, bounds and cancellation shared by both range streams.
+struct Engine<'a, R, P> {
+    reader: R,
+    batches: Option<P>,
+    waiting: VecDeque<Group>,
+    slots: VecDeque<Slot<'a>>,
+    limits: ReadLimits,
+    buffered: u64,
+    fetching: usize,
+}
+
+impl<'a, R, P> Engine<'a, R, P>
+where
+    R: Reader<'a>,
+    P: Iterator<Item = Result<BlockBatch, PithosError>>,
+{
+    fn new(reader: R, batches: P, limits: ReadLimits) -> Self {
+        Self {
+            reader,
             batches: Some(batches),
             waiting: VecDeque::new(),
             slots: VecDeque::new(),
@@ -89,12 +221,6 @@ where
             buffered: 0,
             fetching: 0,
         }
-    }
-
-    /// The bytes currently reserved by requests that are fetched, decoded or waiting for
-    /// delivery, as described in [`ReadLimits`].
-    pub fn buffered_bytes(&self) -> u64 {
-        self.buffered
     }
 
     /// Starts requests while the in-flight and byte bounds allow. Returns whether any started.
@@ -132,7 +258,7 @@ where
             }
             self.buffered = self.buffered.saturating_add(reserved);
             self.fetching += 1;
-            let fetch = Box::pin(self.archive.fetch(group.request()));
+            let fetch = self.reader.fetch(group.request());
             self.slots.push_back(Slot {
                 reserved,
                 state: State::Fetching(fetch, group.blocks),
@@ -147,41 +273,36 @@ where
         let mut progressed = false;
         let mut failed = false;
         for slot in &mut self.slots {
-            let next =
-                match &mut slot.state {
-                    State::Fetching(fetch, _) => match fetch.as_mut().poll(cx) {
-                        Poll::Ready(result) => {
-                            self.fetching -= 1;
-                            let State::Fetching(_, blocks) =
-                                std::mem::replace(&mut slot.state, State::Taken)
-                            else {
-                                unreachable!("the slot was fetching");
-                            };
-                            match result {
-                                Ok(stored) => {
-                                    let view = Arc::clone(&self.archive.view);
-                                    let stored = Zeroizing::new(stored);
-                                    State::Decoding(Box::pin(self.archive.hook.spawn_blocking(
-                                        move || decode_group(&view, &blocks, &stored),
-                                    )))
-                                }
-                                Err(error) => State::Failed(error),
+            let next = match &mut slot.state {
+                State::Fetching(fetch, _) => match fetch.as_mut().poll(cx) {
+                    Poll::Ready(result) => {
+                        self.fetching -= 1;
+                        let State::Fetching(_, blocks) =
+                            std::mem::replace(&mut slot.state, State::Taken)
+                        else {
+                            unreachable!("the slot was fetching");
+                        };
+                        match result {
+                            Ok(stored) => {
+                                State::Decoding(self.reader.decode(blocks, Zeroizing::new(stored)))
                             }
+                            Err(error) => State::Failed(error),
                         }
-                        Poll::Pending => continue,
-                    },
-                    State::Decoding(decode) => match decode.as_mut().poll(cx) {
-                        Poll::Ready(Ok(chunks)) => {
-                            let kept = chunks.iter().map(retained).sum::<u64>();
-                            self.buffered = self.buffered - slot.reserved + kept;
-                            slot.reserved = kept;
-                            State::Ready(chunks.into())
-                        }
-                        Poll::Ready(Err(error)) => State::Failed(error),
-                        Poll::Pending => continue,
-                    },
-                    State::Ready(_) | State::Failed(_) | State::Taken => continue,
-                };
+                    }
+                    Poll::Pending => continue,
+                },
+                State::Decoding(decode) => match decode.as_mut().poll(cx) {
+                    Poll::Ready(Ok(chunks)) => {
+                        let kept = chunks.iter().map(retained).sum::<u64>();
+                        self.buffered = self.buffered - slot.reserved + kept;
+                        slot.reserved = kept;
+                        State::Ready(chunks.into())
+                    }
+                    Poll::Ready(Err(error)) => State::Failed(error),
+                    Poll::Pending => continue,
+                },
+                State::Ready(_) | State::Failed(_) | State::Taken => continue,
+            };
             if matches!(next, State::Failed(_)) {
                 self.buffered -= slot.reserved;
                 slot.reserved = 0;
@@ -237,6 +358,20 @@ where
         }
         Some(Some(item))
     }
+
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, PithosError>>> {
+        loop {
+            let started = self.admit();
+            let progressed = self.poll_slots(cx);
+            let before = self.slots.len();
+            if let Some(item) = self.deliver() {
+                return Poll::Ready(item);
+            }
+            if !started && !progressed && self.slots.len() == before {
+                return Poll::Pending;
+            }
+        }
+    }
 }
 
 impl<S, E, B> Stream for RangeStream<'_, S, E, B>
@@ -248,18 +383,20 @@ where
     type Item = Result<Vec<u8>, PithosError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            let started = this.admit();
-            let progressed = this.poll_slots(cx);
-            let before = this.slots.len();
-            if let Some(item) = this.deliver() {
-                return Poll::Ready(item);
-            }
-            if !started && !progressed && this.slots.len() == before {
-                return Poll::Pending;
-            }
-        }
+        self.get_mut().engine.poll_next(cx)
+    }
+}
+
+impl<S, E, B> Stream for OwnedRangeStream<S, E, B>
+where
+    S: AsyncArchiveSource + 'static,
+    E: AsyncExternalBlockResolver + 'static,
+    B: BlockingHook + 'static,
+{
+    type Item = Result<Vec<u8>, PithosError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().engine.poll_next(cx)
     }
 }
 
