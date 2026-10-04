@@ -506,4 +506,10 @@ mod zeroization_tests {
         assert_zeroize_on_drop::<SharedSecret>();
         assert_zeroize_on_drop::<Zeroizing<Vec<u8>>>();
     }
+
+    #[test]
+    fn aead_ciphers_wipe_keys() {
+        assert_zeroize_on_drop::<Aes256Gcm>();
+        assert_zeroize_on_drop::<ChaCha20Poly1305>();
+    }
 }
