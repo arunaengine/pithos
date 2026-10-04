@@ -866,12 +866,15 @@ fn a_later_failure_ends_the_stream_after_the_earlier_output() {
     release(&probe, blocks[1].offset);
     assert!(next(&mut stream).is_pending());
     release(&probe, blocks[0].offset);
-    let (output, error) = drain(stream, &probe);
+    let (output, error) = drain(&mut stream, &probe);
     assert_eq!(output, content(2));
     assert!(matches!(
         error,
         Some(PithosError::Source(SourceError::Remote { offset, .. })) if offset == blocks[2].offset
     ));
+    assert_eq!(stream.buffered_bytes(), 0);
+    assert!(matches!(next(&mut stream), Poll::Ready(None)));
+    assert_eq!(stream.buffered_bytes(), 0);
     // The pending sibling was cancelled and no request started after the failure.
     assert_eq!(probe.cancelled.load(Ordering::SeqCst), 1);
     assert_eq!(probe.outstanding.load(Ordering::SeqCst), 0);

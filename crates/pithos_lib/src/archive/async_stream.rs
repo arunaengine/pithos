@@ -220,8 +220,9 @@ where
                 let State::Failed(error) = std::mem::replace(&mut slot.state, State::Taken) else {
                     unreachable!("the slot failed");
                 };
-                // Dropping the remaining slots cancels their requests.
+                // Dropping the remaining slots cancels their requests and frees their bytes.
                 self.slots.clear();
+                self.buffered = 0;
                 self.batches = None;
                 self.waiting.clear();
                 Err(error)
