@@ -43,7 +43,7 @@ fn derive_ga4gh_header_key(
 ///
 /// The export validates archive content before encrypting it and reports archive,
 /// cryptographic, and sink failures with operation context. New headers use the
-/// GA4GH KDF.
+/// GA4GH KDF. Plain content, which no reader key protects, gets a fresh writer key.
 pub fn export<S, E, W>(
     archive: &Archive<S, E>,
     path: &str,
@@ -616,5 +616,83 @@ mod zeroization_tests {
             *derive_ga4gh_header_key(&shared_secret, &reader_public_key, &writer_public_key),
             expected
         );
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crate::archive::{
+        ArchivePath, ArchiveWriter, EntryMetadata, OpenOptions, ProcessingOptions, WriteOptions,
+    };
+    use crate::source::MemorySource;
+
+    /// Decrypts an export to one recipient with that recipient's key.
+    fn decrypt(exported: &[u8], recipient: &PrivateKey) -> Vec<u8> {
+        let header_len = 16 + u32::from_le_bytes(exported[16..20].try_into().unwrap()) as usize;
+        let header = Crypt4GHHeader::try_from(&exported[..header_len]).unwrap();
+        let [packet] = header.header_packets.as_slice() else {
+            panic!("the export has one recipient packet");
+        };
+        let PacketData::Encrypted(sealed) = &packet.packet_data else {
+            panic!("a parsed packet is encrypted");
+        };
+        let writer = &packet.writers_pubkey;
+        let secret = recipient.as_dalek_static_secret().to_bytes();
+        let shared = crypto::derive_shared(&secret, writer).unwrap();
+        let reader = recipient.public_key().into_dalek_public_key().to_bytes();
+        let header_key = derive_ga4gh_header_key(shared.expose_for_protocol(), &reader, writer);
+        let packet_data = ChaCha20Poly1305::new_from_slice(&*header_key)
+            .unwrap()
+            .decrypt(
+                &Nonce::from(packet.nonce),
+                [sealed.as_slice(), packet.mac.as_slice()]
+                    .concat()
+                    .as_slice(),
+            )
+            .unwrap();
+        let data_key = ChaCha20Poly1305::new_from_slice(&packet_data[8..40]).unwrap();
+        exported[header_len..]
+            .chunks(CRYPT4GH_ENCRYPTED_BLOCK_SIZE)
+            .flat_map(|segment| {
+                let nonce: [u8; 12] = segment[..12].try_into().unwrap();
+                data_key
+                    .decrypt(&Nonce::from(nonce), &segment[12..])
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plain_content_round_trips() {
+        let content = (0..100_000u32)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut writer = ArchiveWriter::create(Vec::new(), WriteOptions::base()).unwrap();
+        writer
+            .add_file(
+                ArchivePath::new("data").unwrap(),
+                EntryMetadata::new(0, 0, 0o644),
+                ProcessingOptions::new(false, 0).unwrap(),
+                Some(content.len() as u64),
+                std::io::Cursor::new(&content),
+            )
+            .unwrap();
+        let source = MemorySource::new(writer.finish().unwrap());
+        let archive = Archive::open(source, OpenOptions::default()).unwrap();
+        let mut copied = Vec::new();
+        archive.copy_to("data", &mut copied).unwrap();
+        assert_eq!(copied, content);
+
+        let recipient = PrivateKey::generate();
+        let mut exported = Vec::new();
+        export(
+            &archive,
+            "data",
+            vec![recipient.public_key()],
+            &mut exported,
+        )
+        .unwrap();
+        assert_eq!(decrypt(&exported, &recipient), content);
     }
 }

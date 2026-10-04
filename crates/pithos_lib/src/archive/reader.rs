@@ -393,33 +393,40 @@ where
             .map_err(ContentOperationError::Core)?;
         let fresh_key;
         let (key, key_owner) = match self.view.access.key(id) {
-            Some(key) => (key, id),
+            Some(key) => (key, Some(id)),
             None => {
-                // A file sealed in pieces has no file key, so the export gets a fresh one.
+                // Files in pieces and plain files have no file key, so the export gets a fresh one.
                 let first_piece = self
                     .view
                     .access
                     .grant_keys(id)
-                    .and_then(|keys| keys.first().map(|(key_id, _)| *key_id))
-                    .ok_or(PithosError::ContentUnavailable)
-                    .map_err(ContentOperationError::Core)?;
+                    .and_then(|keys| keys.first().map(|(key_id, _)| *key_id));
                 fresh_key = FileKey::from_bytes(x25519_dalek::StaticSecret::random().to_bytes());
                 (&fresh_key, first_piece)
             }
         };
-        let provenance = self
-            .view
-            .access
-            .provenance(key_owner)
-            .ok_or(PithosError::ContentUnavailable)
-            .map_err(ContentOperationError::Core)?;
-        let reader = self
-            .view
-            .access_keys
-            .0
-            .get(provenance.access_key)
-            .ok_or(PithosError::ContentUnavailable)
-            .map_err(ContentOperationError::Core)?;
+        let fresh_sender;
+        let reader = match key_owner {
+            Some(key_owner) => {
+                let provenance = self
+                    .view
+                    .access
+                    .provenance(key_owner)
+                    .ok_or(PithosError::ContentUnavailable)
+                    .map_err(ContentOperationError::Core)?;
+                self.view
+                    .access_keys
+                    .0
+                    .get(provenance.access_key)
+                    .ok_or(PithosError::ContentUnavailable)
+                    .map_err(ContentOperationError::Core)?
+            }
+            // Plain content has no reader key, so a fresh key writes the Crypt4GH header.
+            None => {
+                fresh_sender = PrivateKey::generate();
+                &fresh_sender
+            }
+        };
         operation(id, reader, key).map_err(ContentOperationError::Callback)
     }
 
