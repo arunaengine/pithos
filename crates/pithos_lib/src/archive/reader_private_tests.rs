@@ -2175,7 +2175,7 @@ mod read_wiping {
 mod async_wiping {
     use super::read_wiping::secret_blocks;
     use super::*;
-    use crate::archive::AsyncArchive;
+    use crate::archive::{AsyncArchive, AsyncExternalBlockResolver, ExternalLocation};
     use crate::format::zeroing_tests::watch;
     use crate::source::AsyncArchiveSource;
     use futures_core::Stream;
@@ -2216,7 +2216,9 @@ mod async_wiping {
 
     /// Takes the first item of a stream over all blocks, then drops the stream.
     /// Returns the item length and the number of freed buffers that still held the secret.
-    fn first_then_drop(archive: &AsyncArchive<Bytes>) -> (Result<usize, PithosError>, usize) {
+    fn first_then_drop<E: AsyncExternalBlockResolver>(
+        archive: &AsyncArchive<Bytes, E>,
+    ) -> (Result<usize, PithosError>, usize) {
         let (first, _, leaked) = watch(64, &[], || {
             let mut stream = archive.read_range("data", 0..256).unwrap();
             let mut cx = Context::from_waker(Waker::noop());
@@ -2256,6 +2258,42 @@ mod async_wiping {
             first,
             Err(PithosError::Source(SourceError::ResponseLength { .. }))
         ));
+        assert_eq!(leaked, 0);
+    }
+
+    /// Answers every external block with the same response.
+    struct Answer(Vec<u8>);
+
+    impl AsyncExternalBlockResolver for Answer {
+        fn resolve(
+            &self,
+            _policy: &dyn ExternalBlockAccessPolicy,
+            _location: &ExternalLocation,
+            _expected_len: u64,
+            _max_response_size: u64,
+        ) -> impl Future<Output = Result<Vec<u8>, PithosError>> + Send {
+            std::future::ready(Ok(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn short_resolver_response_is_wiped() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("external.pith");
+        std::fs::write(&path, secret_blocks()).unwrap();
+        let mut response = as_external(&path);
+        response.pop();
+        let bytes = std::fs::read(&path).unwrap();
+        let source = Bytes {
+            bytes,
+            short: Arc::default(),
+        };
+        let options = OpenOptions::default()
+            .with_external_resolver(Answer(response))
+            .with_external_access_policy(allowing_policy());
+        let archive = ready(AsyncArchive::open(source, options, None)).unwrap();
+        let (first, leaked) = first_then_drop(&archive);
+        assert!(matches!(first, Err(PithosError::ExternalBlockFraming(_))));
         assert_eq!(leaked, 0);
     }
 }
