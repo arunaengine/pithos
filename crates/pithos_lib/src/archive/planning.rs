@@ -66,6 +66,13 @@ impl PlannedBlock {
         self.descriptor.stored_size.saturating_add(4)
     }
 
+    /// Whether this block is read by the same request as `previous`: the same location and
+    /// length, local or external. Such a block reuses the stored bytes of `previous`.
+    pub(crate) fn repeats(&self, previous: &Self) -> bool {
+        self.descriptor.location == previous.descriptor.location
+            && self.framed_len() == previous.framed_len()
+    }
+
     /// Whether `other` decodes to the same plaintext: the same file, identity and descriptor.
     pub(crate) fn same_block(&self, other: &Self) -> bool {
         self.file == other.file && self.hash == other.hash && self.descriptor == other.descriptor
@@ -254,9 +261,9 @@ impl Iterator for ReadPlan<'_> {
 
 impl<'a> ReadPlan<'a> {
     /// Groups consecutive local blocks whose spans are contiguous in storage into one request
-    /// of at most `max_bytes`. A block that repeats the span of the block before it joins the
-    /// batch without adding bytes, so the span is fetched once. A larger block and every
-    /// external block form their own batch.
+    /// of at most `max_bytes`. A block with the same request as the block before it, local or
+    /// external, joins the batch without adding bytes, so its bytes are fetched once. A larger
+    /// block forms its own batch, and an external block is joined only by its repeats.
     pub fn batches(self, max_bytes: u64) -> BlockBatches<'a> {
         BlockBatches {
             plan: self,
@@ -282,15 +289,14 @@ impl BlockBatch {
         request
     }
 
-    /// The stored bytes of the batch. A block that repeats the span before it adds none.
+    /// The stored bytes of the batch. A block that repeats the block before it adds none.
     fn stored_len(&self) -> u64 {
-        let mut previous = None;
+        let mut previous: Option<&PlannedBlock> = None;
         self.blocks
             .iter()
             .filter(|block| {
-                let span = block.local_span();
-                let repeat = span.is_some() && span == previous;
-                previous = span;
+                let repeat = previous.is_some_and(|previous| block.repeats(previous));
+                previous = Some(block);
                 !repeat
             })
             .map(PlannedBlock::framed_len)
@@ -315,16 +321,16 @@ impl BlockBatch {
             });
         }
         let mut rest = response;
-        let mut last = None;
+        let mut last: Option<(&PlannedBlock, &[u8])> = None;
         Ok(self.blocks.iter().map(move |block| {
-            if let Some((span, stored)) = last
-                && block.local_span() == Some(span)
+            if let Some((previous, stored)) = last
+                && block.repeats(previous)
             {
                 return (block, stored);
             }
             let (stored, tail) = rest.split_at(block.framed_len() as usize);
             rest = tail;
-            last = block.local_span().map(|span| (span, stored));
+            last = Some((block, stored));
             (block, stored)
         }))
     }
@@ -349,11 +355,19 @@ impl Iterator for BlockBatches<'_> {
             Err(error) => return Some(Err(error)),
         };
         let Some((offset, len)) = first.local_span() else {
-            // A repeated external block could reuse the response, but the async stream detects
-            // repeats by local span only, so joining external repeats needs a change there too.
-            return Some(Ok(BlockBatch {
-                blocks: vec![first],
-            }));
+            // An external block is joined only by repeats of itself, which reuse its response.
+            let mut blocks = vec![first];
+            while blocks.len() < MAX_BATCH_BLOCKS {
+                match self.plan.next() {
+                    Some(Ok(next)) if next.repeats(&blocks[0]) => blocks.push(next),
+                    Some(next) => {
+                        self.pending = Some(next);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            return Some(Ok(BlockBatch { blocks }));
         };
         let (mut last, mut end, mut total) = (offset, offset + len, len);
         let mut blocks = vec![first];

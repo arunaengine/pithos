@@ -450,8 +450,10 @@ mod tests {
             path: ArchivePath::new("data").unwrap(),
             entry: Entry::File(ContentEntry {
                 metadata: metadata(),
-                size: 10,
-                content: ContentState::Available(BlockReferences::new(vec![first, second])),
+                size: 20,
+                content: ContentState::Available(BlockReferences::new(vec![
+                    first, second, second, first,
+                ])),
             }),
         }]);
         value.descriptors = vec![(first, descriptor(4)), (second, descriptor(6))];
@@ -630,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn external_blocks_are_a_distinct_request_kind_and_never_join_a_batch() {
+    fn external_blocks_join_a_batch_only_when_repeated() {
         let first = BlockHash([1; 32]);
         let second = BlockHash([2; 32]);
         let mut value = segment(vec![SegmentEntry {
@@ -638,31 +640,34 @@ mod tests {
             path: ArchivePath::new("data").unwrap(),
             entry: Entry::File(ContentEntry {
                 metadata: metadata(),
-                size: 10,
-                content: ContentState::Available(BlockReferences::new(vec![first, second])),
+                size: 20,
+                content: ContentState::Available(BlockReferences::new(vec![
+                    first, second, second, first,
+                ])),
             }),
         }]);
         value.descriptors = vec![(first, descriptor(4)), (second, descriptor(6))];
         let index = build_effective_index(vec![value], 1_000, IndexLimits::default()).unwrap();
-        let range = ReadRange::new(0..10, 10).unwrap();
+        let range = ReadRange::new(0..20, 20).unwrap();
         let plan = ReadPlan::new(&index, FileId(1), range, test_limits()).unwrap();
         let batches = plan
             .batches(u64::MAX)
-            .map(|batch| batch.unwrap().request())
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let external = |len| BlockRequest::External {
+            location: ExternalLocation::new("opaque"),
+            len,
+        };
+        // Only the repeated block joins the batch before it; equal locations alone do not.
         assert_eq!(
-            batches,
-            [
-                BlockRequest::External {
-                    location: ExternalLocation::new("opaque"),
-                    len: 8
-                },
-                BlockRequest::External {
-                    location: ExternalLocation::new("opaque"),
-                    len: 10
-                },
-            ]
+            batches.iter().map(BlockBatch::request).collect::<Vec<_>>(),
+            [external(8), external(10), external(8)]
         );
+        assert_eq!(batches[1].blocks().len(), 2);
+        let response = (0..10).collect::<Vec<u8>>();
+        let parts = batches[1].split(&response).unwrap().collect::<Vec<_>>();
+        assert!(parts.iter().all(|(_, stored)| *stored == &response[..]));
+        assert!(batches[1].split(&[0; 20]).is_err());
     }
 
     #[test]

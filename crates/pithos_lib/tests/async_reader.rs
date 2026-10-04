@@ -5,8 +5,8 @@ use futures_core::Stream;
 use pithos_lib::archive::{
     AccessKeys, Archive, ArchiveFeature, ArchivePath, ArchiveWriter, AsyncArchive,
     AsyncExternalBlockResolver, BlockRequest, BlockingHook, Chunking, EntryKind, EntryMetadata,
-    ExternalBlockAccessPolicy, ExternalLocation, MAX_BATCH_BLOCKS, NoExternalBlocks, OpenLimits,
-    OpenOptions, ProcessingOptions, ReadLimits, WriteOptions,
+    ExternalBlockAccessPolicy, ExternalBlockResolver, ExternalLocation, MAX_BATCH_BLOCKS,
+    NoExternalBlocks, OpenLimits, OpenOptions, ProcessingOptions, ReadLimits, WriteOptions,
 };
 use pithos_lib::error::PithosError;
 use pithos_lib::source::{AsyncArchiveSource, MemorySource, SourceError};
@@ -650,6 +650,11 @@ const REDIRECT_TARGET: &str = "https://storage.test/redirect";
 
 /// CV-LOCAL-HELLO-279 with its block moved to the opaque external location "x".
 fn external_hello() -> Vec<u8> {
+    repeated_external_hello(1)
+}
+
+/// [`external_hello`] whose file lists its one block `count` times.
+fn repeated_external_hello(count: u8) -> Vec<u8> {
     let start = SPEC.find("#### CV-LOCAL-HELLO-279").unwrap();
     let block = SPEC[start..].split("```text\n").nth(1).unwrap();
     let mut bytes = block
@@ -660,7 +665,12 @@ fn external_hello() -> Vec<u8> {
         .flat_map(|line| line.split_once(": ").unwrap().1.split_whitespace())
         .map(|hex| u8::from_str_radix(hex, 16).unwrap())
         .collect::<Vec<u8>>();
+    // The block list count, then the file size, before the list grows by whole pairs.
+    bytes[0x22] = count;
+    bytes[0x65] = 5 * count;
     bytes.splice(143..=143, [1, 1, b'x']);
+    let pair = bytes[0x23..0x63].to_vec();
+    bytes.splice(0x63..0x63, pair.repeat(usize::from(count) - 1));
     let footer = bytes.len() - 12;
     let directory_len = (bytes.len() - 15) as u64;
     bytes[footer..footer + 8].copy_from_slice(&directory_len.to_be_bytes());
@@ -707,6 +717,25 @@ impl AsyncExternalBlockResolver for RedirectingResolver {
             .unwrap()
             .push((expected_len, max_response_size));
         Ok(self.response.clone())
+    }
+}
+
+impl ExternalBlockResolver for RedirectingResolver {
+    fn resolve(
+        &self,
+        policy: &dyn ExternalBlockAccessPolicy,
+        location: &ExternalLocation,
+        expected_len: u64,
+        max_response_size: u64,
+    ) -> Result<Vec<u8>, PithosError> {
+        let resolve = AsyncExternalBlockResolver::resolve(
+            self,
+            policy,
+            location,
+            expected_len,
+            max_response_size,
+        );
+        block_on(resolve)
     }
 }
 
@@ -1263,4 +1292,41 @@ fn dropping_an_owned_stream_cancels_outstanding_requests() {
     assert_eq!(probe.outstanding.load(Ordering::SeqCst), 0);
     assert_eq!(probe.cancelled.load(Ordering::SeqCst), 4);
     assert_eq!(Arc::strong_count(&archive), 1);
+}
+
+#[test]
+fn repeated_external_blocks_are_resolved_once() {
+    let bytes = repeated_external_hello(3);
+    let expected = (9, OpenLimits::default().max_stored_block_bytes + 4);
+    let options = |calls: &Arc<Mutex<Vec<(u64, u64)>>>| {
+        let policy = Arc::new(RecordingPolicy {
+            checks: Mutex::new(Vec::new()),
+            denied: None,
+        });
+        let resolver = RedirectingResolver {
+            response: b"BLCKhello".to_vec(),
+            calls: Arc::clone(calls),
+        };
+        OpenOptions::default()
+            .with_external_resolver(resolver)
+            .with_external_access_policy(policy)
+    };
+    for range in [0..15, 3..12] {
+        let wanted = &b"hellohellohello"[range.start as usize..range.end as usize];
+        let calls = Arc::default();
+        let sync = Archive::open(MemorySource::new(bytes.clone()), options(&calls)).unwrap();
+        let mut output = Vec::new();
+        sync.copy_range_to("hello", range.clone(), &mut output)
+            .unwrap();
+        assert_eq!(output, wanted);
+        assert_eq!(*calls.lock().unwrap(), [expected], "sync {range:?}");
+
+        let calls = Arc::default();
+        let (source, probe, _) = TestSource::new(&bytes);
+        let archive = block_on(AsyncArchive::open(source, options(&calls), None)).unwrap();
+        let (output, error) = drain(archive.read_range("hello", range.clone()).unwrap(), &probe);
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(output, wanted);
+        assert_eq!(*calls.lock().unwrap(), [expected], "async {range:?}");
+    }
 }
