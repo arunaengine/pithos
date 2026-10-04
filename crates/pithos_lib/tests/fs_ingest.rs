@@ -7,6 +7,7 @@ use pithos_lib::fs::FsError;
 use pithos_lib::fs::ingest::build_input_manifest;
 use pithos_lib::source::MemorySource;
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 
 fn write_manifest(manifest: &pithos_lib::fs::ingest::InputManifest) -> Archive<MemorySource> {
@@ -188,4 +189,64 @@ fn wide_directory_ingestion_and_archive_traversal_complete() {
     assert_eq!(archive.entries().len(), 1_000);
     assert!(archive.entry("entry-0000").unwrap().is_some());
     assert!(archive.entry("entry-0999").unwrap().is_some());
+}
+
+/// A manifest with one file "file.txt" holding `content`.
+fn file_manifest(
+    temporary: &tempfile::TempDir,
+    content: &[u8],
+) -> pithos_lib::fs::ingest::InputManifest {
+    let source = temporary.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("file.txt"), content).unwrap();
+    build_input_manifest(&[source]).unwrap()
+}
+
+fn read_file(archive: &Archive<MemorySource>) -> Vec<u8> {
+    let mut output = Vec::new();
+    archive.copy_to("file.txt", &mut output).unwrap();
+    output
+}
+
+#[test]
+fn a_manifest_can_be_ingested_again() {
+    let temporary = tempfile::tempdir().unwrap();
+    let manifest = file_manifest(&temporary, b"reused content");
+    for _ in 0..2 {
+        assert_eq!(read_file(&write_manifest(&manifest)), b"reused content");
+    }
+}
+
+/// Accepts the first `remaining` bytes, then fails every write.
+struct FailingSink {
+    remaining: usize,
+}
+
+impl Write for FailingSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(|| io::Error::other("sink failure"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_manifest_ingests_again_after_a_sink_failure() {
+    let temporary = tempfile::tempdir().unwrap();
+    let manifest = file_manifest(&temporary, b"retried content");
+    let sender = PrivateKey::generate();
+    let options = WriteOptions::new(sender.duplicate(), vec![sender.public_key()]);
+    let mut writer = ArchiveWriter::create(FailingSink { remaining: 16 }, options).unwrap();
+    assert!(
+        manifest
+            .ingest(&mut writer, ProcessingOptions::default())
+            .is_err()
+    );
+    assert_eq!(read_file(&write_manifest(&manifest)), b"retried content");
 }

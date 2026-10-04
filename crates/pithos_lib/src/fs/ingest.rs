@@ -13,7 +13,8 @@ use cap_std::time::{SystemClock, SystemTime as CapSystemTime};
 use rustix::fs::{Mode, OFlags};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::io::Read;
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -121,6 +122,21 @@ fn same_cap_file_identity(left: &cap_std::fs::Metadata, right: &fs::Metadata) ->
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
+/// Reads a retained source from its start with positioned reads. Each ingestion keeps its own
+/// offset, so ingesting a manifest again or after a failure reads the whole file again.
+struct SourceReader<'a> {
+    file: &'a File,
+    offset: u64,
+}
+
+impl Read for SourceReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.file.read_at(buffer, self.offset)?;
+        self.offset += count as u64;
+        Ok(count)
+    }
+}
+
 enum ManifestKind {
     File { expected_size: u64 },
     Directory,
@@ -160,7 +176,10 @@ impl InputManifest {
                         entry.metadata.clone(),
                         processing,
                         Some(*expected_size),
-                        source.try_clone().map_err(PithosError::Io)?,
+                        SourceReader {
+                            file: source,
+                            offset: 0,
+                        },
                     )?;
                 }
                 ManifestKind::Directory => {
@@ -178,8 +197,8 @@ impl InputManifest {
         Ok(())
     }
 
-    /// Executes a preassigned append plan. The ID assertion occurs before a source is cloned
-    /// or read, so a stale plan cannot consume filesystem content.
+    /// Executes a preassigned append plan. The ID assertion occurs before a source is read,
+    /// so a stale plan cannot consume filesystem content.
     pub(crate) fn ingest_planned<W: std::io::Write>(
         &self,
         ids: &[u64],
@@ -200,7 +219,10 @@ impl InputManifest {
                         entry.metadata.clone(),
                         processing,
                         Some(*expected_size),
-                        source.try_clone().map_err(PithosError::Io)?,
+                        SourceReader {
+                            file: source,
+                            offset: 0,
+                        },
                     )?;
                 }
                 ManifestKind::Directory => {
