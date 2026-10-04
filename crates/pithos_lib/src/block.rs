@@ -115,7 +115,7 @@ pub(crate) fn verify(
         stored
     };
     if meta.flags.get_compression_level() > 0 {
-        plaintext = Zeroizing::new(decompress(&plaintext, meta.original_size)?);
+        plaintext = decompress(&plaintext, meta.original_size)?;
     }
     if plaintext.len() as u64 != meta.original_size {
         return Err(PithosError::BlockSizeMismatch {
@@ -171,14 +171,19 @@ fn compress(input: &[u8], level: i32) -> Result<Vec<u8>, PithosError> {
     })
 }
 
-fn decompress(input: &[u8], expected_size: u64) -> Result<Vec<u8>, PithosError> {
+fn decompress(input: &[u8], expected_size: u64) -> Result<Zeroizing<Vec<u8>>, PithosError> {
     let size = usize::try_from(expected_size).map_err(|_| PithosError::InvalidDirectoryRange {
         operation: "convert decoded block size",
     })?;
-    bulk::decompress(input, size).map_err(|source| PithosError::Compression {
-        operation: "decompress block",
-        source,
-    })
+    // Decompressing into a wiped buffer also wipes the partial output of a failed frame.
+    let mut output = Zeroizing::new(Vec::with_capacity(size));
+    bulk::Decompressor::new()
+        .and_then(|mut decompressor| decompressor.decompress_to_buffer(input, &mut *output))
+        .map_err(|source| PithosError::Compression {
+            operation: "decompress block",
+            source,
+        })?;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -447,5 +452,24 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn failed_decompression_wipes_partial_plaintext() {
+        use crate::format::zeroing_tests::{SECRET, watch};
+        let plain = SECRET.repeat(9_375);
+        let encoded = encode(&plain, ProcessingFlags::new(true, Some(2)), [7; 12]).unwrap();
+        assert!(encoded.flags.get_compression_level() > 0);
+        let declared = plain.len() - 1;
+        let meta = descriptor(&encoded, declared);
+        let limits = Limits {
+            max_stored_bytes: 1024 * 1024,
+            max_decoded_bytes: 1024 * 1024,
+        };
+        let (result, zeroed, leaked) = watch(declared, &[], || {
+            verify(encoded.stored, &encoded.key, encoded.hash, &meta, limits).map(drop)
+        });
+        assert!(matches!(result, Err(PithosError::Compression { .. })));
+        assert_eq!((zeroed, leaked), (1, 0));
     }
 }
