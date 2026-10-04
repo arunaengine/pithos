@@ -1,7 +1,9 @@
 use pithos_lib::crypto::{
-    CryptoError, generate_private_key, parse_private_pem, parse_public_pem, serialize_public_pem,
+    CryptoError, PrivateKey, PublicKey, generate_private_key, parse_private_pem, parse_public_pem,
+    serialize_public_pem,
 };
 use pkcs8::{Document, LineEnding};
+use zeroize::Zeroizing;
 
 #[test]
 fn curated_pem_api_preserves_fixture_bytes_and_redacts_private_debug() {
@@ -60,4 +62,23 @@ fn non_contributory_x25519_public_keys_are_rejected_at_every_public_boundary() {
     let zero_public_pem = document.to_pem("PUBLIC KEY", LineEnding::LF).unwrap();
 
     assert!(parse_public_pem(zero_public_pem.as_bytes()).is_err());
+}
+
+#[test]
+fn raw_keys_match_their_pem_documents() {
+    let public = parse_public_pem(&std::fs::read("tests/data/keys/sender_public.pem").unwrap());
+    let public = public.unwrap();
+    assert_eq!(PublicKey::from_raw(*public.as_bytes()).unwrap(), public);
+    assert!(matches!(
+        PublicKey::from_raw([0; 32]),
+        Err(CryptoError::NonContributoryPublicKey)
+    ));
+
+    // A PKCS#8 X25519 document ends with the 32 raw private key bytes.
+    let private_pem = std::fs::read_to_string("tests/data/keys/sender_private.pem").unwrap();
+    let (_, document) = Document::from_pem(&private_pem).unwrap();
+    let raw = <[u8; 32]>::try_from(&document.as_bytes()[16..]).unwrap();
+    let private = PrivateKey::from_raw(Zeroizing::new(raw));
+    assert_eq!(private.public_key(), public);
+    assert_eq!(format!("{private:?}"), "PrivateKey([REDACTED])");
 }

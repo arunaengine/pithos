@@ -75,3 +75,7 @@ Breaking changes in the 0.8 API:
 - `Archive::open` no longer reads block markers. A missing or changed marker fails when the block is read.
 - The default `OpenLimits` admit objects up to 5 TiB.
 - The minimum supported Rust version is 1.89.
+
+Additions in the 0.8 API:
+
+- `PublicKey::from_raw`, `PublicKey::as_bytes` and `PrivateKey::from_raw` import and export raw 32-byte X25519 keys without PEM. `PrivateKey::from_raw` takes a `Zeroizing` container.

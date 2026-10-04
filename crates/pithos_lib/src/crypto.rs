@@ -111,6 +111,12 @@ impl PrivateKey {
         Self(StaticSecret::random().to_bytes())
     }
 
+    /// Takes 32 raw X25519 private key bytes. The consumed container is wiped when it drops,
+    /// so neither the caller nor Pithos keeps an unwiped copy.
+    pub fn from_raw(bytes: Zeroizing<[u8; 32]>) -> Self {
+        Self(*bytes)
+    }
+
     /// Duplicate a secret only when a distinct owner is required by an API boundary.
     pub fn duplicate(&self) -> Self {
         Self(self.0)
@@ -188,6 +194,17 @@ impl fmt::Debug for PrivateKey {
 }
 
 impl PublicKey {
+    /// Accepts 32 raw X25519 public key bytes that pass the same checks as a PEM public key.
+    pub fn from_raw(bytes: [u8; 32]) -> Result<Self, CryptoError> {
+        validate_x25519_public_key(&bytes)?;
+        Ok(Self(bytes))
+    }
+
+    /// The 32 raw X25519 public key bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     pub fn from_public_pem_bytes(pem: &[u8]) -> Result<Self, CryptoError> {
         let pem = std::str::from_utf8(pem).map_err(|_| CryptoError::InvalidKeyDocument)?;
         let (label, document) =
