@@ -758,6 +758,10 @@ pub fn validate_input_manifest(inputs: &[PathBuf]) -> Result<(), FsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::{AccessKeys, Archive, Chunking, OpenOptions, WriteOptions};
+    use crate::crypto::PrivateKey;
+    use crate::source::MemorySource;
+    use std::io::Write;
 
     #[test]
     fn synthetic_parents_are_deterministic() {
@@ -784,5 +788,85 @@ mod tests {
             assert!(matches!(&entry.kind, ManifestKind::Directory));
             assert_eq!(entry.metadata, EntryMetadata::new(0, 0, 0o755));
         }
+    }
+
+    /// Rejects every write.
+    struct FailingSink;
+
+    impl Write for FailingSink {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("sink failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An empty archive owned by `owner`, and a manifest with one file "file.txt".
+    fn planned_fixture(
+        temporary: &tempfile::TempDir,
+        owner: &PrivateKey,
+    ) -> (Vec<u8>, InputManifest) {
+        let source = temporary.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("file.txt"), b"planned content").unwrap();
+        let options = WriteOptions::new(owner.duplicate(), vec![owner.public_key()]);
+        let base = ArchiveWriter::create(Vec::new(), options).unwrap();
+        (
+            base.finish().unwrap(),
+            build_input_manifest(&[source]).unwrap(),
+        )
+    }
+
+    fn open(bytes: Vec<u8>, owner: &PrivateKey) -> Archive<MemorySource> {
+        let keys = AccessKeys::new().with_key(owner.duplicate());
+        let options = OpenOptions::default().with_access_keys(keys);
+        Archive::open(MemorySource::new(bytes), options).unwrap()
+    }
+
+    /// Appends `manifest` to `base` through the planned path and returns the sink.
+    fn append_planned<W: Write>(
+        manifest: &InputManifest,
+        base: &[u8],
+        owner: &PrivateKey,
+        sink: W,
+    ) -> Result<W, WriterError> {
+        let snapshot = open(base.to_vec(), owner).into_append_snapshot();
+        let ids = manifest.validate_append(&snapshot)?;
+        let recipients = vec![owner.public_key()];
+        let sender = PrivateKey::generate();
+        let chunking = Chunking::default();
+        let mut writer = ArchiveWriter::append(sink, sender, recipients, chunking, snapshot)?;
+        manifest.ingest_planned(&ids, &mut writer, ProcessingOptions::append_default())?;
+        Ok(writer.finish().map_err(|error| error.into_parts().0)?)
+    }
+
+    fn appended_file(base: &[u8], appended: &[u8], owner: &PrivateKey) -> Vec<u8> {
+        let mut output = Vec::new();
+        let archive = open([base, appended].concat(), owner);
+        archive.copy_to("file.txt", &mut output).unwrap();
+        output
+    }
+
+    #[test]
+    fn planned_ingestion_can_run_again() {
+        let temporary = tempfile::tempdir().unwrap();
+        let owner = PrivateKey::generate();
+        let (base, manifest) = planned_fixture(&temporary, &owner);
+        for _ in 0..2 {
+            let appended = append_planned(&manifest, &base, &owner, Vec::new()).unwrap();
+            assert_eq!(appended_file(&base, &appended, &owner), b"planned content");
+        }
+    }
+
+    #[test]
+    fn planned_ingestion_runs_again_after_a_sink_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let owner = PrivateKey::generate();
+        let (base, manifest) = planned_fixture(&temporary, &owner);
+        assert!(append_planned(&manifest, &base, &owner, FailingSink).is_err());
+        let appended = append_planned(&manifest, &base, &owner, Vec::new()).unwrap();
+        assert_eq!(appended_file(&base, &appended, &owner), b"planned content");
     }
 }
