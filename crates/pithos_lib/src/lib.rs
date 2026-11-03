@@ -42,6 +42,7 @@ mod block;
 pub mod crypto;
 pub mod error;
 mod format;
+#[cfg(target_os = "linux")]
 pub mod fs;
 
 pub mod source;

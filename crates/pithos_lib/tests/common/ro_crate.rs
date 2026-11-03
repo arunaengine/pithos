@@ -52,7 +52,8 @@ pub fn write_raw_zip(path: &Path, entries: &[(&[u8], &[u8], u32)]) {
         archive.extend_from_slice(content);
 
         central_directory.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-        central_directory.extend_from_slice(&20u16.to_le_bytes());
+        // Made by Unix (host 3), so readers apply the Unix mode in the external attributes.
+        central_directory.extend_from_slice(&((3u16 << 8) | 20).to_le_bytes());
         central_directory.extend_from_slice(&20u16.to_le_bytes());
         central_directory.extend_from_slice(&0u16.to_le_bytes());
         central_directory.extend_from_slice(&0u16.to_le_bytes());
