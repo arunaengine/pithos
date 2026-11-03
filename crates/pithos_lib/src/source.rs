@@ -1,6 +1,9 @@
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -112,14 +115,13 @@ impl ArchiveSource for FileSource {
                     offset,
                     length: buffer.len(),
                 })?;
-            let count = self
-                .file
-                .read_at(&mut buffer[read..], position)
-                .map_err(|source| SourceError::Io {
+            let count = read_at(&self.file, &mut buffer[read..], position).map_err(|source| {
+                SourceError::Io {
                     operation: "read",
                     offset: position,
                     source,
-                })?;
+                }
+            })?;
             if count == 0 {
                 return Err(SourceError::UnexpectedEof {
                     offset,
@@ -131,6 +133,18 @@ impl ArchiveSource for FileSource {
         }
         Ok(())
     }
+}
+
+/// Reads at an absolute offset without a shared file cursor.
+#[cfg(unix)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    file.read_at(buffer, offset)
+}
+
+/// Reads at an absolute offset; every call passes its own offset, so the moved cursor is unused.
+#[cfg(windows)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    file.seek_read(buffer, offset)
 }
 
 #[derive(Clone)]
