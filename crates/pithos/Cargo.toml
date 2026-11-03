@@ -1,7 +1,7 @@
 [package]
 name = "pithos"
 description = "CLI for the Pithos container file format"
-version = "0.8.0"
+version = "0.8.1"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,7 +17,7 @@ include = [
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
-pithos_lib = { version = "0.8.0", path = "../pithos_lib" }
+pithos_lib = { version = "0.8.1", path = "../pithos_lib" }
 thiserror = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
